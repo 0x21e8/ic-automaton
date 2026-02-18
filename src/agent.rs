@@ -3,7 +3,7 @@ use crate::domain::types::{AgentEvent, AgentState, InferenceInput, TurnRecord};
 use crate::features::{
     EvmPoller, InferenceAdapter, MockEvmPoller, MockInferenceAdapter, MockSignerAdapter,
 };
-use crate::storage::{projection::SqlProjection, replay, stable};
+use crate::storage::stable;
 use crate::tools::ToolManager;
 
 pub const TURN_TIMER_SECONDS: u64 = 30;
@@ -151,10 +151,6 @@ pub async fn run_scheduled_turn() {
     };
 
     stable::append_turn_record(&turn_record, &tool_calls);
-
-    let mut projection = SqlProjection::default();
-    replay::rebuild_projection(&mut projection);
-    projection.upsert_turn(turn_record);
 
     stable::set_last_error(last_error.clone());
     stable::complete_turn(state, last_error);
