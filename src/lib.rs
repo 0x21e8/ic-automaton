@@ -5,7 +5,9 @@ mod storage;
 mod tools;
 
 use crate::agent::{run_scheduled_turn, TURN_TIMER_SECONDS};
-use crate::domain::types::{RuntimeView, SkillRecord, ToolCallRecord};
+use crate::domain::types::{
+    InferenceConfigView, InferenceProvider, RuntimeView, SkillRecord, ToolCallRecord,
+};
 use crate::storage::stable;
 use crate::tools::ToolManager;
 use ic_cdk_timers::set_timer_interval;
@@ -30,9 +32,36 @@ fn set_loop_enabled(enabled: bool) -> String {
     format!("loop_enabled={enabled}")
 }
 
+#[ic_cdk::update]
+fn set_inference_provider(provider: InferenceProvider) -> String {
+    stable::set_inference_provider(provider.clone());
+    format!("inference_provider={provider:?}")
+}
+
+#[ic_cdk::update]
+fn set_inference_model(model: String) -> Result<String, String> {
+    stable::set_inference_model(model)
+}
+
+#[ic_cdk::update]
+fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
+    stable::set_openrouter_base_url(base_url)
+}
+
+#[ic_cdk::update]
+fn set_openrouter_api_key(api_key: Option<String>) -> String {
+    stable::set_openrouter_api_key(api_key);
+    "openrouter_api_key_updated".to_string()
+}
+
 #[ic_cdk::query]
 fn get_runtime_view() -> RuntimeView {
     stable::snapshot_to_view()
+}
+
+#[ic_cdk::query]
+fn get_inference_config() -> InferenceConfigView {
+    stable::inference_config_view()
 }
 
 #[ic_cdk::query]

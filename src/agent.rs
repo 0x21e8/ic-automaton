@@ -1,8 +1,6 @@
 use crate::domain::state_machine;
 use crate::domain::types::{AgentEvent, AgentState, InferenceInput, TurnRecord};
-use crate::features::{
-    EvmPoller, InferenceAdapter, MockEvmPoller, MockInferenceAdapter, MockSignerAdapter,
-};
+use crate::features::{infer_with_provider, EvmPoller, MockEvmPoller, MockSignerAdapter};
 use crate::storage::stable;
 use crate::tools::ToolManager;
 
@@ -76,7 +74,7 @@ pub async fn run_scheduled_turn() {
             turn_id: turn_id.clone(),
         };
 
-        match MockInferenceAdapter::infer(&MockInferenceAdapter, &input) {
+        match infer_with_provider(&snapshot, &input).await {
             Ok(inference) => {
                 if let Err(error) =
                     advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)

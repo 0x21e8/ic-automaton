@@ -1,7 +1,7 @@
 use crate::domain::types::{AgentEvent, AgentState};
 use crate::domain::types::{
-    EvmPollCursor, RuntimeSnapshot, RuntimeView, SkillRecord, ToolCallRecord, TransitionLogRecord,
-    TurnRecord,
+    EvmPollCursor, InferenceConfigView, InferenceProvider, RuntimeSnapshot, RuntimeView,
+    SkillRecord, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use ic_cdk::api::time;
 use ic_stable_structures::{
@@ -107,6 +107,55 @@ pub fn increment_turn_counter() -> RuntimeSnapshot {
 
 pub fn snapshot_to_view() -> RuntimeView {
     RuntimeView::from(&runtime_snapshot())
+}
+
+pub fn inference_config_view() -> InferenceConfigView {
+    InferenceConfigView::from(&runtime_snapshot())
+}
+
+pub fn set_inference_provider(provider: InferenceProvider) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.inference_provider = provider;
+    snapshot.last_transition_at_ns = time();
+    save_runtime_snapshot(&snapshot);
+}
+
+pub fn set_inference_model(model: String) -> Result<String, String> {
+    if model.trim().is_empty() {
+        return Err("inference model cannot be empty".to_string());
+    }
+    let mut snapshot = runtime_snapshot();
+    snapshot.inference_model = model.trim().to_string();
+    snapshot.last_transition_at_ns = time();
+    let out = snapshot.inference_model.clone();
+    save_runtime_snapshot(&snapshot);
+    Ok(out)
+}
+
+pub fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
+    if base_url.trim().is_empty() {
+        return Err("openrouter base url cannot be empty".to_string());
+    }
+    let mut snapshot = runtime_snapshot();
+    snapshot.openrouter_base_url = base_url.trim().trim_end_matches('/').to_string();
+    snapshot.last_transition_at_ns = time();
+    let out = snapshot.openrouter_base_url.clone();
+    save_runtime_snapshot(&snapshot);
+    Ok(out)
+}
+
+pub fn set_openrouter_api_key(api_key: Option<String>) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.openrouter_api_key = api_key.and_then(|key| {
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    snapshot.last_transition_at_ns = time();
+    save_runtime_snapshot(&snapshot);
 }
 
 pub fn record_transition(

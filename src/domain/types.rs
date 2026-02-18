@@ -88,6 +88,16 @@ pub struct RuntimeSnapshot {
     pub event_seq: u64,
     pub transition_seq: u64,
     pub last_transition_at_ns: u64,
+    #[serde(default)]
+    pub inference_provider: InferenceProvider,
+    #[serde(default = "default_inference_model")]
+    pub inference_model: String,
+    #[serde(default)]
+    pub openrouter_api_key: Option<String>,
+    #[serde(default = "default_openrouter_base_url")]
+    pub openrouter_base_url: String,
+    #[serde(default = "default_openrouter_max_response_bytes")]
+    pub openrouter_max_response_bytes: u64,
 }
 
 impl Default for RuntimeSnapshot {
@@ -104,6 +114,11 @@ impl Default for RuntimeSnapshot {
             event_seq: 0,
             transition_seq: 0,
             last_transition_at_ns: 0,
+            inference_provider: InferenceProvider::default(),
+            inference_model: default_inference_model(),
+            openrouter_api_key: None,
+            openrouter_base_url: default_openrouter_base_url(),
+            openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
         }
     }
 }
@@ -153,6 +168,8 @@ pub struct RuntimeView {
     pub evm_next_block: u64,
     pub evm_next_log_index: u64,
     pub last_transition_at_ns: u64,
+    pub inference_provider: InferenceProvider,
+    pub inference_model: String,
 }
 
 impl From<&RuntimeSnapshot> for RuntimeView {
@@ -169,6 +186,43 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             evm_next_block: snapshot.evm_cursor.next_block,
             evm_next_log_index: snapshot.evm_cursor.next_log_index,
             last_transition_at_ns: snapshot.last_transition_at_ns,
+            inference_provider: snapshot.inference_provider.clone(),
+            inference_model: snapshot.inference_model.clone(),
+        }
+    }
+}
+
+#[derive(
+    CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+pub enum InferenceProvider {
+    #[default]
+    Mock,
+    IcLlm,
+    OpenRouter,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct InferenceConfigView {
+    pub provider: InferenceProvider,
+    pub model: String,
+    pub openrouter_base_url: String,
+    pub openrouter_has_api_key: bool,
+    pub openrouter_max_response_bytes: u64,
+}
+
+impl From<&RuntimeSnapshot> for InferenceConfigView {
+    fn from(snapshot: &RuntimeSnapshot) -> Self {
+        Self {
+            provider: snapshot.inference_provider.clone(),
+            model: snapshot.inference_model.clone(),
+            openrouter_base_url: snapshot.openrouter_base_url.clone(),
+            openrouter_has_api_key: snapshot
+                .openrouter_api_key
+                .as_ref()
+                .map(|key| !key.trim().is_empty())
+                .unwrap_or(false),
+            openrouter_max_response_bytes: snapshot.openrouter_max_response_bytes,
         }
     }
 }
@@ -178,4 +232,16 @@ pub struct InferenceInput {
     pub input: String,
     pub context_snippet: String,
     pub turn_id: String,
+}
+
+fn default_inference_model() -> String {
+    "llama3.1:8b".to_string()
+}
+
+fn default_openrouter_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+
+fn default_openrouter_max_response_bytes() -> u64 {
+    64 * 1024
 }
