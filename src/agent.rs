@@ -26,7 +26,13 @@ pub async fn run_scheduled_turn() {
     let mut tool_calls = Vec::new();
 
     if let Err(error) = advance_state(&mut state, &AgentEvent::TimerTick, &turn_id) {
-        let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason: error.clone() }, &turn_id);
+        let _ = advance_state(
+            &mut state,
+            &AgentEvent::TurnFailed {
+                reason: error.clone(),
+            },
+            &turn_id,
+        );
         stable::complete_turn(AgentState::Faulted, Some(error));
         return;
     }
@@ -35,7 +41,13 @@ pub async fn run_scheduled_turn() {
     let (next_cursor, evm_events) = match poll {
         Ok(poll) => (poll.cursor, poll.events.len()),
         Err(reason) => {
-            let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason: reason.clone() }, &turn_id);
+            let _ = advance_state(
+                &mut state,
+                &AgentEvent::TurnFailed {
+                    reason: reason.clone(),
+                },
+                &turn_id,
+            );
             stable::complete_turn(AgentState::Faulted, Some(reason));
             return;
         }
@@ -88,7 +100,13 @@ pub async fn run_scheduled_turn() {
                 }
             }
             Err(reason) => {
-                let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason: reason.clone() }, &turn_id);
+                let _ = advance_state(
+                    &mut state,
+                    &AgentEvent::TurnFailed {
+                        reason: reason.clone(),
+                    },
+                    &turn_id,
+                );
                 last_error = Some(reason);
             }
         }
