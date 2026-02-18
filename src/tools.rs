@@ -29,7 +29,7 @@ impl Default for ToolPolicy {
 
 pub struct ToolManager {
     policies: HashMap<String, ToolPolicy>,
-    executed_in_turn: u8,
+    executed_per_tool: HashMap<String, u8>,
 }
 
 impl ToolManager {
@@ -54,7 +54,7 @@ impl ToolManager {
 
         Self {
             policies,
-            executed_in_turn: 0,
+            executed_per_tool: HashMap::new(),
         }
     }
 
@@ -73,14 +73,6 @@ impl ToolManager {
         rows
     }
 
-    pub fn can_execute(&self, tool: &str, state: &AgentState) -> bool {
-        if let Some(policy) = self.policies.get(tool) {
-            policy.enabled && policy.allowed_states.contains(state)
-        } else {
-            false
-        }
-    }
-
     #[allow(dead_code)]
     pub fn policy_for(&self, tool: &str) -> Option<&ToolPolicy> {
         self.policies.get(tool)
@@ -96,8 +88,21 @@ impl ToolManager {
         calls
             .iter()
             .map(|call| {
-                if !self.can_execute(&call.tool, state) {
-                    self.executed_in_turn = self.executed_in_turn.saturating_add(1);
+                let policy = match self.policies.get(&call.tool) {
+                    Some(policy) => policy,
+                    None => {
+                        return ToolCallRecord {
+                            turn_id: turn_id.to_string(),
+                            tool: call.tool.clone(),
+                            args_json: call.args_json.clone(),
+                            output: "unknown tool".to_string(),
+                            success: false,
+                            error: Some("unknown tool".to_string()),
+                        };
+                    }
+                };
+
+                if !policy.enabled || !policy.allowed_states.contains(state) {
                     return ToolCallRecord {
                         turn_id: turn_id.to_string(),
                         tool: call.tool.clone(),
@@ -108,13 +113,8 @@ impl ToolManager {
                     };
                 }
 
-                if self.executed_in_turn
-                    >= self
-                        .policies
-                        .get(&call.tool)
-                        .map(|policy| policy.max_calls_per_turn)
-                        .unwrap_or(0)
-                {
+                let used = self.executed_per_tool.get(&call.tool).copied().unwrap_or(0);
+                if used >= policy.max_calls_per_turn {
                     return ToolCallRecord {
                         turn_id: turn_id.to_string(),
                         tool: call.tool.clone(),
@@ -126,19 +126,31 @@ impl ToolManager {
                 }
 
                 let result = match call.tool.as_str() {
-                    "sign_message" => signer.sign_message(&call.args_json).unwrap_or_default(),
-                    _ => "ok".to_string(),
+                    "sign_message" => signer.sign_message(&call.args_json),
+                    "record_signal" => Ok("recorded".to_string()),
+                    _ => Err("unknown tool".to_string()),
                 };
 
-                self.executed_in_turn = self.executed_in_turn.saturating_add(1);
+                self.executed_per_tool
+                    .insert(call.tool.clone(), used.saturating_add(1));
 
-                ToolCallRecord {
-                    turn_id: turn_id.to_string(),
-                    tool: call.tool.clone(),
-                    args_json: call.args_json.clone(),
-                    output: result,
-                    success: true,
-                    error: None,
+                match result {
+                    Ok(output) => ToolCallRecord {
+                        turn_id: turn_id.to_string(),
+                        tool: call.tool.clone(),
+                        args_json: call.args_json.clone(),
+                        output,
+                        success: true,
+                        error: None,
+                    },
+                    Err(error) => ToolCallRecord {
+                        turn_id: turn_id.to_string(),
+                        tool: call.tool.clone(),
+                        args_json: call.args_json.clone(),
+                        output: "tool execution failed".to_string(),
+                        success: false,
+                        error: Some(error),
+                    },
                 }
             })
             .collect()
