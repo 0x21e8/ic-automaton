@@ -7,7 +7,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+async-trait = "0.1"
 candid = "0.10"
+canlog = { version = "0.2", features = ["derive"] }
 ic-cdk = "0.19"
 ic-cdk-timers = "1.0"
 ic-stable-structures = "0.7"
