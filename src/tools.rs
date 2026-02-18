@@ -1,5 +1,4 @@
 use crate::domain::types::{AgentState, ToolCall, ToolCallRecord};
-use crate::features::SignerAdapter;
 use std::collections::HashMap;
 
 pub trait SignerPort {
@@ -82,7 +81,7 @@ impl ToolManager {
         &mut self,
         state: &AgentState,
         calls: &[ToolCall],
-        signer: &dyn SignerAdapter,
+        signer: &dyn SignerPort,
         turn_id: &str,
     ) -> Vec<ToolCallRecord> {
         calls
