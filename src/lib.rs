@@ -6,7 +6,7 @@ mod tools;
 
 use crate::agent::{run_scheduled_turn, TURN_TIMER_SECONDS};
 use crate::domain::types::{RuntimeView, SkillRecord, ToolCallRecord};
-use crate::storage::{projection::SqlProjection, replay, stable};
+use crate::storage::stable;
 use crate::tools::ToolManager;
 use ic_cdk_timers::set_timer_interval;
 use std::time::Duration;
@@ -21,8 +21,6 @@ fn init() {
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
     stable::init_storage();
-    let mut projection = SqlProjection::default();
-    replay::rebuild_projection(&mut projection);
     arm_timer();
 }
 
