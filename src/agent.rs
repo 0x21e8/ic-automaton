@@ -38,12 +38,8 @@ pub async fn run_scheduled_turn() {
     }
 
     let poll = MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor);
-    let (poll, evm_events) = match poll {
-        Ok(poll) => {
-            let next_cursor = poll.cursor.clone();
-            snapshot.evm_cursor = poll.cursor;
-            (next_cursor, poll.events.len())
-        }
+    let (next_cursor, evm_events) = match poll {
+        Ok(poll) => (poll.cursor, poll.events.len()),
         Err(reason) => {
             let fail_reason = reason.clone();
             let _ = advance_state(
@@ -59,7 +55,6 @@ pub async fn run_scheduled_turn() {
         }
     };
     let has_input = evm_events > 0;
-    snapshot.evm_cursor = poll;
 
     if let Err(reason) = advance_state(
         &mut state,
@@ -74,8 +69,6 @@ pub async fn run_scheduled_turn() {
         stable::complete_turn(AgentState::Faulted, Some(reason));
         return;
     }
-
-    stable::set_evm_cursor(&snapshot.evm_cursor);
 
     if has_input {
         let context_summary = format!("evm_events:{evm_events}");
@@ -143,7 +136,7 @@ pub async fn run_scheduled_turn() {
         source_events: evm_events as u32,
         tool_call_count: u32::try_from(tool_calls.len()).unwrap_or(0),
         input_summary: if has_input {
-            format!("evm:{}:{}", snapshot.evm_cursor.chain_id, evm_events)
+            format!("evm:{}:{}", next_cursor.chain_id, evm_events)
         } else {
             "no-input".to_string()
         },
@@ -151,6 +144,9 @@ pub async fn run_scheduled_turn() {
     };
 
     stable::append_turn_record(&turn_record, &tool_calls);
+    if last_error.is_none() {
+        stable::set_evm_cursor(&next_cursor);
+    }
 
     stable::set_last_error(last_error.clone());
     stable::complete_turn(state, last_error);
