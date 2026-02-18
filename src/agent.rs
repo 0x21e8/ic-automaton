@@ -26,14 +26,8 @@ pub async fn run_scheduled_turn() {
     let mut tool_calls = Vec::new();
 
     if let Err(error) = advance_state(&mut state, &AgentEvent::TimerTick, &turn_id) {
-        snapshot.last_error = Some(error.clone());
-        stable::set_last_error(Some(error.clone()));
-        let _ = advance_state(
-            &mut state,
-            &AgentEvent::TurnFailed { reason: error },
-            &turn_id,
-        );
-        stable::complete_turn(AgentState::Faulted, snapshot.last_error);
+        let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason: error.clone() }, &turn_id);
+        stable::complete_turn(AgentState::Faulted, Some(error));
         return;
     }
 
@@ -41,15 +35,7 @@ pub async fn run_scheduled_turn() {
     let (next_cursor, evm_events) = match poll {
         Ok(poll) => (poll.cursor, poll.events.len()),
         Err(reason) => {
-            let fail_reason = reason.clone();
-            let _ = advance_state(
-                &mut state,
-                &AgentEvent::TurnFailed {
-                    reason: fail_reason,
-                },
-                &turn_id,
-            );
-            stable::set_last_error(Some(reason.clone()));
+            let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason: reason.clone() }, &turn_id);
             stable::complete_turn(AgentState::Faulted, Some(reason));
             return;
         }
@@ -102,14 +88,7 @@ pub async fn run_scheduled_turn() {
                 }
             }
             Err(reason) => {
-                let fail_reason = reason.clone();
-                let _ = advance_state(
-                    &mut state,
-                    &AgentEvent::TurnFailed {
-                        reason: fail_reason,
-                    },
-                    &turn_id,
-                );
+                let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason: reason.clone() }, &turn_id);
                 last_error = Some(reason);
             }
         }
@@ -148,7 +127,6 @@ pub async fn run_scheduled_turn() {
         stable::set_evm_cursor(&next_cursor);
     }
 
-    stable::set_last_error(last_error.clone());
     stable::complete_turn(state, last_error);
 }
 

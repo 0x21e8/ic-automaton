@@ -148,41 +148,32 @@ pub fn append_turn_record(record: &TurnRecord, tool_calls: &[ToolCallRecord]) {
     set_tool_records(&record.id, tool_calls);
 }
 
-pub fn list_recent_transitions(limit: usize) -> Vec<crate::domain::types::TransitionLogRecord> {
+pub fn list_recent_transitions(limit: usize) -> Vec<TransitionLogRecord> {
     if limit == 0 {
         return Vec::new();
     }
-
-    let mut rows: Vec<_> = TRANSITION_MAP.with(|map| {
+    TRANSITION_MAP.with(|map| {
         map.borrow()
             .iter()
-            .filter_map(|entry| {
-                read_json::<crate::domain::types::TransitionLogRecord>(Some(
-                    entry.value().as_slice(),
-                ))
-            })
+            .rev()
+            .take(limit)
+            .filter_map(|entry| read_json(Some(entry.value().as_slice())))
             .collect()
-    });
-
-    rows.sort_by(|a, b| b.occurred_at_ns.cmp(&a.occurred_at_ns));
-    rows.into_iter().take(limit).collect()
+    })
 }
 
 pub fn list_turns(limit: usize) -> Vec<TurnRecord> {
     if limit == 0 {
         return Vec::new();
     }
-
-    let mut rows: Vec<_> = TURN_MAP.with(|map| {
+    TURN_MAP.with(|map| {
         map.borrow()
             .iter()
-            .filter_map(|entry| read_json::<TurnRecord>(Some(entry.value().as_slice())))
+            .rev()
+            .take(limit)
+            .filter_map(|entry| read_json(Some(entry.value().as_slice())))
             .collect()
-    });
-
-    rows.sort_by_key(|record| record.created_at_ns);
-    rows.reverse();
-    rows.into_iter().take(limit).collect()
+    })
 }
 
 pub fn set_tool_records(turn_id: &str, tool_calls: &[ToolCallRecord]) {
