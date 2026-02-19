@@ -199,6 +199,8 @@ pub struct ObservabilitySnapshot {
     pub scheduler: SchedulerRuntime,
     pub inbox_stats: InboxStats,
     pub inbox_messages: Vec<InboxMessage>,
+    pub outbox_stats: OutboxStats,
+    pub outbox_messages: Vec<OutboxMessage>,
     pub recent_turns: Vec<TurnRecord>,
     pub recent_transitions: Vec<TransitionLogRecord>,
     pub recent_jobs: Vec<ScheduledJob>,
@@ -271,6 +273,21 @@ pub struct InboxStats {
     pub pending_count: u64,
     pub staged_count: u64,
     pub consumed_count: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct OutboxMessage {
+    pub id: String,
+    pub seq: u64,
+    pub turn_id: String,
+    pub body: String,
+    pub created_at_ns: u64,
+    pub source_inbox_ids: Vec<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OutboxStats {
+    pub total_messages: u64,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

@@ -3,7 +3,6 @@ const POLL_MS = 2000;
 const state = {
   knownTransitionIds: new Set(),
   knownJobIds: new Set(),
-  knownMessageIds: new Set(),
   pollHandle: null,
   inferenceConfig: {
     provider: "llm_canister",
@@ -22,7 +21,7 @@ const el = {
   inbox: document.getElementById("inbox-kv"),
   transitions: document.getElementById("transitions-list"),
   jobs: document.getElementById("jobs-list"),
-  messages: document.getElementById("messages-list"),
+  chat: document.getElementById("chat-list"),
   inferenceForm: document.getElementById("inference-form"),
   inferenceSubmit: document.getElementById("inference-submit"),
   inferenceStatus: document.getElementById("inference-status"),
@@ -88,6 +87,45 @@ function renderTimeline(container, items, idKey, labelBuilder, knownSet) {
     </div>`;
   });
   container.innerHTML = rows.length > 0 ? rows.join("") : "<p class=\"muted\">No data yet.</p>";
+}
+
+function renderChat(container, inboxMessages, outboxMessages) {
+  const rows = [];
+  for (const inbox of inboxMessages) {
+    rows.push({
+      id: inbox.id || "",
+      role: "user",
+      body: inbox.body || "",
+      ts: Number(inbox.posted_at_ns || 0),
+      meta: `${inbox.status || "pending"} · ${relativeTimeFromNs(inbox.posted_at_ns)}`,
+    });
+  }
+  for (const outbox of outboxMessages) {
+    const sourceCount = Array.isArray(outbox.source_inbox_ids) ? outbox.source_inbox_ids.length : 0;
+    rows.push({
+      id: outbox.id || "",
+      role: "assistant",
+      body: outbox.body || "",
+      ts: Number(outbox.created_at_ns || 0),
+      meta: `${escapeHtml(outbox.turn_id || "turn:unknown")} · replies:${sourceCount} · ${relativeTimeFromNs(
+        outbox.created_at_ns
+      )}`,
+    });
+  }
+  rows.sort((a, b) => a.ts - b.ts);
+
+  container.innerHTML =
+    rows.length === 0
+      ? "<p class=\"muted\">No chat yet.</p>"
+      : rows
+          .map(
+            (row) => `<article class="chat-row ${row.role}">
+      <p class="chat-meta">${escapeHtml(row.role)} · ${row.meta}</p>
+      <div class="chat-bubble"><p>${escapeHtml(row.body)}</p></div>
+      <code>${escapeHtml(row.id)}</code>
+    </article>`
+          )
+          .join("");
 }
 
 function inferModelFromForm() {
@@ -165,6 +203,7 @@ async function refreshSnapshot() {
     const scheduler = snapshot.scheduler || {};
     const inboxStats = snapshot.inbox_stats || {};
     const messages = snapshot.inbox_messages || [];
+    const outboxMessages = snapshot.outbox_messages || [];
     const jobs = snapshot.recent_jobs || [];
     const transitions = snapshot.recent_transitions || [];
 
@@ -218,14 +257,7 @@ async function refreshSnapshot() {
         )}`,
       state.knownJobIds
     );
-    renderTimeline(
-      el.messages,
-      messages,
-      "id",
-      (item) =>
-        `${escapeHtml(item.status || "?")} · ${relativeTimeFromNs(item.posted_at_ns)}<code>${escapeHtml(item.body || "")}</code>`,
-      state.knownMessageIds
-    );
+    renderChat(el.chat, messages, outboxMessages);
 
     el.status.textContent = `Live · updated ${new Date().toLocaleTimeString()}`;
   } catch (error) {

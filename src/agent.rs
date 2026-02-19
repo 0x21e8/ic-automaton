@@ -34,6 +34,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     let mut state = snapshot.state.clone();
     let mut last_error: Option<String> = None;
     let mut tool_calls = Vec::new();
+    let mut assistant_reply: Option<String> = None;
 
     if let Err(error) = advance_state(&mut state, &AgentEvent::TimerTick, &turn_id) {
         let _ = advance_state(
@@ -105,6 +106,10 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
 
         match infer_with_provider(&snapshot, &input).await {
             Ok(inference) => {
+                let trimmed_reply = inference.explanation.trim().to_string();
+                if !trimmed_reply.is_empty() {
+                    assistant_reply = Some(trimmed_reply);
+                }
                 if let Err(error) =
                     advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)
                 {
@@ -143,13 +148,26 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             {
                 last_error = Some(reason);
             } else {
-                if !staged_message_ids.is_empty() {
-                    let _ = stable::consume_staged_inbox_messages(
-                        &staged_message_ids,
-                        current_time_ns(),
-                    );
+                if staged_message_count > 0 {
+                    if let Some(reply) = assistant_reply.clone() {
+                        if let Err(error) = stable::post_outbox_message(
+                            turn_id.clone(),
+                            reply,
+                            staged_message_ids.clone(),
+                        ) {
+                            last_error = Some(error);
+                        }
+                    }
                 }
-                let _ = advance_state(&mut state, &AgentEvent::SleepRequested, &turn_id);
+                if last_error.is_none() {
+                    if !staged_message_ids.is_empty() {
+                        let _ = stable::consume_staged_inbox_messages(
+                            &staged_message_ids,
+                            current_time_ns(),
+                        );
+                    }
+                    let _ = advance_state(&mut state, &AgentEvent::SleepRequested, &turn_id);
+                }
             }
         }
     }

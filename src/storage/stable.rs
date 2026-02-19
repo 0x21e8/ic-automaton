@@ -1,8 +1,9 @@
 use crate::domain::types::{
     AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, JobStatus, ObservabilitySnapshot, RuntimeSnapshot,
-    RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, TaskKind, TaskLane,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    InferenceConfigView, InferenceProvider, JobStatus, ObservabilitySnapshot, OutboxMessage,
+    OutboxStats, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime,
+    SkillRecord, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    TransitionLogRecord, TurnRecord,
 };
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
@@ -29,6 +30,7 @@ fn now_ns() -> u64 {
 const RUNTIME_KEY: &str = "runtime.snapshot";
 const SCHEDULER_RUNTIME_KEY: &str = "scheduler.runtime";
 const INBOX_SEQ_KEY: &str = "inbox.seq";
+const OUTBOX_SEQ_KEY: &str = "outbox.seq";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
@@ -110,12 +112,19 @@ thread_local! {
         RefCell::new(StableBTreeMap::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(13)))
         ));
+    static OUTBOX_MAP: RefCell<StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>> =
+        RefCell::new(StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(14)))
+        ));
 }
 
 pub fn init_storage() {
     let _ = runtime_snapshot();
     if runtime_u64(INBOX_SEQ_KEY).is_none() {
         save_runtime_u64(INBOX_SEQ_KEY, 0);
+    }
+    if runtime_u64(OUTBOX_SEQ_KEY).is_none() {
+        save_runtime_u64(OUTBOX_SEQ_KEY, 0);
     }
     init_scheduler_defaults(now_ns());
 }
@@ -598,10 +607,58 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
         scheduler: scheduler_runtime_view(),
         inbox_stats: inbox_stats(),
         inbox_messages: list_inbox_messages(bounded_limit),
+        outbox_stats: outbox_stats(),
+        outbox_messages: list_outbox_messages(bounded_limit),
         recent_turns: list_turns(bounded_limit),
         recent_transitions: list_recent_transitions(bounded_limit),
         recent_jobs: list_recent_jobs(bounded_limit),
     }
+}
+
+pub fn post_outbox_message(
+    turn_id: String,
+    body: String,
+    source_inbox_ids: Vec<String>,
+) -> Result<String, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err("outbox message cannot be empty".to_string());
+    }
+
+    let seq = next_outbox_seq();
+    let id = format!("outbox:{seq:020}");
+    let message = OutboxMessage {
+        id: id.clone(),
+        seq,
+        turn_id,
+        body: trimmed.to_string(),
+        created_at_ns: now_ns(),
+        source_inbox_ids,
+    };
+    OUTBOX_MAP.with(|map| {
+        map.borrow_mut().insert(id.clone(), encode_json(&message));
+    });
+    Ok(id)
+}
+
+pub fn list_outbox_messages(limit: usize) -> Vec<OutboxMessage> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut messages = OUTBOX_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<OutboxMessage>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+    messages.sort_by_key(|message| std::cmp::Reverse(message.seq));
+    messages.truncate(limit);
+    messages
+}
+
+pub fn outbox_stats() -> OutboxStats {
+    let total_messages = OUTBOX_MAP.with(|map| map.borrow().len());
+    OutboxStats { total_messages }
 }
 
 pub fn stage_pending_inbox_messages(batch_size: usize, now_ns: u64) -> usize {
@@ -1057,6 +1114,12 @@ fn inbox_staged_key(seq: u64) -> String {
     format!("inbox:staged:{seq:020}")
 }
 
+fn next_outbox_seq() -> u64 {
+    let next = runtime_u64(OUTBOX_SEQ_KEY).unwrap_or(0).saturating_add(1);
+    save_runtime_u64(OUTBOX_SEQ_KEY, next);
+    next
+}
+
 fn queue_index_key(lane: &TaskLane, scheduled_for_ns: u64, priority: u8, seq: u64) -> String {
     format!(
         "queue:{}:{:020}:{:03}:{:020}",
@@ -1305,5 +1368,31 @@ mod tests {
             defaulted.inbox_messages.len() <= DEFAULT_OBSERVABILITY_LIMIT,
             "default limit should bound inbox messages"
         );
+    }
+
+    #[test]
+    fn outbox_post_and_snapshot_are_ordered() {
+        init_storage();
+        let first_id = post_outbox_message(
+            "turn-1".to_string(),
+            "first assistant reply".to_string(),
+            vec!["inbox:00000000000000000001".to_string()],
+        )
+        .expect("first outbox message should be accepted");
+        let second_id = post_outbox_message(
+            "turn-2".to_string(),
+            "second assistant reply".to_string(),
+            vec!["inbox:00000000000000000002".to_string()],
+        )
+        .expect("second outbox message should be accepted");
+
+        let outbox = list_outbox_messages(10);
+        assert_eq!(outbox.len(), 2);
+        assert_eq!(outbox[0].id, second_id);
+        assert_eq!(outbox[1].id, first_id);
+
+        let snapshot = observability_snapshot(10);
+        assert_eq!(snapshot.outbox_stats.total_messages, 2);
+        assert_eq!(snapshot.outbox_messages.len(), 2);
     }
 }
