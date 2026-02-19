@@ -1,6 +1,6 @@
 use crate::domain::cycle_admission::{
-    affordability_requirements, estimate_operation_cost, AffordabilityRequirements, OperationClass,
-    DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+    affordability_requirements, can_afford, estimate_operation_cost, AffordabilityRequirements,
+    OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
     InferenceInput, InferenceProvider, RuntimeSnapshot, SurvivalOperationClass, ToolCall,
@@ -423,7 +423,7 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
         let requirements =
             Self::affordability_requirements(request_size_bytes, self.max_response_bytes)?;
         let total_cycles = ic_cdk::api::canister_cycle_balance();
-        let liquid_cycles = total_cycles.saturating_sub(DEFAULT_RESERVE_FLOOR_CYCLES);
+        let liquid_cycles = ic_cdk::api::canister_liquid_cycle_balance();
 
         log!(
             InferenceLogPriority::Info,
@@ -438,7 +438,7 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
             DEFAULT_RESERVE_FLOOR_CYCLES,
         );
 
-        if liquid_cycles < requirements.required_cycles {
+        if !can_afford(liquid_cycles, &requirements) {
             stable::record_survival_operation_failure(
                 &SurvivalOperationClass::Inference,
                 now_ns,
