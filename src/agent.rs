@@ -47,6 +47,13 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         return Err(error);
     }
 
+    let staged_messages = stable::list_staged_inbox_messages(50);
+    let staged_message_ids = staged_messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let staged_message_count = staged_messages.len();
+
     let poll = MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor);
     let (next_cursor, evm_events) = match poll {
         Ok(poll) => (poll.cursor, poll.events.len()),
@@ -62,7 +69,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             return Err(reason);
         }
     };
-    let has_input = evm_events > 0;
+    let has_input = evm_events > 0 || staged_message_count > 0;
 
     if let Err(reason) = advance_state(
         &mut state,
@@ -78,9 +85,20 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     }
 
     if has_input {
-        let context_summary = format!("evm_events:{evm_events}");
+        let inbox_preview = staged_messages
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let context_summary = format!(
+            "inbox_messages:{staged_message_count};evm_events:{evm_events};inbox_preview:{inbox_preview}"
+        );
         let input = InferenceInput {
-            input: "poll:".to_string(),
+            input: if staged_message_count > 0 {
+                format!("inbox:{inbox_preview}")
+            } else {
+                "poll:".to_string()
+            },
             context_snippet: context_summary,
             turn_id: turn_id.clone(),
         };
@@ -125,6 +143,12 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             {
                 last_error = Some(reason);
             } else {
+                if !staged_message_ids.is_empty() {
+                    let _ = stable::consume_staged_inbox_messages(
+                        &staged_message_ids,
+                        current_time_ns(),
+                    );
+                }
                 let _ = advance_state(&mut state, &AgentEvent::SleepRequested, &turn_id);
             }
         }
@@ -139,10 +163,14 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         created_at_ns: started_at_ns,
         state_from: initial_state,
         state_to: state.clone(),
-        source_events: evm_events as u32,
+        source_events: (evm_events as u32)
+            .saturating_add(u32::try_from(staged_message_count).unwrap_or(u32::MAX)),
         tool_call_count: u32::try_from(tool_calls.len()).unwrap_or(0),
         input_summary: if has_input {
-            format!("evm:{}:{}", next_cursor.chain_id, evm_events)
+            format!(
+                "inbox:{}:evm:{}:{}",
+                staged_message_count, next_cursor.chain_id, evm_events
+            )
         } else {
             "no-input".to_string()
         },

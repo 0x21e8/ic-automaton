@@ -234,6 +234,210 @@ pub struct InferenceInput {
     pub turn_id: String,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum InboxMessageStatus {
+    Pending,
+    Staged,
+    Consumed,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct InboxMessage {
+    pub id: String,
+    pub seq: u64,
+    pub body: String,
+    pub posted_at_ns: u64,
+    pub posted_by: String,
+    pub status: InboxMessageStatus,
+    pub staged_at_ns: Option<u64>,
+    pub consumed_at_ns: Option<u64>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct InboxStats {
+    pub total_messages: u64,
+    pub pending_count: u64,
+    pub staged_count: u64,
+    pub consumed_count: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TaskKind {
+    AgentTurn,
+    PollInbox,
+    CheckCycles,
+    Reconcile,
+}
+
+impl TaskKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::AgentTurn => "AgentTurn",
+            Self::PollInbox => "PollInbox",
+            Self::CheckCycles => "CheckCycles",
+            Self::Reconcile => "Reconcile",
+        }
+    }
+
+    pub const fn default_priority(&self) -> u8 {
+        match self {
+            Self::AgentTurn => 0,
+            Self::PollInbox => 1,
+            Self::CheckCycles => 2,
+            Self::Reconcile => 3,
+        }
+    }
+
+    pub const fn essential(&self) -> bool {
+        match self {
+            Self::AgentTurn => true,
+            Self::PollInbox => true,
+            Self::CheckCycles => true,
+            Self::Reconcile => false,
+        }
+    }
+
+    pub const fn default_interval_secs(&self) -> u64 {
+        match self {
+            Self::AgentTurn => 30,
+            Self::PollInbox => 30,
+            Self::CheckCycles => 60,
+            Self::Reconcile => 300,
+        }
+    }
+
+    pub const fn all() -> &'static [Self] {
+        static TASK_KINDS: [TaskKind; 4] = [
+            TaskKind::AgentTurn,
+            TaskKind::PollInbox,
+            TaskKind::CheckCycles,
+            TaskKind::Reconcile,
+        ];
+        &TASK_KINDS
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TaskLane {
+    Mutating,
+    ReadOnly,
+}
+
+impl TaskLane {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mutating => "mutating",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct TaskScheduleConfig {
+    pub kind: TaskKind,
+    pub enabled: bool,
+    pub essential: bool,
+    pub interval_secs: u64,
+    pub priority: u8,
+    pub max_backoff_secs: u64,
+}
+
+impl TaskScheduleConfig {
+    pub fn default_for(kind: &TaskKind) -> Self {
+        Self {
+            kind: kind.clone(),
+            enabled: true,
+            essential: kind.essential(),
+            interval_secs: kind.default_interval_secs(),
+            priority: kind.default_priority(),
+            max_backoff_secs: 120,
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct TaskScheduleRuntime {
+    pub kind: TaskKind,
+    pub next_due_ns: u64,
+    pub backoff_until_ns: Option<u64>,
+    pub consecutive_failures: u32,
+    pub pending_job_id: Option<String>,
+    pub last_started_ns: Option<u64>,
+    pub last_finished_ns: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum JobStatus {
+    Pending,
+    InFlight,
+    Succeeded,
+    Failed,
+    TimedOut,
+    Skipped,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct ScheduledJob {
+    pub id: String,
+    pub kind: TaskKind,
+    pub lane: TaskLane,
+    pub dedupe_key: String,
+    pub priority: u8,
+    pub created_at_ns: u64,
+    pub scheduled_for_ns: u64,
+    pub started_at_ns: Option<u64>,
+    pub finished_at_ns: Option<u64>,
+    pub status: JobStatus,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub last_error: Option<String>,
+}
+
+impl ScheduledJob {
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Skipped
+        )
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct SchedulerLease {
+    pub lane: TaskLane,
+    pub job_id: String,
+    pub acquired_at_ns: u64,
+    pub expires_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct SchedulerRuntime {
+    pub enabled: bool,
+    pub paused_reason: Option<String>,
+    pub low_cycles_mode: bool,
+    pub next_job_seq: u64,
+    pub active_mutating_lease: Option<SchedulerLease>,
+    pub last_tick_started_ns: u64,
+    pub last_tick_finished_ns: u64,
+    pub last_tick_error: Option<String>,
+}
+
+impl Default for SchedulerRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paused_reason: None,
+            low_cycles_mode: false,
+            next_job_seq: 0,
+            active_mutating_lease: None,
+            last_tick_started_ns: 0,
+            last_tick_finished_ns: 0,
+            last_tick_error: None,
+        }
+    }
+}
+
 fn default_inference_model() -> String {
     "llama3.1:8b".to_string()
 }

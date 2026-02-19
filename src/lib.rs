@@ -1,16 +1,19 @@
 mod agent;
 mod domain;
 mod features;
+mod scheduler;
 mod storage;
 mod tools;
 
-use crate::agent::{run_scheduled_turn, TURN_TIMER_SECONDS};
 use crate::domain::types::{
-    InferenceConfigView, InferenceProvider, RuntimeView, SkillRecord, ToolCallRecord,
+    InboxMessage, InboxStats, InferenceConfigView, InferenceProvider, RuntimeView, ScheduledJob,
+    SchedulerRuntime, SkillRecord, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    ToolCallRecord,
 };
+use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
 use crate::tools::ToolManager;
-use ic_cdk_timers::set_timer_interval;
+use ic_cdk_timers::set_timer_interval_serial;
 use std::time::Duration;
 
 #[ic_cdk::init]
@@ -57,6 +60,58 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
 #[ic_cdk::query]
 fn get_runtime_view() -> RuntimeView {
     stable::snapshot_to_view()
+}
+
+#[ic_cdk::query]
+fn get_scheduler_view() -> SchedulerRuntime {
+    stable::scheduler_runtime_view()
+}
+
+#[ic_cdk::query]
+fn list_scheduler_jobs(limit: u32) -> Vec<ScheduledJob> {
+    stable::list_recent_jobs(limit as usize)
+}
+
+#[ic_cdk::query]
+fn list_task_schedules() -> Vec<(TaskScheduleConfig, TaskScheduleRuntime)> {
+    stable::list_task_schedules()
+}
+
+#[ic_cdk::update]
+fn post_inbox_message(message: String) -> Result<String, String> {
+    stable::post_inbox_message(message, ic_cdk::api::msg_caller().to_text())
+}
+
+#[ic_cdk::query]
+fn list_inbox_messages(limit: u32) -> Vec<InboxMessage> {
+    stable::list_inbox_messages(limit as usize)
+}
+
+#[ic_cdk::query]
+fn get_inbox_stats() -> InboxStats {
+    stable::inbox_stats()
+}
+
+#[ic_cdk::update]
+fn set_scheduler_enabled(enabled: bool) -> String {
+    stable::set_scheduler_enabled(enabled)
+}
+
+#[ic_cdk::update]
+fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
+    stable::set_scheduler_low_cycles_mode(enabled)
+}
+
+#[ic_cdk::update]
+fn set_task_interval_secs(kind: TaskKind, interval_secs: u64) -> Result<String, String> {
+    stable::set_task_interval_secs(&kind, interval_secs)?;
+    Ok("task_interval_updated".to_string())
+}
+
+#[ic_cdk::update]
+fn set_task_enabled(kind: TaskKind, enabled: bool) -> String {
+    stable::set_task_enabled(&kind, enabled);
+    "task_enabled_updated".to_string()
 }
 
 #[ic_cdk::query]
@@ -114,9 +169,7 @@ fn get_tool_calls_for_turn(turn_id: String) -> Vec<ToolCallRecord> {
 }
 
 fn arm_timer() {
-    set_timer_interval(Duration::from_secs(TURN_TIMER_SECONDS), || {
-        run_scheduled_turn()
-    });
+    set_timer_interval_serial(Duration::from_secs(1), scheduler_tick);
 }
 
 ic_cdk::export_candid!();

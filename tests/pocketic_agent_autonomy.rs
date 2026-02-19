@@ -86,6 +86,14 @@ struct RuntimeView {
     inference_model: String,
 }
 
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct InboxStats {
+    total_messages: u64,
+    pending_count: u64,
+    staged_count: u64,
+    consumed_count: u64,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     if !Path::new(WASM_PATH).exists() {
         panic!("build artifact not found at {WASM_PATH}; run `icp build` before PocketIC tests");
@@ -168,6 +176,26 @@ fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJo
         panic!("failed to encode list_scheduler_jobs args: {error}");
     });
     call_query(pic, canister_id, "list_scheduler_jobs", payload)
+}
+
+fn post_inbox_message(
+    pic: &PocketIc,
+    canister_id: Principal,
+    message: &str,
+) -> Result<String, String> {
+    let payload = encode_args((message.to_string(),)).unwrap_or_else(|error| {
+        panic!("failed to encode post_inbox_message args: {error}");
+    });
+    call_update(pic, canister_id, "post_inbox_message", payload)
+}
+
+fn get_inbox_stats(pic: &PocketIc, canister_id: Principal) -> InboxStats {
+    call_query(
+        pic,
+        canister_id,
+        "get_inbox_stats",
+        encode_args(()).expect("failed to encode empty args"),
+    )
 }
 
 fn get_runtime_view(pic: &PocketIc, canister_id: Principal) -> RuntimeView {
@@ -276,4 +304,61 @@ fn agent_turn_self_recovers_after_transient_inference_failure() {
         succeeded_count >= 1,
         "expected a successful recovery agent turn"
     );
+}
+
+#[test]
+fn poll_inbox_stages_messages_and_agent_turn_consumes_them() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
+
+    assert!(post_inbox_message(&pic, canister_id, "hello one").is_ok());
+    assert!(post_inbox_message(&pic, canister_id, "hello two").is_ok());
+
+    let before = get_inbox_stats(&pic, canister_id);
+    assert_eq!(before.total_messages, 2);
+    assert_eq!(before.pending_count, 2);
+    assert_eq!(before.staged_count, 0);
+    assert_eq!(before.consumed_count, 0);
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let after_poll = get_inbox_stats(&pic, canister_id);
+    assert_eq!(after_poll.pending_count, 0);
+    assert_eq!(after_poll.staged_count, 2);
+    assert_eq!(after_poll.consumed_count, 0);
+
+    let poll_succeeded = list_scheduler_jobs(&pic, canister_id)
+        .into_iter()
+        .any(|job| job.kind == TaskKind::PollInbox && job.status == JobStatus::Succeeded);
+    assert!(
+        poll_succeeded,
+        "poll inbox job should complete successfully"
+    );
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, false);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let after_agent = get_inbox_stats(&pic, canister_id);
+    assert_eq!(after_agent.pending_count, 0);
+    assert_eq!(after_agent.staged_count, 0);
+    assert_eq!(after_agent.consumed_count, 2);
+
+    let agent_succeeded = list_scheduler_jobs(&pic, canister_id)
+        .into_iter()
+        .any(|job| job.kind == TaskKind::AgentTurn && job.status == JobStatus::Succeeded);
+    assert!(agent_succeeded, "agent turn should complete successfully");
 }
