@@ -308,6 +308,7 @@ fn build_certification_state() -> HttpCertificationState {
         ),
         upgrade_route(Method::GET, "/api/snapshot"),
         upgrade_route(Method::GET, "/api/inference/config"),
+        upgrade_route(Method::POST, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/inbox"),
     ];
     for route in &routes {
@@ -675,6 +676,17 @@ mod tests {
         init_certification();
 
         let request = HttpRequest::get("/api/inference/config").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn post_inference_config_route_is_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::post("/api/inference/config").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
