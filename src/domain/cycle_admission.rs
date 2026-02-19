@@ -1,10 +1,10 @@
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationClass {
     HttpOutcall {
         request_size_bytes: u64,
         max_response_bytes: u64,
     },
+    #[allow(dead_code)]
     ThresholdSign {
         key_name: String,
         ecdsa_curve: u32,
@@ -64,7 +64,6 @@ pub fn affordability_requirements(
     }
 }
 
-#[allow(dead_code)]
 pub fn can_afford(liquid_cycles: u128, requirements: &AffordabilityRequirements) -> bool {
     liquid_cycles >= requirements.required_cycles
 }
@@ -82,7 +81,6 @@ pub fn can_afford_operation(
     Ok(can_afford(liquid_cycles, &requirements))
 }
 
-#[allow(dead_code)]
 pub fn can_afford_with_reserve(
     total_cycles: u128,
     operation: &OperationClass,

@@ -180,6 +180,12 @@ impl ToolManager {
                                 stable::record_survival_operation_success(
                                     &SurvivalOperationClass::ThresholdSign,
                                 );
+                            } else {
+                                stable::record_survival_operation_failure(
+                                    &SurvivalOperationClass::ThresholdSign,
+                                    now_ns,
+                                    stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN,
+                                );
                             }
                             result
                         }
@@ -196,6 +202,12 @@ impl ToolManager {
                             if result.is_ok() {
                                 stable::record_survival_operation_success(
                                     &SurvivalOperationClass::EvmBroadcast,
+                                );
+                            } else {
+                                stable::record_survival_operation_failure(
+                                    &SurvivalOperationClass::EvmBroadcast,
+                                    now_ns,
+                                    stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST,
                                 );
                             }
                             result

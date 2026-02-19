@@ -1,7 +1,8 @@
 use crate::agent::run_scheduled_turn_job;
 use crate::domain::cycle_admission::{
-    affordability_requirements, estimate_operation_cost, AffordabilityRequirements, OperationClass,
-    DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+    affordability_requirements, can_afford_with_reserve, estimate_operation_cost,
+    AffordabilityRequirements, OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES,
+    DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
     JobStatus, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
@@ -173,8 +174,8 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
 
 async fn run_check_cycles() -> Result<(), String> {
     let total_cycles = ic_cdk::api::canister_cycle_balance();
-    let liquid_cycles = total_cycles.saturating_sub(DEFAULT_RESERVE_FLOOR_CYCLES);
-    let expected = classify_survival_tier(liquid_cycles)?;
+    let liquid_cycles = ic_cdk::api::canister_liquid_cycle_balance();
+    let expected = classify_survival_tier(total_cycles, liquid_cycles)?;
     let requirements = check_cycles_requirements()?;
 
     stable::set_scheduler_survival_tier(expected.clone());
@@ -203,11 +204,23 @@ fn check_cycles_requirements() -> Result<AffordabilityRequirements, String> {
     Ok(affordability_requirements(
         operation_cost,
         DEFAULT_SAFETY_MARGIN_BPS,
-        DEFAULT_RESERVE_FLOOR_CYCLES,
+        0,
     ))
 }
 
-fn classify_survival_tier(liquid_cycles: u128) -> Result<SurvivalTier, String> {
+fn classify_survival_tier(total_cycles: u128, liquid_cycles: u128) -> Result<SurvivalTier, String> {
+    let can_cover_critical_floor = can_afford_with_reserve(
+        total_cycles,
+        &OperationClass::WorkflowEnvelope {
+            envelope_cycles: CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES,
+        },
+        DEFAULT_SAFETY_MARGIN_BPS,
+        DEFAULT_RESERVE_FLOOR_CYCLES,
+    )?;
+    if !can_cover_critical_floor {
+        return Ok(SurvivalTier::Critical);
+    }
+
     let requirements = check_cycles_requirements()?;
     if liquid_cycles < requirements.required_cycles {
         return Ok(SurvivalTier::Critical);
@@ -437,7 +450,11 @@ mod tests {
 
         let below_critical = requirements.required_cycles.saturating_sub(1);
         assert_eq!(
-            classify_survival_tier(below_critical).expect("tier should classify"),
+            classify_survival_tier(
+                below_critical.saturating_add(DEFAULT_RESERVE_FLOOR_CYCLES),
+                below_critical,
+            )
+            .expect("tier should classify"),
             SurvivalTier::Critical
         );
 
@@ -445,12 +462,20 @@ mod tests {
             .required_cycles
             .saturating_add((low_threshold.saturating_sub(requirements.required_cycles)) / 2);
         assert_eq!(
-            classify_survival_tier(low_tier).expect("tier should classify"),
+            classify_survival_tier(
+                low_tier.saturating_add(DEFAULT_RESERVE_FLOOR_CYCLES),
+                low_tier
+            )
+            .expect("tier should classify"),
             SurvivalTier::LowCycles
         );
 
         assert_eq!(
-            classify_survival_tier(low_threshold).expect("tier should classify"),
+            classify_survival_tier(
+                low_threshold.saturating_add(DEFAULT_RESERVE_FLOOR_CYCLES),
+                low_threshold,
+            )
+            .expect("tier should classify"),
             SurvivalTier::Normal
         );
     }

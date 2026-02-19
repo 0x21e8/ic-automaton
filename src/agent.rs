@@ -69,6 +69,11 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             (poll.cursor, poll.events.len())
         }
         Some(Err(reason)) => {
+            stable::record_survival_operation_failure(
+                &SurvivalOperationClass::EvmPoll,
+                started_at_ns,
+                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+            );
             let _ = advance_state(
                 &mut state,
                 &AgentEvent::TurnFailed {
