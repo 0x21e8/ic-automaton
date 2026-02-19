@@ -274,8 +274,10 @@ Improvements still needed:
 
 1. Lower `max_response_bytes` default for inference
 - Candidate: from `64KB` to `16KB`.
-- Add fallback escalation path:
-  - If response limit exceeded/parsing fails due truncation, retry once with `32KB`.
+- Add fallback escalation path via configurable doubling:
+  - On truncation/size-style failures, retry by doubling `max_response_bytes`.
+  - Number of doublings is configurable.
+  - Absolute cap is 2,000,000 bytes (IC max); never exceed it.
 
 2. Bound model output size explicitly
 - Add provider params (e.g., `max_tokens`) so responses stay within low caps.
@@ -318,7 +320,7 @@ Improvements still needed:
 ## Phase 4: Outcall Cost Tuning
 - Reduce default `max_response_bytes`.
 - Add bounded response sizing controls in provider request.
-- Add fallback retry with larger cap only when necessary.
+- Add configurable doubling retries with strict 2 MB cap.
 
 ## Tradeoff Summary
 
@@ -327,6 +329,7 @@ Improvements still needed:
 | Hybrid survival controller | Stops repeated failures and preserves autonomy | More state/policy complexity |
 | Global admission controller (all expensive ops) | Prevents cost-shift regressions from new features | Larger surface area and tuning complexity |
 | Lower `max_response_bytes` | Large cycle savings | Risk of truncation unless outputs are bounded |
+| Configurable doubling fallback (capped) | Improves resilience to response-size variance | Can increase cycles if too many retries are allowed |
 | Per-request affordability preflight | Prevents unaffordable calls | Requires threshold and margin tuning |
 | 5-minute periodic cycle checks | Lower scheduler overhead/noise | Coarser visibility without event-triggered updates |
 | Hysteresis on recovery | Prevents flapping | Slower return to full throughput |
@@ -335,6 +338,8 @@ Improvements still needed:
 
 - `CheckCycles` interval: `300s`.
 - Inference default `max_response_bytes`: `16KB`.
+- Inference fallback doubling attempts: configurable (`0..N`), recommended default `N=2`.
+- Inference response-size hard ceiling: `2_000_000` bytes.
 - Inference affordability margin:
   - `required = cost_http_request(req) + safety_margin`.
   - `safety_margin` initial: `25%` of computed cost (tune via telemetry).

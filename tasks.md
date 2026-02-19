@@ -78,10 +78,12 @@ Rule for every step:
 - [ ] **Step 6: HTTPS outcall cost optimization**
   - Scope:
     - Lower default inference `max_response_bytes` (target 16KB).
-    - Add one-step bounded fallback retry (e.g. 32KB) for truncation/size failures only.
+    - Add configurable fallback retry via size doubling for truncation/size failures only.
+    - Add config knob for maximum doubling attempts (e.g. 0..N).
+    - Enforce hard upper bound `max_response_bytes <= 2_000_000` (2 MB).
     - Add explicit output-bounding request fields where provider supports it.
   - Tests first:
-    - Unit tests for request shaping and fallback trigger conditions.
+    - Unit tests for request shaping, fallback trigger conditions, doubling behavior, and 2 MB clamp.
   - Verification:
     - `cargo test -q`
     - `cargo clippy --all-targets --all-features -- -D warnings`
