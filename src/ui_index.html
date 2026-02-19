@@ -36,6 +36,50 @@
         </form>
       </section>
 
+      <section class="panel inference reveal" aria-labelledby="inference-title">
+        <h2 id="inference-title">Inference Provider</h2>
+        <form id="inference-form" class="inference-form">
+          <div class="field">
+            <label for="inference-provider">Provider</label>
+            <select id="inference-provider">
+              <option value="llm_canister">llm_canister (mock)</option>
+              <option value="openrouter">openrouter</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="inference-model-preset">Model</label>
+            <select id="inference-model-preset">
+              <option value="llama3.1:8b">llama3.1:8b</option>
+              <option value="qwen3:32b">qwen3:32b</option>
+              <option value="llama4-scout">llama4-scout</option>
+              <option value="custom">custom override</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="inference-model-custom">Custom model override</label>
+            <input id="inference-model-custom" type="text" placeholder="Or enter any model id" />
+          </div>
+
+          <div class="field">
+            <label for="inference-key-action">OpenRouter API Key</label>
+            <select id="inference-key-action">
+              <option value="keep">keep</option>
+              <option value="set">set</option>
+              <option value="clear">clear</option>
+            </select>
+            <input id="inference-api-key" type="password" placeholder="API key" autocomplete="off" />
+            <p id="inference-key-help" class="muted">Current key: not shown</p>
+          </div>
+
+          <div class="composer-row">
+            <button id="inference-submit" class="btn" type="submit">Apply Inference Config</button>
+            <p id="inference-status" class="muted status-text" aria-live="polite"></p>
+          </div>
+        </form>
+      </section>
+
       <section class="grid reveal">
         <article class="panel">
           <h2>Runtime</h2>
