@@ -14,7 +14,7 @@ use std::cell::RefCell;
 
 fn now_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
-    return time();
+    return ic_cdk::api::time();
 
     #[cfg(not(target_arch = "wasm32"))]
     {
