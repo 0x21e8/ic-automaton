@@ -5,6 +5,11 @@ const state = {
   knownJobIds: new Set(),
   knownMessageIds: new Set(),
   pollHandle: null,
+  inferenceConfig: {
+    provider: "llm_canister",
+    model: "",
+    openrouter_has_api_key: false,
+  },
 };
 
 const el = {
@@ -18,7 +23,22 @@ const el = {
   transitions: document.getElementById("transitions-list"),
   jobs: document.getElementById("jobs-list"),
   messages: document.getElementById("messages-list"),
+  inferenceForm: document.getElementById("inference-form"),
+  inferenceSubmit: document.getElementById("inference-submit"),
+  inferenceStatus: document.getElementById("inference-status"),
+  inferenceProvider: document.getElementById("inference-provider"),
+  inferenceModelPreset: document.getElementById("inference-model-preset"),
+  inferenceModelCustom: document.getElementById("inference-model-custom"),
+  inferenceKeyAction: document.getElementById("inference-key-action"),
+  inferenceApiKey: document.getElementById("inference-api-key"),
+  inferenceKeyHelp: document.getElementById("inference-key-help"),
 };
+
+const INFERENCE_MODEL_PRESETS = [
+  "llama3.1:8b",
+  "qwen3:32b",
+  "llama4-scout",
+];
 
 function relativeTimeFromNs(ns) {
   if (!ns) {
@@ -65,7 +85,53 @@ function renderTimeline(container, items, idKey, labelBuilder, knownSet) {
       <code>${escapeHtml(id)}</code>
     </div>`;
   });
-  container.innerHTML = rows.length > 0 ? rows.join("") : '<p class="muted">No data yet.</p>';
+  container.innerHTML = rows.length > 0 ? rows.join("") : "<p class=\"muted\">No data yet.</p>";
+}
+
+function inferModelFromForm() {
+  const customModel = el.inferenceModelCustom.value.trim();
+  if (customModel) {
+    return customModel;
+  }
+  if (el.inferenceModelPreset.value === "custom") {
+    return "";
+  }
+  return el.inferenceModelPreset.value;
+}
+
+function syncInferenceModelSelect(model) {
+  if (INFERENCE_MODEL_PRESETS.includes(model)) {
+    el.inferenceModelPreset.value = model;
+    el.inferenceModelCustom.value = "";
+  } else {
+    el.inferenceModelPreset.value = "custom";
+    el.inferenceModelCustom.value = model;
+  }
+}
+
+function syncInferenceControls() {
+  const config = state.inferenceConfig || {};
+  const provider = config.provider || "llm_canister";
+  const hasOpenRouterKey = Boolean(config.openrouter_has_api_key);
+  const model = config.model || "";
+  const isOpenRouter = provider === "OpenRouter";
+
+  el.inferenceProvider.value = provider === "OpenRouter" ? "openrouter" : "llm_canister";
+  syncInferenceModelSelect(model);
+
+  el.inferenceKeyHelp.textContent = hasOpenRouterKey
+    ? "Current key: present"
+    : "Current key: not present";
+  if (!isOpenRouter) {
+    el.inferenceKeyHelp.textContent = "Key controls are available for OpenRouter only";
+    el.inferenceKeyAction.value = "keep";
+    el.inferenceApiKey.value = "";
+  }
+
+  el.inferenceKeyAction.disabled = !isOpenRouter;
+  el.inferenceApiKey.disabled = !isOpenRouter;
+  el.inferenceModelPreset.disabled = false;
+  el.inferenceModelCustom.disabled = false;
 }
 
 async function apiFetch(path, init) {
@@ -99,7 +165,8 @@ async function refreshSnapshot() {
     const transitions = snapshot.recent_transitions || [];
 
     const runtimeState = runtime.state || "Unknown";
-    const runtimeBadge = runtimeState === "Faulted" ? statusBadge(runtimeState, "danger") : statusBadge(runtimeState, "ok");
+    const runtimeBadge =
+      runtimeState === "Faulted" ? statusBadge(runtimeState, "danger") : statusBadge(runtimeState, "ok");
     renderStats(el.runtime, [
       ["state", runtimeState],
       ["state badge", runtimeBadge.replace(/<[^>]+>/g, runtimeState)],
@@ -132,7 +199,9 @@ async function refreshSnapshot() {
       transitions,
       "id",
       (item) =>
-        `${escapeHtml(item.from_state || "?")} -> ${escapeHtml(item.to_state || "?")} · ${relativeTimeFromNs(item.occurred_at_ns)}`,
+        `${escapeHtml(item.from_state || "?")} -> ${escapeHtml(item.to_state || "?")} · ${relativeTimeFromNs(
+          item.occurred_at_ns
+        )}`,
       state.knownTransitionIds
     );
     renderTimeline(
@@ -140,7 +209,9 @@ async function refreshSnapshot() {
       jobs,
       "id",
       (item) =>
-        `${escapeHtml(item.kind || "?")} · ${escapeHtml(item.status || "?")} · ${relativeTimeFromNs(item.finished_at_ns || item.created_at_ns)}`,
+        `${escapeHtml(item.kind || "?")} · ${escapeHtml(item.status || "?")} · ${relativeTimeFromNs(
+          item.finished_at_ns || item.created_at_ns
+        )}`,
       state.knownJobIds
     );
     renderTimeline(
@@ -158,6 +229,16 @@ async function refreshSnapshot() {
   }
 }
 
+async function refreshInferenceConfig() {
+  try {
+    const config = await apiFetch("/api/inference/config", { method: "GET" });
+    state.inferenceConfig = config;
+    syncInferenceControls();
+  } catch (error) {
+    el.inferenceStatus.textContent = `Inference config error: ${error.message}`;
+  }
+}
+
 async function submitMessage(message) {
   return apiFetch("/api/inbox", {
     method: "POST",
@@ -166,6 +247,68 @@ async function submitMessage(message) {
     },
     body: JSON.stringify({ message }),
   });
+}
+
+async function applyInferenceConfig() {
+  const provider = el.inferenceProvider.value;
+  const model = inferModelFromForm();
+  const keyAction = el.inferenceKeyAction.value;
+  const apiKey = el.inferenceApiKey.value.trim();
+  const isOpenRouter = provider === "openrouter";
+
+  if (!provider) {
+    el.inferenceStatus.textContent = "Provider is required.";
+    return;
+  }
+  if (isOpenRouter && !model) {
+    el.inferenceStatus.textContent = "Model is required for openrouter.";
+    return;
+  }
+  if (!isOpenRouter) {
+    if (keyAction !== "keep") {
+      el.inferenceStatus.textContent =
+        "Key actions are only available for OpenRouter.";
+      return;
+    }
+  } else if (keyAction === "set" && !apiKey) {
+    el.inferenceStatus.textContent = "API key is required when key action is set.";
+    return;
+  }
+
+  const payload = {
+    provider,
+    key_action: isOpenRouter ? keyAction : "keep",
+  };
+
+  if (model) {
+    payload.model = model;
+  }
+
+  if (keyAction === "set") {
+    payload.api_key = apiKey;
+  }
+
+  el.inferenceSubmit.disabled = true;
+  el.inferenceStatus.textContent = "Applying inference config...";
+  try {
+    await apiFetch("/api/inference/config", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    el.inferenceStatus.textContent = "Inference config updated.";
+    if (keyAction !== "keep") {
+      el.inferenceApiKey.value = "";
+    }
+    await refreshInferenceConfig();
+    await refreshSnapshot();
+  } catch (error) {
+    el.inferenceStatus.textContent = `Inference config update failed: ${error.message}`;
+  } finally {
+    el.inferenceSubmit.disabled = false;
+  }
 }
 
 el.form.addEventListener("submit", async (event) => {
@@ -190,9 +333,23 @@ el.form.addEventListener("submit", async (event) => {
   }
 });
 
+el.inferenceForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await applyInferenceConfig();
+});
+
+el.inferenceModelPreset.addEventListener("change", () => {
+  if (el.inferenceModelPreset.value === "custom") {
+    el.inferenceModelCustom.focus();
+  }
+});
+
 async function boot() {
-  await refreshSnapshot();
-  state.pollHandle = setInterval(refreshSnapshot, POLL_MS);
+  await Promise.all([refreshInferenceConfig(), refreshSnapshot()]);
+  state.pollHandle = setInterval(() => {
+    refreshSnapshot();
+    refreshInferenceConfig();
+  }, POLL_MS);
 }
 
 boot();

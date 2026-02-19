@@ -1,3 +1,4 @@
+use crate::domain::types::InferenceConfigView;
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 #[cfg(target_arch = "wasm32")]
@@ -18,7 +19,6 @@ const CONTENT_TYPE_JS: &str = "application/javascript; charset=utf-8";
 const CONTENT_TYPE_JSON: &str = "application/json; charset=utf-8";
 const CACHE_NO_STORE: &str = "no-store";
 const DEFAULT_SNAPSHOT_LIMIT: usize = 25;
-
 const UI_INDEX_HTML: &str = include_str!("ui_index.html");
 const UI_STYLES_CSS: &str = include_str!("ui_styles.css");
 const UI_APP_JS: &str = include_str!("ui_app.js");
@@ -67,6 +67,38 @@ struct InboxPostSuccess {
 struct InboxPostError {
     ok: bool,
     error: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InferenceConfigError {
+    ok: bool,
+    error: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InferenceConfigSuccess {
+    ok: bool,
+    config: InferenceConfigView,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InferenceConfigUpdateRequest {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    key_action: Option<OpenRouterKeyAction>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OpenRouterKeyAction {
+    Keep,
+    Set,
+    Clear,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -183,6 +215,42 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
                 }
             }
         }
+        (&Method::GET, "/api/inference/config") => {
+            let config = stable::inference_config_view();
+            json_update_response(StatusCode::OK, &config)
+        }
+        (&Method::POST, "/api/inference/config") => {
+            match parse_inference_config_request(request.body()) {
+                Ok(payload) => match apply_inference_config_update(payload) {
+                    Ok(_) => json_update_response(
+                        StatusCode::OK,
+                        &InferenceConfigSuccess {
+                            ok: true,
+                            config: stable::inference_config_view(),
+                        },
+                    ),
+                    Err(error) => {
+                        log!(
+                            HttpLogPriority::Warn,
+                            "http_inference_config_update_rejected err={}",
+                            error
+                        );
+                        json_update_response(
+                            StatusCode::BAD_REQUEST,
+                            &InferenceConfigError { ok: false, error },
+                        )
+                    }
+                },
+                Err(error) => {
+                    log!(
+                        HttpLogPriority::Warn,
+                        "http_inference_config_parse_rejected err={}",
+                        error.error
+                    );
+                    json_update_response(StatusCode::BAD_REQUEST, &error)
+                }
+            }
+        }
         _ => HttpResponse::not_found(
             br#"{"ok":false,"error":"not found"}"#.as_slice(),
             vec![
@@ -239,6 +307,7 @@ fn build_certification_state() -> HttpCertificationState {
             CONTENT_TYPE_JS,
         ),
         upgrade_route(Method::GET, "/api/snapshot"),
+        upgrade_route(Method::GET, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/inbox"),
     ];
     for route in &routes {
@@ -463,6 +532,66 @@ fn parse_inbox_post_request(body: &[u8]) -> Result<InboxPostRequest, String> {
     })
 }
 
+fn parse_inference_config_request(
+    body: &[u8],
+) -> Result<InferenceConfigUpdateRequest, InferenceConfigError> {
+    if body.is_empty() {
+        return Err(InferenceConfigError {
+            ok: false,
+            error: "inference config body cannot be empty".to_string(),
+        });
+    }
+
+    serde_json::from_slice::<InferenceConfigUpdateRequest>(body).map_err(|error| {
+        InferenceConfigError {
+            ok: false,
+            error: format!("invalid inference config payload: {error}"),
+        }
+    })
+}
+
+fn apply_inference_config_update(
+    payload: InferenceConfigUpdateRequest,
+) -> Result<InferenceConfigView, String> {
+    if let Some(raw_provider) = payload.provider {
+        let provider = parse_inference_provider(&raw_provider)?;
+        stable::set_inference_provider(provider);
+    }
+
+    if let Some(raw_model) = payload.model {
+        let model = raw_model.trim();
+        if !model.is_empty() {
+            stable::set_inference_model(model.to_string())?;
+        } else {
+            return Err("inference model cannot be empty".to_string());
+        }
+    }
+
+    match payload.key_action.unwrap_or(OpenRouterKeyAction::Keep) {
+        OpenRouterKeyAction::Keep => {}
+        OpenRouterKeyAction::Set => {
+            let trimmed_key = payload.api_key.unwrap_or_default().trim().to_string();
+            if trimmed_key.is_empty() {
+                return Err("api key cannot be empty when action is set".to_string());
+            }
+            stable::set_openrouter_api_key(Some(trimmed_key));
+        }
+        OpenRouterKeyAction::Clear => stable::set_openrouter_api_key(None),
+    }
+
+    Ok(stable::inference_config_view())
+}
+
+fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::InferenceProvider, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "llm_canister" | "llm-canister" | "ic_llm" | "icllm" | "mock" => {
+            Ok(crate::domain::types::InferenceProvider::IcLlm)
+        }
+        "openrouter" => Ok(crate::domain::types::InferenceProvider::OpenRouter),
+        unsupported => Err(format!("unsupported inference provider: {unsupported}")),
+    }
+}
+
 fn set_tree_as_certified_data(tree: &HttpCertificationTree) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -478,6 +607,7 @@ fn set_tree_as_certified_data(tree: &HttpCertificationTree) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn find_header<'a>(response: &'a HttpResponse<'_>, name: &str) -> Option<&'a str> {
         response
@@ -523,5 +653,79 @@ mod tests {
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn get_inference_config_route_is_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::get("/api/inference/config").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn inference_config_update_payload_rejects_invalid_json() {
+        init_certification();
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"provider": "openrouter", "key_action": "set"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(body.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(
+            body.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "api key cannot be empty when action is set"
+        );
+    }
+
+    #[test]
+    fn inference_config_update_reflects_viewed_state() {
+        stable::init_storage();
+        stable::set_inference_provider(crate::domain::types::InferenceProvider::IcLlm);
+        stable::set_inference_model("llama3.1:8b".to_string()).expect("model should set");
+        stable::set_openrouter_api_key(Some("test-key".to_string()));
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(
+                br#"{"provider":"openrouter","model":"qwen3:32b","key_action":"keep"}"#.to_vec(),
+            )
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(body.get("ok"), Some(&Value::Bool(true)));
+        let config = body.get("config").unwrap_or(&Value::Null);
+        assert_eq!(
+            config.get("provider"),
+            Some(&Value::String("OpenRouter".to_string()))
+        );
+        assert_eq!(
+            config.get("model"),
+            Some(&Value::String("qwen3:32b".to_string()))
+        );
+        assert!(config
+            .get("openrouter_has_api_key")
+            .and_then(Value::as_bool)
+            .unwrap_or(false));
+        assert!(config.get("openrouter_api_key").is_none());
     }
 }

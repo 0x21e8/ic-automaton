@@ -143,6 +143,46 @@ h2 {
   gap: var(--space-3);
 }
 
+.inference-form {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.field {
+  display: grid;
+  gap: 0.42rem;
+}
+
+.field label {
+  font-size: 0.82rem;
+  color: var(--color-muted);
+}
+
+select,
+input[type="text"],
+input[type="password"] {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--color-border);
+  background: rgba(8, 16, 22, 0.65);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  padding: 0.62rem 0.72rem;
+  font-size: 0.93rem;
+}
+
+select:focus-visible,
+input[type="text"]:focus-visible,
+input[type="password"]:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+input[disabled],
+select[disabled] {
+  opacity: 0.7;
+}
+
 textarea {
   width: 100%;
   min-height: 100px;

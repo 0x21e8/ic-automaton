@@ -61,15 +61,28 @@ where
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
 }
 
-fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
-where
-    T: for<'de> Deserialize<'de> + CandidType,
-{
+fn call_http_update<'a>(
+    pic: &PocketIc,
+    canister_id: Principal,
+    request: HttpUpdateRequest<'a>,
+) -> HttpUpdateResponse<'a> {
+    let payload = encode_args((request,))
+        .unwrap_or_else(|error| panic!("failed to encode http_request_update args: {error}"));
     let response = pic
-        .update_call(canister_id, Principal::anonymous(), method, payload)
-        .unwrap_or_else(|error| panic!("update call {method} failed: {error:?}"));
+        .update_call(
+            canister_id,
+            Principal::anonymous(),
+            "http_request_update",
+            payload,
+        )
+        .unwrap_or_else(|error| panic!("http update call failed: {error:?}"));
     decode_one(&response)
-        .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
+        .unwrap_or_else(|error| panic!("failed decoding http_request_update response: {error:?}"))
+}
+
+fn parse_json_response(response: &HttpUpdateResponse<'_>, context: &str) -> Value {
+    serde_json::from_slice(response.body())
+        .unwrap_or_else(|error| panic!("{context} should return json: {error}"))
 }
 
 #[test]
@@ -106,10 +119,7 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
         )])
         .with_body(post_payload)
         .build_update();
-    let post_args = encode_args((post_request,))
-        .unwrap_or_else(|error| panic!("failed to encode http_request_update args: {error}"));
-    let post_response: HttpUpdateResponse =
-        call_update(&pic, canister_id, "http_request_update", post_args);
+    let post_response = call_http_update(&pic, canister_id, post_request);
     assert_eq!(post_response.status_code().as_u16(), 200);
 
     let post_json: Value =
@@ -124,10 +134,7 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
     );
 
     let snapshot_request: HttpUpdateRequest = HttpRequest::get("/api/snapshot").build_update();
-    let snapshot_args = encode_args((snapshot_request,))
-        .unwrap_or_else(|error| panic!("failed to encode http_request_update args: {error}"));
-    let snapshot_response: HttpUpdateResponse =
-        call_update(&pic, canister_id, "http_request_update", snapshot_args);
+    let snapshot_response = call_http_update(&pic, canister_id, snapshot_request);
     assert_eq!(snapshot_response.status_code().as_u16(), 200);
 
     let snapshot: SnapshotEnvelope = serde_json::from_slice(snapshot_response.body())
@@ -147,5 +154,120 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
             .iter()
             .any(|msg| msg.get("id").and_then(Value::as_str) == Some(posted_id)),
         "snapshot should include the posted message id"
+    );
+}
+
+#[test]
+fn supports_inference_config_http_flow() {
+    let (pic, canister_id) = with_backend_canister();
+
+    let initial_response = call_http_update(
+        &pic,
+        canister_id,
+        HttpRequest::get("/api/inference/config").build_update(),
+    );
+    assert_eq!(initial_response.status_code().as_u16(), 200);
+    let initial_json = parse_json_response(&initial_response, "GET /api/inference/config");
+    assert_eq!(
+        initial_json
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "Mock"
+    );
+    assert!(initial_json.get("openrouter_api_key").is_none());
+    assert_eq!(
+        initial_json.get("openrouter_has_api_key"),
+        Some(&Value::Bool(false))
+    );
+
+    let set_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+        .with_headers(vec![(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )])
+        .with_body(
+            serde_json::json!({
+                "provider": "openrouter",
+                "model": "qwen3:32b",
+                "key_action": "set",
+                "api_key": "test-key",
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .build_update();
+    let set_response = call_http_update(&pic, canister_id, set_request);
+    assert_eq!(set_response.status_code().as_u16(), 200);
+    let set_json = parse_json_response(&set_response, "POST /api/inference/config set");
+    assert_eq!(set_json.get("ok"), Some(&Value::Bool(true)));
+    let set_config = &set_json["config"];
+    assert_eq!(
+        set_config.get("provider").and_then(Value::as_str),
+        Some("OpenRouter")
+    );
+    assert_eq!(
+        set_config.get("model").and_then(Value::as_str),
+        Some("qwen3:32b")
+    );
+    assert_eq!(
+        set_config
+            .get("openrouter_has_api_key")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(set_config.get("openrouter_api_key").is_none());
+
+    let reread_response = call_http_update(
+        &pic,
+        canister_id,
+        HttpRequest::get("/api/inference/config").build_update(),
+    );
+    assert_eq!(reread_response.status_code().as_u16(), 200);
+    let reread_json = parse_json_response(&reread_response, "GET /api/inference/config");
+    assert_eq!(
+        reread_json.get("provider").and_then(Value::as_str),
+        Some("OpenRouter")
+    );
+    assert_eq!(
+        reread_json
+            .get("openrouter_has_api_key")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(reread_json.get("openrouter_api_key").is_none());
+
+    let clear_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+        .with_headers(vec![(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )])
+        .with_body(
+            serde_json::json!({
+                "provider": "llm_canister",
+                "model": "llama3.1:8b",
+                "key_action": "clear",
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .build_update();
+    let clear_response = call_http_update(&pic, canister_id, clear_request);
+    assert_eq!(clear_response.status_code().as_u16(), 200);
+    let clear_json = parse_json_response(&clear_response, "POST /api/inference/config clear");
+    let clear_config = &clear_json["config"];
+    assert_eq!(
+        clear_config.get("provider").and_then(Value::as_str),
+        Some("IcLlm")
+    );
+    assert_eq!(
+        clear_config.get("model").and_then(Value::as_str),
+        Some("llama3.1:8b")
+    );
+    assert_eq!(
+        clear_config
+            .get("openrouter_has_api_key")
+            .and_then(Value::as_bool),
+        Some(false)
     );
 }
