@@ -4,6 +4,7 @@ const state = {
   knownTransitionIds: new Set(),
   knownJobIds: new Set(),
   pollHandle: null,
+  inferenceDirty: false,
   inferenceConfig: {
     provider: "llm_canister",
     model: "",
@@ -151,12 +152,16 @@ function syncInferenceModelSelect(model) {
 
 function syncInferenceControls() {
   const config = state.inferenceConfig || {};
-  const provider = config.provider || "llm_canister";
+  const selectedProvider = el.inferenceProvider.value;
+  const provider =
+    selectedProvider === "openrouter" || selectedProvider === "llm_canister"
+      ? selectedProvider
+      : config.provider || "llm_canister";
   const hasOpenRouterKey = Boolean(config.openrouter_has_api_key);
   const model = config.model || "";
-  const isOpenRouter = provider === "OpenRouter";
+  const isOpenRouter = provider === "openrouter" || provider === "OpenRouter";
 
-  el.inferenceProvider.value = provider === "OpenRouter" ? "openrouter" : "llm_canister";
+  el.inferenceProvider.value = isOpenRouter ? "openrouter" : "llm_canister";
   syncInferenceModelSelect(model);
   el.inferenceModelSection.hidden = !isOpenRouter;
   el.inferenceKeySection.hidden = !isOpenRouter;
@@ -269,7 +274,17 @@ async function refreshInferenceConfig() {
   try {
     const config = await apiFetch("/api/inference/config", { method: "GET" });
     state.inferenceConfig = config;
-    syncInferenceControls();
+    if (!state.inferenceDirty) {
+      syncInferenceControls();
+      return;
+    }
+    const hasOpenRouterKey = Boolean(config.openrouter_has_api_key);
+    el.inferenceKeyHelp.textContent = hasOpenRouterKey
+      ? "Current key: present"
+      : "Current key: not present";
+    if (el.inferenceProvider.value !== "openrouter") {
+      el.inferenceKeyHelp.textContent = "Key controls are available for OpenRouter only";
+    }
   } catch (error) {
     el.inferenceStatus.textContent = `Inference config error: ${error.message}`;
   }
@@ -325,6 +340,7 @@ async function applyInferenceConfig() {
   }
 
   el.inferenceSubmit.disabled = true;
+  state.inferenceDirty = false;
   el.inferenceStatus.textContent = "Applying inference config...";
   try {
     await apiFetch("/api/inference/config", {
@@ -341,6 +357,7 @@ async function applyInferenceConfig() {
     await refreshInferenceConfig();
     await refreshSnapshot();
   } catch (error) {
+    state.inferenceDirty = true;
     el.inferenceStatus.textContent = `Inference config update failed: ${error.message}`;
   } finally {
     el.inferenceSubmit.disabled = false;
@@ -375,13 +392,27 @@ el.inferenceForm.addEventListener("submit", async (event) => {
 });
 
 el.inferenceModelPreset.addEventListener("change", () => {
+  state.inferenceDirty = true;
   if (el.inferenceModelPreset.value === "custom") {
     el.inferenceModelCustom.focus();
   }
 });
 
 el.inferenceProvider.addEventListener("change", () => {
+  state.inferenceDirty = true;
   syncInferenceControls();
+});
+
+el.inferenceModelCustom.addEventListener("input", () => {
+  state.inferenceDirty = true;
+});
+
+el.inferenceKeyAction.addEventListener("change", () => {
+  state.inferenceDirty = true;
+});
+
+el.inferenceApiKey.addEventListener("input", () => {
+  state.inferenceDirty = true;
 });
 
 async function boot() {
