@@ -18,3 +18,7 @@ serde_json = "1"
 
 [features]
 default = []
+pocketic_tests = []
+
+[dev-dependencies]
+pocket-ic = { version = "9.0.2" }

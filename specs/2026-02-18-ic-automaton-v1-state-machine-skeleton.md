@@ -10,13 +10,11 @@
 ---
 
 ## Problem
-`ic-automaton` is still the default greet canister and does not implement the agent runtime described in `docs/design/ICP_ANALYSIS.md`. The first implementation slice must establish an explicit state-machine core, durable persistence, and a runnable single-turn loop with mocked feature adapters.
+The first implementation slice must establish an explicit state-machine core, durable persistence, and a runnable single-turn loop with mocked feature adapters.
 
 ## Goal
 Deliver a buildable/tested canister skeleton where one agent turn runs through an explicit FSM and persists state safely:
 1. Canonical state in stable structures.
-2. Query-oriented projection in `ic-rusqlite`.
-3. Mocked feature modules for inference, signer, and skills loader/store.
 
 ## Non-Goals
 - Social relay support.
@@ -99,19 +97,6 @@ Why canonical in stable structures:
 - simple KV/log access fits runtime control path
 - avoids coupling critical correctness to SQL schema evolution
 
-### `ic-rusqlite` (Projection/Query Layer)
-- Tables:
-  - `turn_projection`
-  - `transition_projection`
-  - `action_projection` (mocked actions, including signer usage)
-  - `skill_projection` (flattened view for filtering/search)
-- Projection data is rebuildable from `EpisodicLog`.
-- SQL is used only where filtering/sorting/aggregations are needed (e.g., “last N failed turns”, “state transition frequency”, “actions by type”).
-
-Why SQL for this part:
-- richer query patterns than key-range scans
-- easier diagnostics and future dashboards
-- keeps runtime write path simple while enabling analysis queries
 
 ---
 
@@ -121,8 +106,6 @@ Why SQL for this part:
 - [ ] Implement FSM domain module with typed states/events, legal transitions, and transition errors.
 - [ ] Implement `run_agent_turn` orchestrator that advances by dispatching FSM events.
 - [ ] Implement stable canonical stores for runtime snapshot, soul/config KV, skills store, and episodic memory log.
-- [ ] Implement `ic-rusqlite` projection schema + repository for turn/transition/action/skill views.
-- [ ] Implement replay function: rebuild SQL projection from stable episodic log.
 - [ ] Implement feature modules with explicit ports + two adapters each:
   - inference: `MockInferenceAdapter`, `StubInferenceAdapter`
   - signer: `MockSignerAdapter`, `StubSignerAdapter`
@@ -134,7 +117,6 @@ Why SQL for this part:
 
 ### Should Have
 - [ ] Deterministic test abstractions for clock/id generation.
-- [ ] Query endpoints for recent episodic entries and projected SQL summaries.
 - [ ] Explicit protected-key list for config writes (`soul` allowed via dedicated API only).
 
 ### Could Have
@@ -175,27 +157,22 @@ Why SQL for this part:
       - Validation: `cargo test --test stable_storage`
       - Notes: Include protected config key policy and dedicated soul write path.
 
-- [ ] **Task 3:** Implement SQL projection and replay
-      - Files: `src/storage/sql_projection.rs`, `src/storage/replay.rs`, `tests/sql_projection.rs`
-      - Validation: `cargo test --test sql_projection`
-      - Notes: SQL projection must be rebuildable from canonical episodic log.
-
-- [ ] **Task 4:** Implement feature modules with explicit mock/stub adapters
+- [ ] **Task 3:** Implement feature modules with explicit mock/stub adapters
       - Files: `src/features/mod.rs`, `src/features/inference.rs`, `src/features/signer.rs`, `src/features/skills.rs`, `tests/features_mocks.rs`
       - Validation: `cargo test --test features_mocks`
       - Notes: No generic `integrations` bucket; one explicit module per feature.
 
-- [ ] **Task 5:** Implement loop orchestrator and canister API surface
+- [ ] **Task 4:** Implement loop orchestrator and canister API surface
       - Files: `src/agent/mod.rs`, `src/agent/loop.rs`, `src/lib.rs`
       - Validation: `cargo test --test agent_loop_mocked`
       - Notes: `run_agent_turn` must dispatch events through FSM and persist both stable + SQL layers.
 
-- [ ] **Task 6:** Timer wiring, upgrade hooks, and PocketIC integration coverage
+- [ ] **Task 5:** Timer wiring, upgrade hooks, and PocketIC integration coverage
       - Files: `src/lib.rs`, `tests/pocketic_agent_loop.rs`
       - Validation: `cargo test --test pocketic_agent_loop`
       - Notes: Re-arm timers in `post_upgrade`; assert turn execution + persistence via public endpoints.
 
-- [ ] **Task 7:** Candid generation workflow alignment
+- [ ] **Task 6:** Candid generation workflow alignment
       - Files: `src/lib.rs`, `scripts/generate-candid.sh` (if missing), `ic-automaton.did` (generated output only)
       - Validation: `./scripts/generate-candid.sh ic-automaton.did`
       - Notes: Add `ic_cdk::export_candid!()` and keep `.did` generated, not manually edited.
@@ -258,7 +235,6 @@ service : {
 
 ### Decide yourself:
 - Concrete Rust type names and module internals.
-- Exact SQL indices and projection query APIs.
 - Specific deterministic mock payloads for inference/signer/skills.
 - Exact test case decomposition for unit and PocketIC suites.
 
@@ -282,7 +258,6 @@ service : {
 ### Expected State
 - File `src/domain/state_machine.rs` exists and is >400 bytes.
 - File `src/storage/stable_memory.rs` exists and is >300 bytes.
-- File `src/storage/sql_projection.rs` exists and is >300 bytes.
 - File `src/features/inference.rs` exists and is >250 bytes.
 - File `src/features/signer.rs` exists and is >250 bytes.
 - File `src/features/skills.rs` exists and is >250 bytes.
@@ -300,6 +275,5 @@ service : {
   - triggers one wake/turn
   - verifies resulting FSM state is valid
   - verifies episodic memory persisted
-  - verifies SQL projection query returns expected turn summary
   - verifies soul update endpoint persists and is retrievable
 
