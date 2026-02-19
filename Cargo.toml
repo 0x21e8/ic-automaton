@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 async-trait = "0.1"
 candid = "0.10"
 canlog = { version = "0.2", features = ["derive"] }
+ic-http-certification = "3.1.0"
 ic-cdk = "0.19"
 ic-cdk-timers = "1.0"
 ic-stable-structures = "0.7"

@@ -1,31 +1,35 @@
 mod agent;
 mod domain;
 mod features;
+mod http;
 mod scheduler;
 mod storage;
 mod tools;
 
 use crate::domain::types::{
-    InboxMessage, InboxStats, InferenceConfigView, InferenceProvider, RuntimeView, ScheduledJob,
-    SchedulerRuntime, SkillRecord, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
-    ToolCallRecord,
+    InboxMessage, InboxStats, InferenceConfigView, InferenceProvider, ObservabilitySnapshot,
+    RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord, TaskKind, TaskScheduleConfig,
+    TaskScheduleRuntime, ToolCallRecord,
 };
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
 use crate::tools::ToolManager;
 use ic_cdk_timers::set_timer_interval_serial;
+use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use std::time::Duration;
 
 #[ic_cdk::init]
 fn init() {
     stable::init_storage();
     crate::features::MockSkillLoader::install_defaults();
+    crate::http::init_certification();
     arm_timer();
 }
 
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
     stable::init_storage();
+    crate::http::init_certification();
     arm_timer();
 }
 
@@ -75,6 +79,11 @@ fn list_scheduler_jobs(limit: u32) -> Vec<ScheduledJob> {
 #[ic_cdk::query]
 fn list_task_schedules() -> Vec<(TaskScheduleConfig, TaskScheduleRuntime)> {
     stable::list_task_schedules()
+}
+
+#[ic_cdk::query]
+fn get_observability_snapshot(limit: u32) -> ObservabilitySnapshot {
+    stable::observability_snapshot(limit as usize)
 }
 
 #[ic_cdk::update]
@@ -166,6 +175,16 @@ fn list_tool_policies() -> Vec<String> {
 #[ic_cdk::query]
 fn get_tool_calls_for_turn(turn_id: String) -> Vec<ToolCallRecord> {
     stable::get_tools_for_turn(&turn_id)
+}
+
+#[ic_cdk::query]
+fn http_request(request: HttpRequest) -> HttpResponse {
+    crate::http::handle_http_request(request)
+}
+
+#[ic_cdk::update]
+fn http_request_update(request: HttpUpdateRequest) -> HttpUpdateResponse {
+    crate::http::handle_http_request_update(request)
 }
 
 fn arm_timer() {
