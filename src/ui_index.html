@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autonomous Automaton</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="panel hero reveal">
+        <p class="kicker">Decentralized Substrate</p>
+        <h1>Autonomous Automaton</h1>
+        <p class="lede">
+          A self-operating canister runtime. Observe state transitions, queue activity, and post
+          new input directly to its inbox.
+        </p>
+      </header>
+
+      <section class="panel composer reveal" aria-labelledby="composer-title">
+        <h2 id="composer-title">Send A Message</h2>
+        <form id="composer-form" class="composer-form">
+          <label class="sr-only" for="composer-input">Message</label>
+          <textarea
+            id="composer-input"
+            rows="3"
+            maxlength="2000"
+            placeholder="Ask the automaton something..."
+            required
+          ></textarea>
+          <div class="composer-row">
+            <button id="composer-submit" class="btn" type="submit">Transmit</button>
+            <p id="composer-status" class="muted status-text" aria-live="polite"></p>
+          </div>
+        </form>
+      </section>
+
+      <section class="grid reveal">
+        <article class="panel">
+          <h2>Runtime</h2>
+          <div id="runtime-kv" class="kv"></div>
+        </article>
+        <article class="panel">
+          <h2>Scheduler</h2>
+          <div id="scheduler-kv" class="kv"></div>
+        </article>
+        <article class="panel">
+          <h2>Inbox</h2>
+          <div id="inbox-kv" class="kv"></div>
+        </article>
+      </section>
+
+      <section class="grid reveal">
+        <article class="panel">
+          <h2>Recent Transitions</h2>
+          <div id="transitions-list" class="timeline"></div>
+        </article>
+        <article class="panel">
+          <h2>Recent Jobs</h2>
+          <div id="jobs-list" class="timeline"></div>
+        </article>
+        <article class="panel">
+          <h2>Recent Messages</h2>
+          <div id="messages-list" class="timeline"></div>
+        </article>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -192,6 +192,18 @@ impl From<&RuntimeSnapshot> for RuntimeView {
     }
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct ObservabilitySnapshot {
+    pub captured_at_ns: u64,
+    pub runtime: RuntimeView,
+    pub scheduler: SchedulerRuntime,
+    pub inbox_stats: InboxStats,
+    pub inbox_messages: Vec<InboxMessage>,
+    pub recent_turns: Vec<TurnRecord>,
+    pub recent_transitions: Vec<TransitionLogRecord>,
+    pub recent_jobs: Vec<ScheduledJob>,
+}
+
 #[derive(
     CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
 )]

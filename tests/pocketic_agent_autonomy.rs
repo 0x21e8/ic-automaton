@@ -7,7 +7,10 @@ use candid::{decode_one, encode_args, CandidType, Principal};
 use pocket_ic::PocketIc;
 use serde::{Deserialize, Serialize};
 
-const WASM_PATH: &str = "target/wasm32-unknown-unknown/release/backend.wasm";
+const WASM_PATHS: &[&str] = &[
+    "target/wasm32-unknown-unknown/release/backend.wasm",
+    "target/wasm32-unknown-unknown/release/deps/backend.wasm",
+];
 
 #[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 enum TaskKind {
@@ -95,12 +98,17 @@ struct InboxStats {
 }
 
 fn assert_wasm_artifact_present() -> Vec<u8> {
-    if !Path::new(WASM_PATH).exists() {
-        panic!("build artifact not found at {WASM_PATH}; run `icp build` before PocketIC tests");
+    for path in WASM_PATHS {
+        if Path::new(path).exists() {
+            return std::fs::read(path).unwrap_or_else(|error| {
+                panic!("cannot read PocketIC test artifact {path}: {error}");
+            });
+        }
     }
-    std::fs::read(WASM_PATH).unwrap_or_else(|error| {
-        panic!("cannot read PocketIC test artifact {WASM_PATH}: {error}");
-    })
+    panic!(
+        "build artifact not found at any expected path ({:?}); run `icp build` before PocketIC tests",
+        WASM_PATHS
+    );
 }
 
 fn with_backend_canister() -> (PocketIc, Principal) {

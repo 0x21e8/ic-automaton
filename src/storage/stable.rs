@@ -1,8 +1,8 @@
 use crate::domain::types::{
     AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, JobStatus, RuntimeSnapshot, RuntimeView, ScheduledJob,
-    SchedulerLease, SchedulerRuntime, SkillRecord, TaskKind, TaskLane, TaskScheduleConfig,
-    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    InferenceConfigView, InferenceProvider, JobStatus, ObservabilitySnapshot, RuntimeSnapshot,
+    RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, TaskKind, TaskLane,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
@@ -30,6 +30,8 @@ const RUNTIME_KEY: &str = "runtime.snapshot";
 const SCHEDULER_RUNTIME_KEY: &str = "scheduler.runtime";
 const INBOX_SEQ_KEY: &str = "inbox.seq";
 const MAX_RECENT_JOBS: usize = 200;
+const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
+const MAX_OBSERVABILITY_LIMIT: usize = 100;
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
@@ -581,6 +583,25 @@ pub fn inbox_stats() -> InboxStats {
         }
     });
     stats
+}
+
+pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
+    let bounded_limit = if limit == 0 {
+        DEFAULT_OBSERVABILITY_LIMIT
+    } else {
+        limit.min(MAX_OBSERVABILITY_LIMIT)
+    };
+
+    ObservabilitySnapshot {
+        captured_at_ns: now_ns(),
+        runtime: snapshot_to_view(),
+        scheduler: scheduler_runtime_view(),
+        inbox_stats: inbox_stats(),
+        inbox_messages: list_inbox_messages(bounded_limit),
+        recent_turns: list_turns(bounded_limit),
+        recent_transitions: list_recent_transitions(bounded_limit),
+        recent_jobs: list_recent_jobs(bounded_limit),
+    }
 }
 
 pub fn stage_pending_inbox_messages(batch_size: usize, now_ns: u64) -> usize {
@@ -1262,6 +1283,27 @@ mod tests {
         assert_eq!(
             status_by_id.get(&third_id),
             Some(&InboxMessageStatus::Consumed)
+        );
+    }
+
+    #[test]
+    fn observability_snapshot_applies_limits_and_includes_runtime() {
+        init_storage();
+        post_inbox_message("snapshot message one".to_string(), "2vxsx-fae".to_string()).unwrap();
+        post_inbox_message("snapshot message two".to_string(), "2vxsx-fae".to_string()).unwrap();
+
+        let bounded = observability_snapshot(1);
+        assert_eq!(bounded.inbox_messages.len(), 1);
+        assert_eq!(bounded.recent_jobs.len(), 0);
+        assert!(
+            bounded.captured_at_ns > 0,
+            "captured timestamp should be populated"
+        );
+
+        let defaulted = observability_snapshot(0);
+        assert!(
+            defaulted.inbox_messages.len() <= DEFAULT_OBSERVABILITY_LIMIT,
+            "default limit should bound inbox messages"
         );
     }
 }
