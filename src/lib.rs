@@ -8,8 +8,8 @@ mod tools;
 
 use crate::domain::types::{
     InboxMessage, InboxStats, InferenceConfigView, InferenceProvider, ObservabilitySnapshot,
-    RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord, TaskKind, TaskScheduleConfig,
-    TaskScheduleRuntime, ToolCallRecord,
+    OutboxMessage, OutboxStats, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord, TaskKind,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
 };
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
@@ -99,6 +99,16 @@ fn list_inbox_messages(limit: u32) -> Vec<InboxMessage> {
 #[ic_cdk::query]
 fn get_inbox_stats() -> InboxStats {
     stable::inbox_stats()
+}
+
+#[ic_cdk::query]
+fn list_outbox_messages(limit: u32) -> Vec<OutboxMessage> {
+    stable::list_outbox_messages(limit as usize)
+}
+
+#[ic_cdk::query]
+fn get_outbox_stats() -> OutboxStats {
+    stable::outbox_stats()
 }
 
 #[ic_cdk::update]

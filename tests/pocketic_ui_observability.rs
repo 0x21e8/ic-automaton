@@ -1,6 +1,7 @@
 #![cfg(feature = "pocketic_tests")]
 
 use std::path::Path;
+use std::time::Duration;
 
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
@@ -20,6 +21,8 @@ struct SnapshotEnvelope {
     scheduler: Value,
     inbox_stats: Value,
     inbox_messages: Vec<Value>,
+    outbox_stats: Value,
+    outbox_messages: Vec<Value>,
     recent_turns: Vec<Value>,
     recent_transitions: Vec<Value>,
     recent_jobs: Vec<Value>,
@@ -154,6 +157,34 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
             .iter()
             .any(|msg| msg.get("id").and_then(Value::as_str) == Some(posted_id)),
         "snapshot should include the posted message id"
+    );
+
+    for _ in 0..3 {
+        pic.advance_time(Duration::from_secs(31));
+        pic.tick();
+    }
+
+    let after_turn_response = call_http_update(
+        &pic,
+        canister_id,
+        HttpRequest::get("/api/snapshot").build_update(),
+    );
+    assert_eq!(after_turn_response.status_code().as_u16(), 200);
+    let after_turn_snapshot: SnapshotEnvelope = serde_json::from_slice(after_turn_response.body())
+        .expect("post-turn snapshot should decode");
+    let outbox_total = after_turn_snapshot
+        .outbox_stats
+        .get("total_messages")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    assert!(outbox_total >= 1, "snapshot should include outbox replies");
+    assert!(
+        after_turn_snapshot.outbox_messages.iter().any(|msg| msg
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .starts_with("outbox:")),
+        "snapshot should include at least one outbox record id"
     );
 }
 

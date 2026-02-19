@@ -305,6 +305,53 @@ textarea:focus-visible,
   animation: pulse 750ms ease;
 }
 
+.chat {
+  display: grid;
+  gap: var(--space-2);
+  max-height: 360px;
+  overflow: auto;
+}
+
+.chat-row {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.chat-meta {
+  margin: 0;
+  font-size: 0.77rem;
+  color: var(--color-muted);
+  text-transform: capitalize;
+}
+
+.chat-bubble {
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: rgba(8, 16, 22, 0.55);
+  padding: 0.58rem 0.7rem;
+}
+
+.chat-bubble p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-row.user .chat-bubble {
+  border-color: rgba(82, 240, 189, 0.35);
+}
+
+.chat-row.assistant .chat-bubble {
+  border-color: rgba(155, 207, 255, 0.35);
+}
+
+.chat-row code {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: #bddfff;
+  overflow-wrap: anywhere;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
