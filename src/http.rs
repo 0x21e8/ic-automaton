@@ -535,7 +535,7 @@ fn parse_inbox_post_request(body: &[u8]) -> Result<InboxPostRequest, String> {
 fn parse_inference_config_request(
     body: &[u8],
 ) -> Result<InferenceConfigUpdateRequest, InferenceConfigError> {
-    if body.is_empty() {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Err(InferenceConfigError {
             ok: false,
             error: "inference config body cannot be empty".to_string(),
@@ -553,9 +553,15 @@ fn parse_inference_config_request(
 fn apply_inference_config_update(
     payload: InferenceConfigUpdateRequest,
 ) -> Result<InferenceConfigView, String> {
-    if let Some(raw_provider) = payload.provider {
-        let provider = parse_inference_provider(&raw_provider)?;
-        stable::set_inference_provider(provider);
+    let current_provider = stable::inference_config_view().provider;
+    let requested_provider = payload
+        .provider
+        .as_ref()
+        .map(|raw| parse_inference_provider(raw))
+        .transpose()?;
+
+    if let Some(provider) = requested_provider.as_ref() {
+        stable::set_inference_provider(provider.clone());
     }
 
     if let Some(raw_model) = payload.model {
@@ -567,23 +573,32 @@ fn apply_inference_config_update(
         }
     }
 
+    let provider = requested_provider.unwrap_or(current_provider);
     match payload.key_action.unwrap_or(OpenRouterKeyAction::Keep) {
         OpenRouterKeyAction::Keep => {}
         OpenRouterKeyAction::Set => {
+            if provider != crate::domain::types::InferenceProvider::OpenRouter {
+                return Err("key action set requires openrouter provider".to_string());
+            }
             let trimmed_key = payload.api_key.unwrap_or_default().trim().to_string();
             if trimmed_key.is_empty() {
                 return Err("api key cannot be empty when action is set".to_string());
             }
             stable::set_openrouter_api_key(Some(trimmed_key));
         }
-        OpenRouterKeyAction::Clear => stable::set_openrouter_api_key(None),
+        OpenRouterKeyAction::Clear => {
+            if provider != crate::domain::types::InferenceProvider::OpenRouter {
+                return Err("key action clear requires openrouter provider".to_string());
+            }
+            stable::set_openrouter_api_key(None)
+        }
     }
 
     Ok(stable::inference_config_view())
 }
 
 fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::InferenceProvider, String> {
-    match raw.to_ascii_lowercase().as_str() {
+    match raw.trim().to_ascii_lowercase().as_str() {
         "llm_canister" | "llm-canister" | "ic_llm" | "icllm" | "mock" => {
             Ok(crate::domain::types::InferenceProvider::IcLlm)
         }
@@ -664,6 +679,78 @@ mod tests {
 
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn inference_config_update_rejects_invalid_provider() {
+        init_certification();
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"provider":"bad-provider"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(body.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("unsupported inference provider: bad-provider")
+        );
+    }
+
+    #[test]
+    fn inference_config_update_rejects_empty_body() {
+        init_certification();
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(b"   ".to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(body.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("inference config body cannot be empty")
+        );
+    }
+
+    #[test]
+    fn inference_config_update_rejects_openrouter_key_action_without_provider() {
+        init_certification();
+        stable::init_storage();
+        stable::set_inference_provider(crate::domain::types::InferenceProvider::IcLlm);
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(
+                br#"{"key_action":"set","api_key":"test-key","model":"llama3.1:8b"}"#.to_vec(),
+            )
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("key action set requires openrouter provider")
+        );
     }
 
     #[test]
