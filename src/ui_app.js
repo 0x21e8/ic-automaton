@@ -150,13 +150,19 @@ function syncInferenceModelSelect(model) {
   }
 }
 
-function syncInferenceControls() {
+function syncInferenceControls(options = {}) {
+  const { preferFormProvider = false } = options;
   const config = state.inferenceConfig || {};
   const selectedProvider = el.inferenceProvider.value;
+  const configProvider =
+    config.provider === "OpenRouter" || config.provider === "openrouter"
+      ? "openrouter"
+      : "llm_canister";
   const provider =
-    selectedProvider === "openrouter" || selectedProvider === "llm_canister"
+    preferFormProvider &&
+    (selectedProvider === "openrouter" || selectedProvider === "llm_canister")
       ? selectedProvider
-      : config.provider || "llm_canister";
+      : configProvider;
   const hasOpenRouterKey = Boolean(config.openrouter_has_api_key);
   const model = config.model || "";
   const isOpenRouter = provider === "openrouter" || provider === "OpenRouter";
@@ -400,7 +406,7 @@ el.inferenceModelPreset.addEventListener("change", () => {
 
 el.inferenceProvider.addEventListener("change", () => {
   state.inferenceDirty = true;
-  syncInferenceControls();
+  syncInferenceControls({ preferFormProvider: true });
 });
 
 el.inferenceModelCustom.addEventListener("input", () => {
