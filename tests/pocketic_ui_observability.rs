@@ -218,6 +218,31 @@ fn supports_inference_config_http_flow() {
     );
     assert!(set_config.get("openrouter_api_key").is_none());
 
+    let invalid_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+        .with_headers(vec![(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )])
+        .with_body(
+            serde_json::json!({
+                "provider": "bad-provider",
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .build_update();
+    let invalid_response = call_http_update(&pic, canister_id, invalid_request);
+    assert_eq!(invalid_response.status_code().as_u16(), 400);
+    let invalid_json = parse_json_response(&invalid_response, "POST /api/inference/config invalid");
+    assert_eq!(invalid_json.get("ok"), Some(&Value::Bool(false)));
+    assert_eq!(
+        invalid_json
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "unsupported inference provider: bad-provider"
+    );
+
     let reread_response = call_http_update(
         &pic,
         canister_id,
@@ -237,7 +262,33 @@ fn supports_inference_config_http_flow() {
     );
     assert!(reread_json.get("openrouter_api_key").is_none());
 
-    let clear_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+    let clear_openrouter_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+        .with_headers(vec![(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )])
+        .with_body(
+            serde_json::json!({
+                "provider": "openrouter",
+                "key_action": "clear",
+                "model": "qwen3:32b",
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .build_update();
+    let clear_openrouter_response = call_http_update(&pic, canister_id, clear_openrouter_request);
+    assert_eq!(clear_openrouter_response.status_code().as_u16(), 200);
+    let clear_openrouter_json = parse_json_response(
+        &clear_openrouter_response,
+        "POST /api/inference/config clear openrouter",
+    );
+    assert_eq!(
+        clear_openrouter_json["config"]["openrouter_has_api_key"].as_bool(),
+        Some(false)
+    );
+
+    let switch_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
         .with_headers(vec![(
             "content-type".to_string(),
             "application/json".to_string(),
@@ -246,26 +297,29 @@ fn supports_inference_config_http_flow() {
             serde_json::json!({
                 "provider": "llm_canister",
                 "model": "llama3.1:8b",
-                "key_action": "clear",
             })
             .to_string()
             .into_bytes(),
         )
         .build_update();
-    let clear_response = call_http_update(&pic, canister_id, clear_request);
-    assert_eq!(clear_response.status_code().as_u16(), 200);
-    let clear_json = parse_json_response(&clear_response, "POST /api/inference/config clear");
-    let clear_config = &clear_json["config"];
+    let switch_response = call_http_update(&pic, canister_id, switch_request);
+    assert_eq!(switch_response.status_code().as_u16(), 200);
+    let switch_json = parse_json_response(
+        &switch_response,
+        "POST /api/inference/config switch provider",
+    );
     assert_eq!(
-        clear_config.get("provider").and_then(Value::as_str),
+        switch_json["config"]
+            .get("provider")
+            .and_then(Value::as_str),
         Some("IcLlm")
     );
     assert_eq!(
-        clear_config.get("model").and_then(Value::as_str),
+        switch_json["config"].get("model").and_then(Value::as_str),
         Some("llama3.1:8b")
     );
     assert_eq!(
-        clear_config
+        switch_json["config"]
             .get("openrouter_has_api_key")
             .and_then(Value::as_bool),
         Some(false)

@@ -27,8 +27,10 @@ const el = {
   inferenceSubmit: document.getElementById("inference-submit"),
   inferenceStatus: document.getElementById("inference-status"),
   inferenceProvider: document.getElementById("inference-provider"),
+  inferenceModelSection: document.getElementById("inference-model-section"),
   inferenceModelPreset: document.getElementById("inference-model-preset"),
   inferenceModelCustom: document.getElementById("inference-model-custom"),
+  inferenceKeySection: document.getElementById("inference-key-section"),
   inferenceKeyAction: document.getElementById("inference-key-action"),
   inferenceApiKey: document.getElementById("inference-api-key"),
   inferenceKeyHelp: document.getElementById("inference-key-help"),
@@ -118,6 +120,10 @@ function syncInferenceControls() {
 
   el.inferenceProvider.value = provider === "OpenRouter" ? "openrouter" : "llm_canister";
   syncInferenceModelSelect(model);
+  el.inferenceModelSection.hidden = !isOpenRouter;
+  el.inferenceKeySection.hidden = !isOpenRouter;
+  el.inferenceModelPreset.disabled = !isOpenRouter;
+  el.inferenceModelCustom.disabled = !isOpenRouter;
 
   el.inferenceKeyHelp.textContent = hasOpenRouterKey
     ? "Current key: present"
@@ -130,8 +136,6 @@ function syncInferenceControls() {
 
   el.inferenceKeyAction.disabled = !isOpenRouter;
   el.inferenceApiKey.disabled = !isOpenRouter;
-  el.inferenceModelPreset.disabled = false;
-  el.inferenceModelCustom.disabled = false;
 }
 
 async function apiFetch(path, init) {
@@ -280,7 +284,7 @@ async function applyInferenceConfig() {
     key_action: isOpenRouter ? keyAction : "keep",
   };
 
-  if (model) {
+  if (isOpenRouter && model) {
     payload.model = model;
   }
 
@@ -342,6 +346,10 @@ el.inferenceModelPreset.addEventListener("change", () => {
   if (el.inferenceModelPreset.value === "custom") {
     el.inferenceModelCustom.focus();
   }
+});
+
+el.inferenceProvider.addEventListener("change", () => {
+  syncInferenceControls();
 });
 
 async function boot() {
