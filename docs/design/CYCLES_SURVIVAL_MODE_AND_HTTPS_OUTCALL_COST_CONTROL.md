@@ -35,6 +35,22 @@ This violates the autonomy requirement that runtime should self-heal and continu
 - Default OpenRouter `max_response_bytes`: `64 * 1024` (`src/domain/types.rs`).
 - Low-cycles mode exists in scheduler runtime but is not driven by cycle-aware policy.
 
+## Scope Correction: This Must Be Multi-Operation, Not Inference-Only
+
+The immediate live failure is on inference, but your point is correct: the survival policy must cover *all* expensive operation classes.
+
+Important distinction in the current codebase:
+- Today, EVM polling and signing are still mock adapters (`MockEvmPoller`, `MockSignerAdapter`).
+- So currently observed insufficient-cycles failures come from inference HTTPS outcalls.
+
+However, roadmap/spec context already includes future expensive paths:
+- EVM JSON-RPC polling (`eth_blockNumber`, `eth_getLogs`, receipt polling),
+- threshold signing (`sign_with_ecdsa` / possibly schnorr),
+- EVM transaction submission workflows (which combine signing + one or more outcalls).
+
+Conclusion:
+- The design should be generalized now as a cycle admission controller for operation classes, not a one-off inference fix.
+
 ## Deep Investigation: How Cycles Work and Why This Fails
 
 ## 1) Balance vs Liquid Balance vs Reserved Cycles
@@ -77,6 +93,21 @@ What is missing:
 - No preflight affordability check against liquid cycles before attempting outcall.
 - No survival-mode downgrade on cycle insufficiency.
 - No cost telemetry to verify expected vs actual reserved cycles per call.
+
+## 3b) Cost Surfaces Beyond HTTPS Outcalls
+
+Survival logic must account for multiple cost models:
+
+| Operation class | Typical API | Cost model shape | Key implication |
+|---|---|---|---|
+| HTTPS outcall | `management_canister::http_request` | Size/subnet dependent (`request_bytes`, `max_response_bytes`, subnet `n`) | `max_response_bytes` dominates, must stay low and explicit |
+| Threshold signing | `management_canister::sign_with_ecdsa` / `sign_with_schnorr` | Management canister sign fee (`cost_sign_with_*`) | Expensive, should be admission-gated and rate-limited |
+| Inter-canister EVM helpers | `Call::with_cycles` style calls | Depends on callee protocol and attached cycles budget | Need explicit per-call cycles envelope and retry policy |
+| EVM tx lifecycle | compose: estimate/fetch + sign + broadcast + poll | Multi-step cumulative cost | Admission must be workflow-aware, not only per-step |
+
+Operational implication:
+- A scheduler that only protects inference can still burn out on signing/EVM workflows.
+- Need global budget arbitration by operation class and task priority.
 
 ## 4) Why Failures Repeat Every Cadence
 
@@ -159,13 +190,17 @@ Combine periodic cycle controller plus per-request outcall affordability guard.
 - Do not wait for next periodic check.
 
 3. Per-request preflight:
-- Compute `estimated_outcall_cycles` via `cost_http_request`.
-- Require `liquid >= estimated + safety_margin + reserve_floor`.
-- If not affordable: skip inference as a controlled degraded outcome (not hard fault).
+- Compute `estimated_op_cycles` per operation class:
+  - HTTPS: `cost_http_request(&req)`
+  - Threshold signing: `cost_sign_with_ecdsa(&args)` / `cost_sign_with_schnorr(&args)`
+  - Other inter-canister steps: configured envelope + observed history
+- Require `liquid >= estimated_op_cycles + safety_margin + reserve_floor`.
+- If not affordable: skip/defer operation as a controlled degraded outcome (not hard fault).
 
 4. Backoff:
 - Exponential cooldown for repeated unaffordable inference attempts.
 - Keep lightweight jobs alive (e.g., cycles checks, inbox staging if cheap).
+- Apply backoff per operation class (`inference`, `evm_poll`, `evm_broadcast`, `threshold_sign`), not one shared bucket.
 
 ### Pros
 - Fast reaction + stable long-term control.
@@ -200,7 +235,7 @@ Suggested behavior:
 - Increase inference backoff interval.
 
 ### CriticalCycles
-- Disable inference entirely.
+- Disable all non-essential expensive operations (inference + signing + EVM outcalls).
 - Keep only essential control-plane tasks:
   - `CheckCycles`
   - minimal observability and operator endpoints
@@ -215,11 +250,11 @@ Suggested behavior:
 Use this combined policy:
 - Scheduled `CheckCycles` every 5 minutes (occasional).
 - No frequent "global balance checks" in heartbeat path.
-- But keep per-outcall preflight affordability check only for the specific expensive call being attempted.
+- But keep per-operation preflight affordability checks only when an expensive operation is actually attempted.
 
 This satisfies both goals:
 - no constant heartbeat-level balance polling,
-- no repeated unaffordable inference outcalls.
+- no repeated unaffordable expensive operations (inference, signing, EVM calls).
 
 ## HTTPS Outcalls: Correctness and Savings Investigation
 
@@ -271,7 +306,16 @@ Improvements still needed:
 - Add survival tiers and scheduler gating.
 - Add hysteresis and backoff.
 
-## Phase 3: Outcall Cost Tuning
+## Phase 3: Multi-Operation Admission Controller
+- Introduce operation classes and per-class admission checks:
+  - `InferenceHttpOutcall`
+  - `EvmRpcOutcall`
+  - `ThresholdSign`
+  - `EvmTxWorkflow`
+- Add per-class cooldown/backoff and counters.
+- Add task-level policy mapping (`TaskKind` -> allowed operation classes by survival tier).
+
+## Phase 4: Outcall Cost Tuning
 - Reduce default `max_response_bytes`.
 - Add bounded response sizing controls in provider request.
 - Add fallback retry with larger cap only when necessary.
@@ -281,6 +325,7 @@ Improvements still needed:
 | Decision | Benefit | Cost/Risk |
 |---|---|---|
 | Hybrid survival controller | Stops repeated failures and preserves autonomy | More state/policy complexity |
+| Global admission controller (all expensive ops) | Prevents cost-shift regressions from new features | Larger surface area and tuning complexity |
 | Lower `max_response_bytes` | Large cycle savings | Risk of truncation unless outputs are bounded |
 | Per-request affordability preflight | Prevents unaffordable calls | Requires threshold and margin tuning |
 | 5-minute periodic cycle checks | Lower scheduler overhead/noise | Coarser visibility without event-triggered updates |
@@ -302,6 +347,8 @@ Improvements still needed:
 2. Should `PollInbox` remain active in critical mode (queue growth tradeoff)?
 3. Should top-up automation via CMC be in this phase or deferred?
 4. What SLO for recovery time is acceptable after top-up?
+5. How should limited liquid cycles be allocated between `ThresholdSign` and `EvmRpcOutcall` when both are pending?
+6. Which operations are strictly essential vs deferrable under `CriticalCycles`?
 
 ## References
 
@@ -316,6 +363,11 @@ Improvements still needed:
 - `ic-cdk` management canister API docs (`http_request`, `cost_http_request`):  
   https://docs.rs/ic-cdk/latest/ic_cdk/management_canister/fn.http_request.html  
   https://docs.rs/ic-cdk/latest/ic_cdk/management_canister/fn.cost_http_request.html
+- `ic-cdk` management canister API docs (`sign_with_ecdsa`, `cost_sign_with_ecdsa`):  
+  https://docs.rs/ic-cdk/latest/ic_cdk/management_canister/fn.sign_with_ecdsa.html  
+  https://docs.rs/ic-cdk/latest/ic_cdk/management_canister/fn.cost_sign_with_ecdsa.html
 - `ic-cdk` canister balance APIs (`canister_balance128`, `canister_liquid_cycle_balance128`):  
   https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.canister_balance128.html  
   https://docs.rs/ic-cdk/latest/ic_cdk/api/fn.canister_liquid_cycle_balance128.html
+- Threshold signature fee formulas:  
+  https://internetcomputer.org/docs/references/cycles-cost-formulas/#threshold-signature-fees
