@@ -5,6 +5,7 @@ pub fn transition(current: &AgentState, event: &AgentEvent) -> Result<AgentState
         (AgentState::Bootstrapping, AgentEvent::TimerTick) => Ok(AgentState::LoadingContext),
         (AgentState::Idle, AgentEvent::TimerTick) => Ok(AgentState::LoadingContext),
         (AgentState::Sleeping, AgentEvent::TimerTick) => Ok(AgentState::LoadingContext),
+        (AgentState::Faulted, AgentEvent::TimerTick) => Ok(AgentState::LoadingContext),
         (
             AgentState::LoadingContext,
             AgentEvent::EvmPollCompleted {
@@ -38,5 +39,45 @@ pub fn transition(current: &AgentState, event: &AgentEvent) -> Result<AgentState
             event: format!("{event:?}"),
             reason: "invalid transition".to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faulted_state_recovers_on_timer_tick() {
+        let next = transition(&AgentState::Faulted, &AgentEvent::TimerTick)
+            .expect("faulted state should recover on timer tick");
+        assert_eq!(next, AgentState::LoadingContext);
+    }
+
+    #[test]
+    fn reset_fault_path_still_supported() {
+        let next = transition(&AgentState::Faulted, &AgentEvent::ResetFault)
+            .expect("explicit reset should remain valid");
+        assert_eq!(next, AgentState::Bootstrapping);
+    }
+
+    #[test]
+    fn faulted_state_preserves_fault_signal() {
+        let next = transition(
+            &AgentState::Faulted,
+            &AgentEvent::TurnFailed {
+                reason: "repeat".to_string(),
+            },
+        )
+        .expect("faulted state should remain faulted on repeated failure");
+        assert_eq!(next, AgentState::Faulted);
+    }
+
+    #[test]
+    fn inferring_does_not_accept_timer_tick_directly() {
+        let transition_result = transition(&AgentState::Inferring, &AgentEvent::TimerTick);
+        assert!(
+            transition_result.is_err(),
+            "timer tick must not re-enter mid-turn execution state"
+        );
     }
 }

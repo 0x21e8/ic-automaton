@@ -12,6 +12,7 @@ Follow the KISS principle. Clarify with the human if you need to introduce compl
 - Candid is generated from Rust canister code via `ic_cdk::export_candid!()` and extracted from the compiled Wasm using `./scripts/generate-candid.sh ic-automaton.did` (automatically run by `.githooks/pre-commit`); do not hand-edit `ic-automaton.did`.
 - We are still in the development phase without users, as such we don't care about backward compatbility and can reinstall the canister and wipe the stable memory.
 - Use canlog rust crate for structured logging.
+- Autonomy is mandatory: the canister runtime must self-heal and continue scheduled operation after transient failures, without requiring manual resets or operator intervention.
 
 ## Documentation workflow
 - Treat `docs/design/` and `specs/` as a primary source of truth for requirements, architecture/design decisions, and user flows.
