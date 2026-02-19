@@ -1,8 +1,8 @@
 use crate::domain::types::{
-    AgentEvent, AgentState, EvmPollCursor, InferenceConfigView, InferenceProvider, JobStatus,
-    RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord,
-    TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
-    TransitionLogRecord, TurnRecord,
+    AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
+    InferenceConfigView, InferenceProvider, JobStatus, RuntimeSnapshot, RuntimeView, ScheduledJob,
+    SchedulerLease, SchedulerRuntime, SkillRecord, TaskKind, TaskLane, TaskScheduleConfig,
+    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
@@ -28,6 +28,7 @@ fn now_ns() -> u64 {
 
 const RUNTIME_KEY: &str = "runtime.snapshot";
 const SCHEDULER_RUNTIME_KEY: &str = "scheduler.runtime";
+const INBOX_SEQ_KEY: &str = "inbox.seq";
 const MAX_RECENT_JOBS: usize = 200;
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
@@ -95,10 +96,25 @@ thread_local! {
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(5)))
     ));
+    static INBOX_MAP: RefCell<StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>> =
+        RefCell::new(StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(11)))
+        ));
+    static INBOX_PENDING_QUEUE_MAP: RefCell<StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>> =
+        RefCell::new(StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(12)))
+        ));
+    static INBOX_STAGED_QUEUE_MAP: RefCell<StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>> =
+        RefCell::new(StableBTreeMap::init(
+            MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(13)))
+        ));
 }
 
 pub fn init_storage() {
     let _ = runtime_snapshot();
+    if runtime_u64(INBOX_SEQ_KEY).is_none() {
+        save_runtime_u64(INBOX_SEQ_KEY, 0);
+    }
     init_scheduler_defaults(now_ns());
 }
 
@@ -495,6 +511,175 @@ pub fn set_evm_cursor(cursor: &EvmPollCursor) {
     save_runtime_snapshot(&snapshot);
 }
 
+pub fn post_inbox_message(body: String, caller: String) -> Result<String, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err("message cannot be empty".to_string());
+    }
+
+    let seq = next_inbox_seq();
+    let id = format!("inbox:{seq:020}");
+    let message = InboxMessage {
+        id: id.clone(),
+        seq,
+        body: trimmed.to_string(),
+        posted_at_ns: now_ns(),
+        posted_by: caller,
+        status: InboxMessageStatus::Pending,
+        staged_at_ns: None,
+        consumed_at_ns: None,
+    };
+    INBOX_MAP.with(|map| {
+        map.borrow_mut().insert(id.clone(), encode_json(&message));
+    });
+    INBOX_PENDING_QUEUE_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(inbox_pending_key(seq), id.clone().into_bytes());
+    });
+    log!(
+        SchedulerStorageLogPriority::Info,
+        "inbox_posted id={} seq={}",
+        id,
+        seq
+    );
+    Ok(id)
+}
+
+pub fn list_inbox_messages(limit: usize) -> Vec<InboxMessage> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut messages = INBOX_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<InboxMessage>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+    messages.sort_by_key(|message| std::cmp::Reverse(message.seq));
+    messages.truncate(limit);
+    messages
+}
+
+pub fn inbox_stats() -> InboxStats {
+    let mut stats = InboxStats::default();
+    INBOX_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if let Some(message) = read_json::<InboxMessage>(Some(entry.value().as_slice())) {
+                stats.total_messages = stats.total_messages.saturating_add(1);
+                match message.status {
+                    InboxMessageStatus::Pending => {
+                        stats.pending_count = stats.pending_count.saturating_add(1)
+                    }
+                    InboxMessageStatus::Staged => {
+                        stats.staged_count = stats.staged_count.saturating_add(1)
+                    }
+                    InboxMessageStatus::Consumed => {
+                        stats.consumed_count = stats.consumed_count.saturating_add(1)
+                    }
+                }
+            }
+        }
+    });
+    stats
+}
+
+pub fn stage_pending_inbox_messages(batch_size: usize, now_ns: u64) -> usize {
+    if batch_size == 0 {
+        return 0;
+    }
+    let mut staged_count = 0usize;
+    let mut to_remove = Vec::new();
+
+    INBOX_PENDING_QUEUE_MAP.with(|pending_map| {
+        let pending = pending_map.borrow();
+        for entry in pending.iter().take(batch_size) {
+            to_remove.push((entry.key().clone(), entry.value().clone()));
+        }
+    });
+
+    for (pending_key, raw_id) in &to_remove {
+        let Ok(message_id) = String::from_utf8(raw_id.clone()) else {
+            continue;
+        };
+        if let Some(mut message) = get_inbox_message_by_id(&message_id) {
+            if matches!(message.status, InboxMessageStatus::Pending) {
+                message.status = InboxMessageStatus::Staged;
+                message.staged_at_ns = Some(now_ns);
+                save_inbox_message(&message);
+                INBOX_STAGED_QUEUE_MAP.with(|staged_map| {
+                    staged_map
+                        .borrow_mut()
+                        .insert(inbox_staged_key(message.seq), message_id.into_bytes());
+                });
+                staged_count = staged_count.saturating_add(1);
+            }
+        }
+        INBOX_PENDING_QUEUE_MAP.with(|pending_map| {
+            pending_map.borrow_mut().remove(pending_key);
+        });
+    }
+
+    if staged_count > 0 {
+        log!(
+            SchedulerStorageLogPriority::Info,
+            "inbox_staged count={} now_ns={}",
+            staged_count,
+            now_ns
+        );
+    }
+    staged_count
+}
+
+pub fn list_staged_inbox_messages(batch_size: usize) -> Vec<InboxMessage> {
+    if batch_size == 0 {
+        return Vec::new();
+    }
+
+    INBOX_STAGED_QUEUE_MAP.with(|staged_map| {
+        staged_map
+            .borrow()
+            .iter()
+            .take(batch_size)
+            .filter_map(|entry| String::from_utf8(entry.value().clone()).ok())
+            .filter_map(|id| get_inbox_message_by_id(&id))
+            .filter(|message| matches!(message.status, InboxMessageStatus::Staged))
+            .collect::<Vec<_>>()
+    })
+}
+
+pub fn consume_staged_inbox_messages(ids: &[String], now_ns: u64) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let mut consumed = 0usize;
+    for id in ids {
+        let Some(mut message) = get_inbox_message_by_id(id) else {
+            continue;
+        };
+        if !matches!(message.status, InboxMessageStatus::Staged) {
+            continue;
+        }
+        message.status = InboxMessageStatus::Consumed;
+        message.consumed_at_ns = Some(now_ns);
+        save_inbox_message(&message);
+        INBOX_STAGED_QUEUE_MAP.with(|staged_map| {
+            staged_map
+                .borrow_mut()
+                .remove(&inbox_staged_key(message.seq));
+        });
+        consumed = consumed.saturating_add(1);
+    }
+    if consumed > 0 {
+        log!(
+            SchedulerStorageLogPriority::Info,
+            "inbox_consumed count={} now_ns={}",
+            consumed,
+            now_ns
+        );
+    }
+    consumed
+}
+
 pub fn upsert_skill(skill: &SkillRecord) {
     SKILL_MAP.with(|map| {
         map.borrow_mut()
@@ -843,6 +1028,14 @@ fn dedupe_index_key(dedupe_key: &str) -> String {
     format!("dedupe:{dedupe_key}")
 }
 
+fn inbox_pending_key(seq: u64) -> String {
+    format!("inbox:pending:{seq:020}")
+}
+
+fn inbox_staged_key(seq: u64) -> String {
+    format!("inbox:staged:{seq:020}")
+}
+
 fn queue_index_key(lane: &TaskLane, scheduled_for_ns: u64, priority: u8, seq: u64) -> String {
     format!(
         "queue:{}:{:020}:{:03}:{:020}",
@@ -873,6 +1066,38 @@ fn save_job(job: &ScheduledJob) {
     });
 }
 
+fn get_inbox_message_by_id(id: &str) -> Option<InboxMessage> {
+    INBOX_MAP
+        .with(|map| map.borrow().get(&id.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+fn save_inbox_message(message: &InboxMessage) {
+    INBOX_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(message.id.clone(), encode_json(message));
+    });
+}
+
+fn next_inbox_seq() -> u64 {
+    let next = runtime_u64(INBOX_SEQ_KEY).unwrap_or(0).saturating_add(1);
+    save_runtime_u64(INBOX_SEQ_KEY, next);
+    next
+}
+
+fn runtime_u64(key: &str) -> Option<u64> {
+    RUNTIME_MAP
+        .with(|map| map.borrow().get(&key.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+fn save_runtime_u64(key: &str, value: u64) {
+    RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(key.to_string(), encode_json(&value));
+    });
+}
+
 fn encode_json<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_default()
 }
@@ -884,7 +1109,7 @@ fn read_json<T: DeserializeOwned>(value: Option<&[u8]>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{TaskKind, TaskLane};
+    use crate::domain::types::{InboxMessageStatus, TaskKind, TaskLane};
 
     fn sample_job(id: &str, kind: TaskKind, when: u64, priority: u8) -> ScheduledJob {
         ScheduledJob {
@@ -971,5 +1196,72 @@ mod tests {
 
         let reloaded = get_job_by_id("lease:stale").expect("job still exists");
         assert!(matches!(reloaded.status, JobStatus::TimedOut));
+    }
+
+    #[test]
+    fn inbox_post_stage_consume_is_ordered_and_idempotent() {
+        init_storage();
+
+        let first_id =
+            post_inbox_message("first message".to_string(), "2vxsx-fae".to_string()).unwrap();
+        let second_id =
+            post_inbox_message("second message".to_string(), "2vxsx-fae".to_string()).unwrap();
+        let third_id =
+            post_inbox_message("third message".to_string(), "2vxsx-fae".to_string()).unwrap();
+
+        let staged_first = stage_pending_inbox_messages(2, 100);
+        assert_eq!(
+            staged_first, 2,
+            "first poll should stage first two messages"
+        );
+
+        let staged_second = stage_pending_inbox_messages(10, 101);
+        assert_eq!(
+            staged_second, 1,
+            "second poll should only stage the remaining pending message"
+        );
+
+        let staged_third = stage_pending_inbox_messages(10, 102);
+        assert_eq!(staged_third, 0, "no pending messages should remain");
+
+        let consumed = list_staged_inbox_messages(10);
+        let consumed_ids = consumed
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(consume_staged_inbox_messages(&consumed_ids, 200), 3);
+        assert_eq!(consumed.len(), 3);
+        assert_eq!(consumed[0].id, first_id);
+        assert_eq!(consumed[1].id, second_id);
+        assert_eq!(consumed[2].id, third_id);
+
+        let consumed_again = list_staged_inbox_messages(10);
+        let consumed_again_ids = consumed_again
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(consume_staged_inbox_messages(&consumed_again_ids, 201), 0);
+        assert!(
+            consumed_again.is_empty(),
+            "consuming staged queue twice must be idempotent"
+        );
+
+        let messages = list_inbox_messages(10);
+        let status_by_id = messages
+            .into_iter()
+            .map(|message| (message.id, message.status))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            status_by_id.get(&first_id),
+            Some(&InboxMessageStatus::Consumed)
+        );
+        assert_eq!(
+            status_by_id.get(&second_id),
+            Some(&InboxMessageStatus::Consumed)
+        );
+        assert_eq!(
+            status_by_id.get(&third_id),
+            Some(&InboxMessageStatus::Consumed)
+        );
     }
 }
