@@ -554,7 +554,9 @@ fn parse_inference_config_request(
 fn apply_inference_config_update(
     payload: InferenceConfigUpdateRequest,
 ) -> Result<InferenceConfigView, String> {
-    let current_provider = stable::inference_config_view().provider;
+    let current_config = stable::inference_config_view();
+    let current_provider = current_config.provider.clone();
+    let openrouter_has_api_key = current_config.openrouter_has_api_key;
     let requested_provider = payload
         .provider
         .as_ref()
@@ -576,7 +578,15 @@ fn apply_inference_config_update(
 
     let provider = requested_provider.unwrap_or(current_provider);
     match payload.key_action.unwrap_or(OpenRouterKeyAction::Keep) {
-        OpenRouterKeyAction::Keep => {}
+        OpenRouterKeyAction::Keep => {
+            if provider == crate::domain::types::InferenceProvider::OpenRouter
+                && !openrouter_has_api_key
+            {
+                return Err(
+                    "openrouter api key is not configured; set key_action to set".to_string(),
+                );
+            }
+        }
         OpenRouterKeyAction::Set => {
             if provider != crate::domain::types::InferenceProvider::OpenRouter {
                 return Err("key action set requires openrouter provider".to_string());
@@ -591,7 +601,7 @@ fn apply_inference_config_update(
             if provider != crate::domain::types::InferenceProvider::OpenRouter {
                 return Err("key action clear requires openrouter provider".to_string());
             }
-            stable::set_openrouter_api_key(None)
+            stable::set_openrouter_api_key(None);
         }
     }
 
@@ -762,6 +772,33 @@ mod tests {
         assert_eq!(
             body.get("error").and_then(Value::as_str),
             Some("key action set requires openrouter provider")
+        );
+    }
+
+    #[test]
+    fn inference_config_update_rejects_openrouter_keep_without_api_key() {
+        init_certification();
+        stable::init_storage();
+        stable::set_inference_provider(crate::domain::types::InferenceProvider::IcLlm);
+        stable::set_openrouter_api_key(None);
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(
+                br#"{"provider":"openrouter","model":"qwen3:32b","key_action":"keep"}"#.to_vec(),
+            )
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("openrouter api key is not configured; set key_action to set")
         );
     }
 
