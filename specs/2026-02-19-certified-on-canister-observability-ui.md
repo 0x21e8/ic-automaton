@@ -156,42 +156,42 @@ Serve a minimal, modern UI directly from the canister with certified HTTP respon
 
 ## Implementation Plan
 
-- [ ] **Task 1: Add HTTP certification and asset service module**
+- [x] **Task 1: Add HTTP certification and asset service module**
       - Files: `Cargo.toml`, `src/http.rs` (new), `src/lib.rs`
       - Validation: `cargo check`
       - Notes: Introduce `ic-http-certification` and a small asset registry + certified response builder for static files.
 
-- [ ] **Task 2: Add UI static assets (buildless frontend)**
+- [x] **Task 2: Add UI static assets (buildless frontend)**
       - Files: `src/ui_index.html` (new), `src/ui_styles.css` (new), `src/ui_app.js` (new)
       - Validation: `rg -n "post_inbox_message|get_observability_snapshot|list_recent" src/ui_index.html src/ui_app.js`
       - Notes: Keep UX intentional/minimal, responsive on desktop/mobile, no framework dependency.
 
-- [ ] **Task 3: Implement design-system tokens and component primitives**
+- [x] **Task 3: Implement design-system tokens and component primitives**
       - Files: `src/ui_styles.css`, `src/ui_index.html`
       - Validation: `rg -n -- "--color-|--font-|prefers-reduced-motion|panel|timeline|badge" src/ui_styles.css`
       - Notes: Enforce tokenized color/type/spacing and reusable component classes; include reduced-motion behavior.
 
-- [ ] **Task 4: Add UI snapshot API for efficient hydration**
+- [x] **Task 4: Add UI snapshot API for efficient hydration**
       - Files: `src/domain/types.rs`, `src/lib.rs`, `src/storage/stable.rs` (if helper accessors are needed)
       - Validation: `cargo test`
       - Notes: Add typed structs with bounded limits and no secret fields.
 
-- [ ] **Task 5: Wire init/upgrade lifecycle for certification**
+- [x] **Task 5: Wire init/upgrade lifecycle for certification**
       - Files: `src/lib.rs`, `src/http.rs`
       - Validation: `cargo test`
       - Notes: Ensure certification tree/data is initialized in `init` and `post_upgrade`.
 
-- [ ] **Task 6: Add unit tests for HTTP and snapshot behavior**
+- [x] **Task 6: Add unit tests for HTTP and snapshot behavior**
       - Files: `src/http.rs`, `src/lib.rs` (tests module or dedicated unit test modules)
       - Validation: `cargo test`
       - Notes: Cover route correctness, content type, and deterministic snapshot schema behavior.
 
-- [ ] **Task 7: Add PocketIC integration test for canister-served UI flow**
+- [x] **Task 7: Add PocketIC integration test for canister-served UI flow**
       - Files: `tests/pocketic_ui_observability.rs` (new)
       - Validation: `icp build && cargo test --features pocketic_tests --test pocketic_ui_observability`
       - Notes: Verify asset serving primitives + message post + observable updates via query methods.
 
-- [ ] **Task 8: Final validation and candid generation**
+- [x] **Task 8: Final validation and candid generation**
       - Files: `ic-automaton.did` (generated), changed source files above
       - Validation: `bash .githooks/pre-commit`
       - Dependencies: Task 1, Task 2, Task 3, Task 4, Task 5, Task 6, Task 7
@@ -267,6 +267,6 @@ Snapshot date: 2026-02-19
 ### Integration Test
 
 - `icp build && cargo test --features pocketic_tests --test pocketic_ui_observability` passes and proves:
-- [ ] canister serves UI assets over HTTP path(s)
-- [ ] UI backend primitives can post inbox messages
-- [ ] observability snapshot reflects newly posted/processed state over time
+- [x] canister serves UI assets over HTTP path(s)
+- [x] UI backend primitives can post inbox messages
+- [x] observability snapshot reflects newly posted/processed state over time
