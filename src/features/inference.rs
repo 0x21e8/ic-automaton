@@ -1,4 +1,11 @@
-use crate::domain::types::{InferenceInput, InferenceProvider, RuntimeSnapshot, ToolCall};
+use crate::domain::cycle_admission::{
+    affordability_requirements, estimate_operation_cost, AffordabilityRequirements, OperationClass,
+    DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+};
+use crate::domain::types::{
+    InferenceInput, InferenceProvider, RuntimeSnapshot, SurvivalOperationClass, ToolCall,
+};
+use crate::storage::stable;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -9,6 +16,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 const IC_LLM_CANISTER_ID: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
+
+fn current_time_ns() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::time();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
+            .unwrap_or_default()
+    }
+}
 
 #[derive(Clone, Copy, Serialize, Deserialize, LogPriorityLevels)]
 enum InferenceLogPriority {
@@ -40,7 +61,15 @@ pub async fn infer_with_provider(
     snapshot: &RuntimeSnapshot,
     input: &InferenceInput,
 ) -> Result<InferenceOutput, String> {
-    match snapshot.inference_provider {
+    let now_ns = current_time_ns();
+    if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
+        return Ok(InferenceOutput {
+            tool_calls: Vec::new(),
+            explanation: "inference skipped due to survival policy".to_string(),
+        });
+    }
+
+    let output = match snapshot.inference_provider {
         InferenceProvider::Mock => MockInferenceAdapter.infer(input).await,
         InferenceProvider::IcLlm => {
             IcLlmInferenceAdapter::from_snapshot(snapshot)
@@ -52,7 +81,12 @@ pub async fn infer_with_provider(
                 .infer(input)
                 .await
         }
+    };
+
+    if output.is_ok() {
+        stable::record_survival_operation_success(&SurvivalOperationClass::Inference);
     }
+    output
 }
 
 pub struct MockInferenceAdapter;
@@ -319,6 +353,26 @@ pub struct OpenRouterInferenceAdapter {
 }
 
 impl OpenRouterInferenceAdapter {
+    fn affordability_requirements(
+        request_size_bytes: u64,
+        max_response_bytes: u64,
+    ) -> Result<AffordabilityRequirements, String> {
+        let operation = OperationClass::HttpOutcall {
+            request_size_bytes,
+            max_response_bytes,
+        };
+        let estimated = estimate_operation_cost(&operation)?;
+        Ok(affordability_requirements(
+            estimated,
+            DEFAULT_SAFETY_MARGIN_BPS,
+            0,
+        ))
+    }
+
+    fn estimate_request_size_bytes(payload: &[u8]) -> u64 {
+        u64::try_from(payload.len()).unwrap_or(u64::MAX)
+    }
+
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Self {
         Self {
             model: snapshot.inference_model.clone(),
@@ -352,11 +406,59 @@ impl OpenRouterInferenceAdapter {
 #[async_trait(?Send)]
 impl InferenceAdapter for OpenRouterInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
+        let now_ns = current_time_ns();
+        if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
+            return Ok(InferenceOutput {
+                tool_calls: Vec::new(),
+                explanation: "inference skipped due to survival policy".to_string(),
+            });
+        }
+
         self.validate_config()?;
 
         let api_key = self.api_key.clone().unwrap_or_default();
         let payload = serde_json::to_vec(&build_openrouter_request_body(input, &self.model))
             .map_err(|error| format!("failed to build openrouter request payload: {error}"))?;
+        let request_size_bytes = Self::estimate_request_size_bytes(&payload);
+        let requirements =
+            Self::affordability_requirements(request_size_bytes, self.max_response_bytes)?;
+        let total_cycles = ic_cdk::api::canister_cycle_balance();
+        let liquid_cycles = total_cycles.saturating_sub(DEFAULT_RESERVE_FLOOR_CYCLES);
+
+        log!(
+            InferenceLogPriority::Info,
+            "turn={} provider=openrouter request_affordability_check estimated_cost={} safety_margin_bps={} safety_margin={} required_cycles={} liquid_cycles={} total_cycles={} reserve_floor_cycles={}",
+            input.turn_id,
+            requirements.estimated_cycles,
+            requirements.safety_margin_bps,
+            requirements.safety_margin,
+            requirements.required_cycles,
+            liquid_cycles,
+            total_cycles,
+            DEFAULT_RESERVE_FLOOR_CYCLES,
+        );
+
+        if liquid_cycles < requirements.required_cycles {
+            stable::record_survival_operation_failure(
+                &SurvivalOperationClass::Inference,
+                now_ns,
+                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE,
+            );
+            log!(
+                InferenceLogPriority::Error,
+                "turn={} provider=openrouter inference_deferred insufficient_liquid_cycles estimated_cost={} liquid_cycles={} total_cycles={} reserve_floor_cycles={} required_cycles={}",
+                input.turn_id,
+                requirements.estimated_cycles,
+                liquid_cycles,
+                total_cycles,
+                DEFAULT_RESERVE_FLOOR_CYCLES,
+                requirements.required_cycles
+            );
+            return Ok(InferenceOutput {
+                tool_calls: Vec::new(),
+                explanation: "inference skipped due to low cycles".to_string(),
+            });
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let request = HttpRequestArgs {
@@ -385,11 +487,44 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
             self.model
         );
 
-        let response = http_request(&request)
-            .await
-            .map_err(|error| format!("openrouter http outcall failed: {error}"))?;
+        let response = match http_request(&request).await {
+            Ok(response) => response,
+            Err(error) => {
+                let message = format!("openrouter http outcall failed: {error}");
+                if is_insufficient_cycles_error(&message) {
+                    stable::record_survival_operation_failure(
+                        &SurvivalOperationClass::Inference,
+                        now_ns,
+                        stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE,
+                    );
+                    log!(
+                        InferenceLogPriority::Error,
+                        "turn={} provider=openrouter inference_deferred insufficient_cycles_error_after_preflight message={} estimated_cost={} liquid_cycles={} total_cycles={}",
+                        input.turn_id,
+                        message,
+                        requirements.estimated_cycles,
+                        liquid_cycles,
+                        total_cycles
+                    );
+                    return Ok(InferenceOutput {
+                        tool_calls: Vec::new(),
+                        explanation: "inference skipped due to low cycles".to_string(),
+                    });
+                }
+                return Err(message);
+            }
+        };
         parse_openrouter_http_response(response)
     }
+}
+
+fn is_insufficient_cycles_error(error: &str) -> bool {
+    let normalized = error.to_lowercase();
+    let indicates_insufficient_cycles =
+        normalized.contains("insufficient cycles") || normalized.contains("not enough cycles");
+    let indicates_depleted =
+        normalized.contains("out of cycles") || normalized.contains("cycles depleted");
+    indicates_insufficient_cycles || indicates_depleted
 }
 
 fn parse_openrouter_http_response(response: HttpRequestResult) -> Result<InferenceOutput, String> {
@@ -624,5 +759,45 @@ mod tests {
             .validate_config()
             .expect_err("should fail without key");
         assert!(error.contains("api key"));
+    }
+
+    #[test]
+    fn openrouter_affordability_blocks_low_liquid_cycles() {
+        let requirements = OpenRouterInferenceAdapter::affordability_requirements(1_024, 16_000)
+            .expect("affordability estimate should compute");
+        let total_cycles = 5 + requirements.required_cycles;
+        let liquid_cycles = total_cycles.saturating_sub(DEFAULT_RESERVE_FLOOR_CYCLES);
+        assert!(
+            liquid_cycles < requirements.required_cycles,
+            "fixture should exercise insufficient condition"
+        );
+    }
+
+    #[test]
+    fn openrouter_affordability_allows_high_liquid_cycles() {
+        let requirements = OpenRouterInferenceAdapter::affordability_requirements(1_024, 16_000)
+            .expect("affordability estimate should compute");
+        let total_cycles = requirements.required_cycles + DEFAULT_RESERVE_FLOOR_CYCLES + 1_000;
+        let liquid_cycles = total_cycles.saturating_sub(DEFAULT_RESERVE_FLOOR_CYCLES);
+        assert!(liquid_cycles >= requirements.required_cycles);
+    }
+
+    #[test]
+    fn insufficient_cycles_error_is_classified() {
+        assert!(is_insufficient_cycles_error(
+            "openrouter failed: insufficient cycles for this request"
+        ));
+        assert!(is_insufficient_cycles_error(
+            "canister reported cycles depleted while sending outbound HTTP request"
+        ));
+        assert!(!is_insufficient_cycles_error(
+            "openrouter returned status 500"
+        ));
+    }
+
+    #[test]
+    fn request_size_is_truncated_to_u64() {
+        let size = OpenRouterInferenceAdapter::estimate_request_size_bytes(&[]);
+        assert_eq!(size, 0);
     }
 }

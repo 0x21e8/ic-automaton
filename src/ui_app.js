@@ -37,9 +37,10 @@ const el = {
 };
 
 const INFERENCE_MODEL_PRESETS = [
-  "llama3.1:8b",
-  "qwen3:32b",
-  "llama4-scout",
+  "openai/gpt-4o-mini",
+  "meta-llama/llama-3.1-8b-instruct",
+  "anthropic/claude-3.5-sonnet",
+  "moonshotai/kimi-k2.5",
 ];
 
 function relativeTimeFromNs(ns) {

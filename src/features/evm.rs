@@ -5,6 +5,17 @@ pub struct EvmPollResult {
     pub events: Vec<EvmEvent>,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct EvmBroadcastResult {
+    pub tx_hash: String,
+}
+
+#[allow(dead_code)]
+pub trait EvmBroadcaster {
+    fn broadcast(&self, signed_transaction: &str) -> Result<EvmBroadcastResult, String>;
+}
+
 pub trait EvmPoller {
     fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String>;
 }
@@ -32,5 +43,30 @@ impl EvmPoller for MockEvmPoller {
             },
             events,
         })
+    }
+}
+
+#[allow(dead_code)]
+pub struct MockEvmBroadcaster;
+
+impl EvmBroadcaster for MockEvmBroadcaster {
+    fn broadcast(&self, signed_transaction: &str) -> Result<EvmBroadcastResult, String> {
+        Ok(EvmBroadcastResult {
+            tx_hash: format!("0x{signed_transaction}-mock"),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_evm_broadcaster_returns_mock_tx_hash() {
+        let broadcaster = MockEvmBroadcaster;
+        let result = broadcaster
+            .broadcast("0xdeadbeef")
+            .expect("mock broadcaster should succeed");
+        assert_eq!(result.tx_hash, "0x0xdeadbeef-mock");
     }
 }

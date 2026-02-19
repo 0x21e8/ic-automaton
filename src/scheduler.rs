@@ -1,9 +1,31 @@
 use crate::agent::run_scheduled_turn_job;
-use crate::domain::types::{JobStatus, ScheduledJob, TaskKind, TaskLane};
+use crate::domain::cycle_admission::{
+    affordability_requirements, estimate_operation_cost, AffordabilityRequirements, OperationClass,
+    DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+};
+use crate::domain::types::{
+    JobStatus, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+};
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 
 const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
+const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
+const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 4;
+
+fn current_time_ns() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::time();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
+            .unwrap_or_default()
+    }
+}
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerLogPriority {
@@ -20,7 +42,7 @@ impl GetLogFilter for SchedulerLogPriority {
 }
 
 pub async fn scheduler_tick() {
-    let now_ns = ic_cdk::api::time();
+    let now_ns = current_time_ns();
     stable::record_scheduler_tick_start(now_ns);
 
     log!(
@@ -82,20 +104,41 @@ pub async fn scheduler_tick() {
             &job.id,
             JobStatus::Failed,
             Some(format!("lease acquire failed: {error}")),
-            ic_cdk::api::time(),
+            current_time_ns(),
         );
-        stable::record_scheduler_tick_end(ic_cdk::api::time(), Some(error));
+        stable::record_scheduler_tick_end(current_time_ns(), Some(error));
         return;
+    }
+
+    if let Some(operation_class) = operation_class_for_task(&job.kind) {
+        if !stable::can_run_survival_operation(&operation_class, now_ns) {
+            let reason = "operation blocked by survival policy";
+            stable::complete_job(
+                &job.id,
+                JobStatus::Skipped,
+                Some(reason.to_string()),
+                current_time_ns(),
+            );
+            log!(
+                SchedulerLogPriority::Info,
+                "scheduler_job_skipped job_id={} kind={:?} operation={:?} reason={reason}",
+                job.id,
+                job.kind,
+                operation_class
+            );
+            stable::record_scheduler_tick_end(current_time_ns(), None);
+            return;
+        }
     }
 
     let result = dispatch_job(&job).await;
     match result {
-        Ok(()) => stable::complete_job(&job.id, JobStatus::Succeeded, None, ic_cdk::api::time()),
+        Ok(()) => stable::complete_job(&job.id, JobStatus::Succeeded, None, current_time_ns()),
         Err(error) => stable::complete_job(
             &job.id,
             JobStatus::Failed,
             Some(error.clone()),
-            ic_cdk::api::time(),
+            current_time_ns(),
         ),
     }
 
@@ -105,7 +148,7 @@ pub async fn scheduler_tick() {
         job.id,
         job.kind
     );
-    stable::record_scheduler_tick_end(ic_cdk::api::time(), None);
+    stable::record_scheduler_tick_end(current_time_ns(), None);
 }
 
 async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
@@ -114,7 +157,7 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
         TaskKind::PollInbox => {
             let staged = stable::stage_pending_inbox_messages(
                 POLL_INBOX_STAGE_BATCH_SIZE,
-                ic_cdk::api::time(),
+                current_time_ns(),
             );
             log!(
                 SchedulerLogPriority::Info,
@@ -123,8 +166,61 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
             );
             Ok(())
         }
-        TaskKind::CheckCycles | TaskKind::Reconcile => Ok(()),
+        TaskKind::CheckCycles => run_check_cycles().await,
+        TaskKind::Reconcile => Ok(()),
     }
+}
+
+async fn run_check_cycles() -> Result<(), String> {
+    let total_cycles = ic_cdk::api::canister_cycle_balance();
+    let liquid_cycles = total_cycles.saturating_sub(DEFAULT_RESERVE_FLOOR_CYCLES);
+    let expected = classify_survival_tier(liquid_cycles)?;
+    let requirements = check_cycles_requirements()?;
+
+    stable::set_scheduler_survival_tier(expected.clone());
+    let runtime_tier = stable::scheduler_survival_tier();
+    let recovery_checks = stable::scheduler_survival_tier_recovery_checks();
+
+    log!(
+        SchedulerLogPriority::Info,
+    "scheduler_checkcycles total_cycles={} liquid_cycles={} reserve_floor_cycles={} required_cycles={} low_tier_limit={} observed_tier={:?} runtime_tier={:?} recovery_checks={}",
+        total_cycles,
+        liquid_cycles,
+        DEFAULT_RESERVE_FLOOR_CYCLES,
+        requirements.required_cycles,
+        requirements.required_cycles.saturating_mul(CHECKCYCLES_LOW_TIER_MULTIPLIER),
+        expected,
+        runtime_tier,
+        recovery_checks
+    );
+    Ok(())
+}
+
+fn check_cycles_requirements() -> Result<AffordabilityRequirements, String> {
+    let operation_cost = estimate_operation_cost(&OperationClass::WorkflowEnvelope {
+        envelope_cycles: CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES,
+    })?;
+    Ok(affordability_requirements(
+        operation_cost,
+        DEFAULT_SAFETY_MARGIN_BPS,
+        DEFAULT_RESERVE_FLOOR_CYCLES,
+    ))
+}
+
+fn classify_survival_tier(liquid_cycles: u128) -> Result<SurvivalTier, String> {
+    let requirements = check_cycles_requirements()?;
+    if liquid_cycles < requirements.required_cycles {
+        return Ok(SurvivalTier::Critical);
+    }
+
+    let low_threshold = requirements
+        .required_cycles
+        .saturating_mul(CHECKCYCLES_LOW_TIER_MULTIPLIER);
+    if liquid_cycles < low_threshold {
+        return Ok(SurvivalTier::LowCycles);
+    }
+
+    Ok(SurvivalTier::Normal)
 }
 
 pub fn refresh_due_jobs(now_ns: u64) {
@@ -179,6 +275,14 @@ pub fn refresh_due_jobs(now_ns: u64) {
     }
 }
 
+fn operation_class_for_task(kind: &TaskKind) -> Option<SurvivalOperationClass> {
+    match kind {
+        TaskKind::AgentTurn => Some(SurvivalOperationClass::Inference),
+        TaskKind::PollInbox => Some(SurvivalOperationClass::EvmPoll),
+        _ => None,
+    }
+}
+
 fn lease_ttl_ns(kind: &TaskKind) -> u64 {
     match kind {
         TaskKind::AgentTurn => 120_000_000_000,
@@ -191,7 +295,8 @@ fn lease_ttl_ns(kind: &TaskKind) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{TaskScheduleConfig, TaskScheduleRuntime};
+    use crate::domain::types::{SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime};
+    use crate::storage::stable;
 
     fn init_scheduler_scope() {
         stable::init_scheduler_defaults(0);
@@ -321,5 +426,153 @@ mod tests {
             .filter(|job| job.dedupe_key == dedupe_key)
             .count();
         assert_eq!(second_slot_count, 1);
+    }
+
+    #[test]
+    fn checkcycles_classifies_survival_tier_by_liquid_cycles() {
+        let requirements = check_cycles_requirements().expect("requirements should compute");
+        let low_threshold = requirements
+            .required_cycles
+            .saturating_mul(CHECKCYCLES_LOW_TIER_MULTIPLIER);
+
+        let below_critical = requirements.required_cycles.saturating_sub(1);
+        assert_eq!(
+            classify_survival_tier(below_critical).expect("tier should classify"),
+            SurvivalTier::Critical
+        );
+
+        let low_tier = requirements
+            .required_cycles
+            .saturating_add((low_threshold.saturating_sub(requirements.required_cycles)) / 2);
+        assert_eq!(
+            classify_survival_tier(low_tier).expect("tier should classify"),
+            SurvivalTier::LowCycles
+        );
+
+        assert_eq!(
+            classify_survival_tier(low_threshold).expect("tier should classify"),
+            SurvivalTier::Normal
+        );
+    }
+
+    #[test]
+    fn checkcycles_survival_tier_recovery_hysteresis() {
+        init_scheduler_scope();
+        stable::set_scheduler_survival_tier(SurvivalTier::Critical);
+        let mut runtime = stable::scheduler_runtime_view();
+        assert_eq!(runtime.survival_tier, SurvivalTier::Critical);
+        assert_eq!(runtime.survival_tier_recovery_checks, 0);
+
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        runtime = stable::scheduler_runtime_view();
+        assert_eq!(runtime.survival_tier, SurvivalTier::Critical);
+        assert_eq!(runtime.survival_tier_recovery_checks, 1);
+
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        runtime = stable::scheduler_runtime_view();
+        assert_eq!(runtime.survival_tier, SurvivalTier::Critical);
+        assert_eq!(runtime.survival_tier_recovery_checks, 2);
+
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        runtime = stable::scheduler_runtime_view();
+        assert_eq!(runtime.survival_tier, SurvivalTier::Normal);
+        assert_eq!(runtime.survival_tier_recovery_checks, 0);
+    }
+
+    #[test]
+    fn operation_class_mapping_for_scheduler_tasks_is_stable() {
+        assert_eq!(
+            operation_class_for_task(&TaskKind::AgentTurn),
+            Some(SurvivalOperationClass::Inference)
+        );
+        assert_eq!(
+            operation_class_for_task(&TaskKind::PollInbox),
+            Some(SurvivalOperationClass::EvmPoll)
+        );
+        assert_eq!(operation_class_for_task(&TaskKind::CheckCycles), None);
+        assert_eq!(operation_class_for_task(&TaskKind::Reconcile), None);
+    }
+
+    #[test]
+    fn low_tier_policy_allows_only_inference_and_evm_poll_operations() {
+        init_scheduler_scope();
+        stable::set_scheduler_survival_tier(SurvivalTier::LowCycles);
+
+        assert!(stable::can_run_survival_operation(
+            &SurvivalOperationClass::Inference,
+            10
+        ));
+        assert!(stable::can_run_survival_operation(
+            &SurvivalOperationClass::EvmPoll,
+            10
+        ));
+        assert!(!stable::can_run_survival_operation(
+            &SurvivalOperationClass::EvmBroadcast,
+            10
+        ));
+        assert!(!stable::can_run_survival_operation(
+            &SurvivalOperationClass::ThresholdSign,
+            10
+        ));
+    }
+
+    #[test]
+    fn scheduler_blocks_inference_job_when_survival_operation_backoff_active() {
+        init_scheduler_scope();
+        let now_ns = 10u64;
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        stable::record_survival_operation_failure(&SurvivalOperationClass::Inference, now_ns, 1);
+
+        assert!(!stable::can_run_survival_operation(
+            &SurvivalOperationClass::Inference,
+            now_ns.saturating_add(500),
+        ));
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::Inference),
+            1
+        );
+    }
+
+    #[test]
+    fn scheduler_blocks_operation_class_on_critical_tier() {
+        init_scheduler_scope();
+        stable::set_scheduler_survival_tier(SurvivalTier::Critical);
+
+        assert!(!stable::can_run_survival_operation(
+            &SurvivalOperationClass::Inference,
+            10
+        ));
+        assert!(!stable::can_run_survival_operation(
+            &SurvivalOperationClass::EvmPoll,
+            10
+        ));
+    }
+
+    #[test]
+    fn scheduler_allows_operations_after_low_tier_backoff_cooldown() {
+        init_scheduler_scope();
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        let now_ns = 10u64;
+        stable::record_survival_operation_failure(&SurvivalOperationClass::Inference, now_ns, 1);
+
+        assert!(!stable::can_run_survival_operation(
+            &SurvivalOperationClass::Inference,
+            now_ns.saturating_add(500),
+        ));
+
+        let cooldown = stable::survival_operation_backoff_until(&SurvivalOperationClass::Inference)
+            .expect("backoff should be active");
+        assert!(
+            !stable::can_run_survival_operation(
+                &SurvivalOperationClass::Inference,
+                cooldown.saturating_sub(1)
+            ),
+            "operation should remain blocked at backoff boundary"
+        );
+        let after_backoff = cooldown.saturating_add(1);
+        assert!(
+            stable::can_run_survival_operation(&SurvivalOperationClass::Inference, after_backoff),
+            "operation should be runnable after backoff window"
+        );
     }
 }

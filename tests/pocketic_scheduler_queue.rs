@@ -37,6 +37,14 @@ enum TaskLane {
     ReadOnly,
 }
 
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+enum SurvivalTier {
+    Normal,
+    LowCycles,
+    Critical,
+    OutOfCycles,
+}
+
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
 struct ObservedJob {
     id: String,
@@ -67,6 +75,8 @@ struct SchedulerRuntime {
     enabled: bool,
     paused_reason: Option<String>,
     low_cycles_mode: bool,
+    survival_tier: SurvivalTier,
+    survival_tier_recovery_checks: u32,
     next_job_seq: u64,
     active_mutating_lease: Option<SchedulerLease>,
     last_tick_started_ns: u64,

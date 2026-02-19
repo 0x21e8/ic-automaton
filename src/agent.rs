@@ -1,4 +1,5 @@
 use crate::domain::state_machine;
+use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{AgentEvent, AgentState, InferenceInput, TurnRecord};
 use crate::features::{infer_with_provider, EvmPoller, MockEvmPoller, MockSignerAdapter};
 use crate::storage::stable;
@@ -55,10 +56,19 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         .collect::<Vec<_>>();
     let staged_message_count = staged_messages.len();
 
-    let poll = MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor);
+    let can_poll =
+        stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, started_at_ns);
+    let poll = if can_poll {
+        Some(MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor))
+    } else {
+        None
+    };
     let (next_cursor, evm_events) = match poll {
-        Ok(poll) => (poll.cursor, poll.events.len()),
-        Err(reason) => {
+        Some(Ok(poll)) => {
+            stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
+            (poll.cursor, poll.events.len())
+        }
+        Some(Err(reason)) => {
             let _ = advance_state(
                 &mut state,
                 &AgentEvent::TurnFailed {
@@ -69,6 +79,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             stable::complete_turn(AgentState::Faulted, Some(reason.clone()));
             return Err(reason);
         }
+        None => (snapshot.evm_cursor.clone(), 0),
     };
     let has_input = evm_events > 0 || staged_message_count > 0;
 

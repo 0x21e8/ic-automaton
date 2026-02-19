@@ -570,6 +570,16 @@ fn apply_inference_config_update(
     if let Some(raw_model) = payload.model {
         let model = raw_model.trim();
         if !model.is_empty() {
+            let target_provider = requested_provider
+                .clone()
+                .unwrap_or_else(|| current_provider.clone());
+            if target_provider == crate::domain::types::InferenceProvider::OpenRouter
+                && is_ic_llm_model_alias(model)
+            {
+                return Err(format!(
+                    "openrouter model id is invalid: {model}. use a provider model id like openai/gpt-4o-mini"
+                ));
+            }
             stable::set_inference_model(model.to_string())?;
         } else {
             return Err("inference model cannot be empty".to_string());
@@ -616,6 +626,13 @@ fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::Inference
         "openrouter" => Ok(crate::domain::types::InferenceProvider::OpenRouter),
         unsupported => Err(format!("unsupported inference provider: {unsupported}")),
     }
+}
+
+fn is_ic_llm_model_alias(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "llama3.1:8b" | "qwen3:32b" | "llama4-scout"
+    )
 }
 
 fn set_tree_as_certified_data(tree: &HttpCertificationTree) {
@@ -788,7 +805,8 @@ mod tests {
                 CONTENT_TYPE_JSON.to_string(),
             )])
             .with_body(
-                br#"{"provider":"openrouter","model":"qwen3:32b","key_action":"keep"}"#.to_vec(),
+                br#"{"provider":"openrouter","model":"openai/gpt-4o-mini","key_action":"keep"}"#
+                    .to_vec(),
             )
             .build_update();
         let response = handle_http_request_update(request);
@@ -799,6 +817,34 @@ mod tests {
         assert_eq!(
             body.get("error").and_then(Value::as_str),
             Some("openrouter api key is not configured; set key_action to set")
+        );
+    }
+
+    #[test]
+    fn inference_config_update_rejects_ic_llm_model_alias_for_openrouter() {
+        init_certification();
+        stable::init_storage();
+        stable::set_openrouter_api_key(Some("test-key".to_string()));
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(
+                br#"{"provider":"openrouter","model":"qwen3:32b","key_action":"keep"}"#.to_vec(),
+            )
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some(
+                "openrouter model id is invalid: qwen3:32b. use a provider model id like openai/gpt-4o-mini"
+            )
         );
     }
 
@@ -840,7 +886,8 @@ mod tests {
                 CONTENT_TYPE_JSON.to_string(),
             )])
             .with_body(
-                br#"{"provider":"openrouter","model":"qwen3:32b","key_action":"keep"}"#.to_vec(),
+                br#"{"provider":"openrouter","model":"openai/gpt-4o-mini","key_action":"keep"}"#
+                    .to_vec(),
             )
             .build_update();
         let response = handle_http_request_update(request);
@@ -856,7 +903,7 @@ mod tests {
         );
         assert_eq!(
             config.get("model"),
-            Some(&Value::String("qwen3:32b".to_string()))
+            Some(&Value::String("openai/gpt-4o-mini".to_string()))
         );
         assert!(config
             .get("openrouter_has_api_key")
