@@ -14,6 +14,13 @@ Follow the KISS principle. Clarify with the human if you need to introduce compl
 - Use canlog rust crate for structured logging.
 - Autonomy is mandatory: the canister runtime must self-heal and continue scheduled operation after transient failures, without requiring manual resets or operator intervention.
 
+## Host-safe time guidance
+- Do not call `ic_cdk::api::time()` directly in code that runs in native/unit tests.
+- Use a small local helper, for example `current_time_ns()`, with `cfg` branches:
+  - `wasm32`: use `ic_cdk::api::time()`
+  - non-`wasm32`: use a host-safe fallback (system time or deterministic test value, depending on test needs)
+- Keep time-source behavior explicit in tests that validate backoff/retry windows to avoid flaky or always-expired assertions.
+
 ## Documentation workflow
 - Treat `docs/design/` and `specs/` as a primary source of truth for requirements, architecture/design decisions, and user flows.
 - For agent-based testing of flows check `docs/runbooks/`.

@@ -346,10 +346,27 @@ impl TaskKind {
     }
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum SurvivalTier {
+    #[default]
+    Normal,
+    LowCycles,
+    Critical,
+    OutOfCycles,
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum TaskLane {
     Mutating,
     ReadOnly,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum SurvivalOperationClass {
+    Inference,
+    EvmPoll,
+    EvmBroadcast,
+    ThresholdSign,
 }
 
 impl TaskLane {
@@ -445,6 +462,10 @@ pub struct SchedulerRuntime {
     pub enabled: bool,
     pub paused_reason: Option<String>,
     pub low_cycles_mode: bool,
+    #[serde(default)]
+    pub survival_tier: SurvivalTier,
+    #[serde(default)]
+    pub survival_tier_recovery_checks: u32,
     pub next_job_seq: u64,
     pub active_mutating_lease: Option<SchedulerLease>,
     pub last_tick_started_ns: u64,
@@ -458,6 +479,8 @@ impl Default for SchedulerRuntime {
             enabled: true,
             paused_reason: None,
             low_cycles_mode: false,
+            survival_tier: SurvivalTier::Normal,
+            survival_tier_recovery_checks: 0,
             next_job_seq: 0,
             active_mutating_lease: None,
             last_tick_started_ns: 0,

@@ -220,7 +220,7 @@ fn supports_inference_config_http_flow() {
         .with_body(
             serde_json::json!({
                 "provider": "openrouter",
-                "model": "qwen3:32b",
+                "model": "openai/gpt-4o-mini",
                 "key_action": "set",
                 "api_key": "test-key",
             })
@@ -239,7 +239,7 @@ fn supports_inference_config_http_flow() {
     );
     assert_eq!(
         set_config.get("model").and_then(Value::as_str),
-        Some("qwen3:32b")
+        Some("openai/gpt-4o-mini")
     );
     assert_eq!(
         set_config
@@ -302,7 +302,7 @@ fn supports_inference_config_http_flow() {
             serde_json::json!({
                 "provider": "openrouter",
                 "key_action": "clear",
-                "model": "qwen3:32b",
+                "model": "openai/gpt-4o-mini",
             })
             .to_string()
             .into_bytes(),

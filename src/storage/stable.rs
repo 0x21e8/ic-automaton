@@ -2,15 +2,15 @@ use crate::domain::types::{
     AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
     InferenceConfigView, InferenceProvider, JobStatus, ObservabilitySnapshot, OutboxMessage,
     OutboxStats, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime,
-    SkillRecord, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
-    TransitionLogRecord, TurnRecord,
+    SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
+    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
     memory_manager::{MemoryId, MemoryManager, VirtualMemory},
     DefaultMemoryImpl, StableBTreeMap,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::cell::RefCell;
 
 fn now_ns() -> u64 {
@@ -34,6 +34,14 @@ const OUTBOX_SEQ_KEY: &str = "outbox.seq";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
+pub const SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED: u32 = 3;
+pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE: u64 = 120;
+#[allow(dead_code)]
+pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
+#[allow(dead_code)]
+pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
+#[allow(dead_code)]
+pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
@@ -49,6 +57,122 @@ impl GetLogFilter for SchedulerStorageLogPriority {
     fn get_log_filter() -> LogFilter {
         LogFilter::ShowAll
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SurvivalOperationRuntime {
+    pub consecutive_failures: u32,
+    pub backoff_until_ns: Option<u64>,
+}
+
+fn survival_operation_runtime_key(operation: &SurvivalOperationClass) -> String {
+    match operation {
+        SurvivalOperationClass::Inference => "survival.operation:inference".to_string(),
+        SurvivalOperationClass::EvmPoll => "survival.operation:evm_poll".to_string(),
+        SurvivalOperationClass::EvmBroadcast => "survival.operation:evm_broadcast".to_string(),
+        SurvivalOperationClass::ThresholdSign => "survival.operation:threshold_sign".to_string(),
+    }
+}
+
+fn get_survival_operation_runtime(operation: &SurvivalOperationClass) -> SurvivalOperationRuntime {
+    SURVIVAL_OPERATION_RUNTIME_MAP
+        .with(|map| map.borrow().get(&survival_operation_runtime_key(operation)))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+        .unwrap_or_default()
+}
+
+fn set_survival_operation_runtime(
+    operation: &SurvivalOperationClass,
+    runtime: &SurvivalOperationRuntime,
+) {
+    SURVIVAL_OPERATION_RUNTIME_MAP.with(|map| {
+        map.borrow_mut().insert(
+            survival_operation_runtime_key(operation),
+            encode_json(runtime),
+        );
+    });
+}
+
+fn survival_operation_backoff_secs(failures: u32, max_backoff_secs: u64) -> u64 {
+    let capped = max_backoff_secs.max(1);
+    let exponent = failures.min(20);
+    let delay = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    delay.min(capped)
+}
+
+fn survival_operation_allows_in_tier(
+    tier: &SurvivalTier,
+    operation: &SurvivalOperationClass,
+) -> bool {
+    !matches!(
+        (tier, operation),
+        (SurvivalTier::Critical, _)
+            | (SurvivalTier::OutOfCycles, _)
+            | (
+                SurvivalTier::LowCycles,
+                SurvivalOperationClass::ThresholdSign
+            )
+            | (
+                SurvivalTier::LowCycles,
+                SurvivalOperationClass::EvmBroadcast
+            )
+    )
+}
+
+pub fn can_run_survival_operation(operation: &SurvivalOperationClass, now_ns: u64) -> bool {
+    if !survival_operation_allows_in_tier(&scheduler_survival_tier(), operation) {
+        return false;
+    }
+    get_survival_operation_runtime(operation)
+        .backoff_until_ns
+        .is_none_or(|until| until <= now_ns)
+}
+
+pub fn record_survival_operation_failure(
+    operation: &SurvivalOperationClass,
+    now_ns: u64,
+    max_backoff_secs: u64,
+) {
+    let mut runtime = get_survival_operation_runtime(operation);
+    runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
+    let backoff_ns =
+        survival_operation_backoff_secs(runtime.consecutive_failures, max_backoff_secs)
+            .saturating_mul(1_000_000_000);
+    runtime.backoff_until_ns = now_ns.checked_add(backoff_ns);
+    if runtime.backoff_until_ns.is_none() {
+        runtime.backoff_until_ns = Some(u64::MAX);
+    }
+    set_survival_operation_runtime(operation, &runtime);
+    log!(
+        SchedulerStorageLogPriority::Warn,
+        "survival_operation_failure operation={:?} consecutive_failures={} backoff_until_ns={}",
+        operation,
+        runtime.consecutive_failures,
+        runtime.backoff_until_ns.unwrap_or_default()
+    );
+}
+
+pub fn record_survival_operation_success(operation: &SurvivalOperationClass) {
+    let runtime = get_survival_operation_runtime(operation);
+    if runtime.consecutive_failures == 0 && runtime.backoff_until_ns.is_none() {
+        return;
+    }
+    log!(
+        SchedulerStorageLogPriority::Info,
+        "survival_operation_success operation={:?}",
+        operation
+    );
+    set_survival_operation_runtime(operation, &SurvivalOperationRuntime::default());
+}
+
+#[allow(dead_code)]
+pub fn survival_operation_backoff_until(operation: &SurvivalOperationClass) -> Option<u64> {
+    get_survival_operation_runtime(operation).backoff_until_ns
+}
+
+#[allow(dead_code)]
+pub fn survival_operation_consecutive_failures(operation: &SurvivalOperationClass) -> u32 {
+    get_survival_operation_runtime(operation).consecutive_failures
 }
 
 thread_local! {
@@ -116,6 +240,11 @@ thread_local! {
         RefCell::new(StableBTreeMap::init(
             MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(14)))
         ));
+    static SURVIVAL_OPERATION_RUNTIME_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(15)))
+    ));
 }
 
 pub fn init_storage() {
@@ -273,9 +402,15 @@ pub fn set_scheduler_enabled(enabled: bool) -> String {
 }
 
 pub fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
+    let previous = scheduler_low_cycles_mode();
     let mut runtime = scheduler_runtime();
-    let previous = runtime.low_cycles_mode;
     runtime.low_cycles_mode = enabled;
+    runtime.survival_tier = if enabled {
+        SurvivalTier::LowCycles
+    } else {
+        SurvivalTier::Normal
+    };
+    runtime.survival_tier_recovery_checks = 0;
     runtime.paused_reason = if enabled {
         Some("low_cycles".to_string())
     } else {
@@ -295,18 +430,81 @@ pub fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
     }
 }
 
-pub fn scheduler_enabled() -> bool {
-    scheduler_runtime().enabled
+pub fn set_scheduler_survival_tier(observed_tier: SurvivalTier) {
+    let mut runtime = scheduler_runtime();
+    let previous_tier = runtime.survival_tier.clone();
+    let previous_checks = runtime.survival_tier_recovery_checks;
+
+    let (resolved_tier, resolved_checks) =
+        next_survival_tier_with_recovery(previous_tier.clone(), previous_checks, observed_tier);
+    let resolved_low_cycles = resolved_tier != SurvivalTier::Normal;
+    let resolved_paused_reason = if resolved_low_cycles {
+        Some("low_cycles".to_string())
+    } else {
+        None
+    };
+    if resolved_tier == previous_tier
+        && resolved_checks == previous_checks
+        && runtime.low_cycles_mode == resolved_low_cycles
+        && runtime.paused_reason == resolved_paused_reason
+    {
+        return;
+    }
+
+    runtime.survival_tier = resolved_tier.clone();
+    runtime.survival_tier_recovery_checks = resolved_checks;
+    runtime.low_cycles_mode = resolved_low_cycles;
+    runtime.paused_reason = resolved_paused_reason;
+
+    log!(
+        SchedulerStorageLogPriority::Info,
+        "scheduler_survival_tier transition previous_tier={:?} next_tier={:?} recovery_checks={}",
+        previous_tier,
+        resolved_tier,
+        resolved_checks
+    );
+    save_scheduler_runtime(&runtime);
 }
 
 pub fn scheduler_low_cycles_mode() -> bool {
     scheduler_runtime().low_cycles_mode
 }
 
+pub fn scheduler_survival_tier() -> SurvivalTier {
+    scheduler_runtime().survival_tier
+}
+
+pub fn scheduler_survival_tier_recovery_checks() -> u32 {
+    scheduler_runtime().survival_tier_recovery_checks
+}
+
+pub fn scheduler_enabled() -> bool {
+    scheduler_runtime().enabled
+}
+
 pub fn mutating_lease_active(now_ns: u64) -> bool {
     scheduler_runtime()
         .active_mutating_lease
         .is_some_and(|lease| lease.expires_at_ns > now_ns)
+}
+
+fn next_survival_tier_with_recovery(
+    current: SurvivalTier,
+    current_checks: u32,
+    observed: SurvivalTier,
+) -> (SurvivalTier, u32) {
+    match observed {
+        SurvivalTier::Normal => {
+            if current == SurvivalTier::Normal
+                || current_checks.saturating_add(1) >= SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED
+            {
+                (SurvivalTier::Normal, 0)
+            } else {
+                (current, current_checks.saturating_add(1))
+            }
+        }
+        _ => (observed, 0),
+    }
 }
 
 pub fn record_scheduler_tick_start(now_ns: u64) {
