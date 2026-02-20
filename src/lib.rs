@@ -22,6 +22,8 @@ use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUp
 use serde::Deserialize;
 use std::time::Duration;
 
+const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
+
 #[derive(CandidType, Deserialize)]
 struct InitArgs {
     ecdsa_key_name: String,
@@ -279,7 +281,7 @@ fn http_request_update(request: HttpUpdateRequest) -> HttpUpdateResponse {
 }
 
 fn arm_timer() {
-    set_timer_interval_serial(Duration::from_secs(1), scheduler_tick);
+    set_timer_interval_serial(Duration::from_secs(SCHEDULER_TICK_INTERVAL_SECS), scheduler_tick);
 }
 
 ic_cdk::export_candid!();
