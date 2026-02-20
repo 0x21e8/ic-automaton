@@ -170,7 +170,7 @@ Required impact response:
       - Validation: `cargo test -q no_input_turn_runs_autonomous_inference_and_records_inner_dialogue` and new continuation loop tests
       - Notes: Implement max rounds/time guards and degraded continuation fallback behavior.
 
-- [ ] **Task 4: Update autonomy dedupe behavior for continuation protocol completeness**
+- [x] **Task 4: Update autonomy dedupe behavior for continuation protocol completeness**
       - Files: `src/agent.rs`
       - Validation: new unit test asserting suppressed autonomy calls still generate tool outputs consumable by continuation
       - Notes: Use synthetic “skipped due to freshness dedupe” tool records when suppression applies.
