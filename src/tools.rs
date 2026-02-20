@@ -1,5 +1,5 @@
 use crate::domain::types::{AgentState, SurvivalOperationClass, ToolCall, ToolCallRecord};
-use crate::features::evm::evm_read_tool;
+use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::storage::stable;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -92,6 +92,14 @@ impl ToolManager {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
                 max_calls_per_turn: 3,
+            },
+        );
+        policies.insert(
+            "send_eth".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+                max_calls_per_turn: 1,
             },
         );
 
@@ -265,6 +273,42 @@ impl ToolManager {
                                 &SurvivalOperationClass::EvmPoll,
                                 now_ns,
                                 stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+                            );
+                        }
+                        result
+                    }
+                }
+                "send_eth" => {
+                    let now_ns = current_time_ns();
+                    if !stable::can_run_survival_operation(
+                        &SurvivalOperationClass::ThresholdSign,
+                        now_ns,
+                    ) {
+                        Err("send_eth skipped due to threshold sign survival policy".to_string())
+                    } else if !stable::can_run_survival_operation(
+                        &SurvivalOperationClass::EvmBroadcast,
+                        now_ns,
+                    ) {
+                        Err("send_eth skipped due to evm broadcast survival policy".to_string())
+                    } else {
+                        let result = send_eth_tool(&call.args_json, signer).await;
+                        if result.is_ok() {
+                            stable::record_survival_operation_success(
+                                &SurvivalOperationClass::ThresholdSign,
+                            );
+                            stable::record_survival_operation_success(
+                                &SurvivalOperationClass::EvmBroadcast,
+                            );
+                        } else {
+                            stable::record_survival_operation_failure(
+                                &SurvivalOperationClass::ThresholdSign,
+                                now_ns,
+                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN,
+                            );
+                            stable::record_survival_operation_failure(
+                                &SurvivalOperationClass::EvmBroadcast,
+                                now_ns,
+                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST,
                             );
                         }
                         result
@@ -512,5 +556,43 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].success);
         assert!(records[0].output.contains("0x"));
+    }
+
+    #[test]
+    fn send_eth_tool_runs_for_supported_payload() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("address should set");
+
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+
+        let state = AgentState::ExecutingActions;
+        let signer = HexSigner;
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool: "send_eth".to_string(),
+            args_json: r#"{"to":"0x2222222222222222222222222222222222222222","value_wei":"1"}"#
+                .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        assert_eq!(
+            records[0].output,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 }
