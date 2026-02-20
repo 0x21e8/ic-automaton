@@ -35,6 +35,8 @@ pub struct TransitionError {
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct ToolCall {
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
     pub tool: String,
     pub args_json: String,
 }

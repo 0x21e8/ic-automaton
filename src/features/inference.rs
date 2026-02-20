@@ -105,11 +105,13 @@ impl InferenceAdapter for MockInferenceAdapter {
 
         let tool_calls = if explicit_sign_request {
             vec![ToolCall {
+                tool_call_id: None,
                 tool: "sign_message".to_string(),
                 args_json: r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#.to_string(),
             }]
         } else if update_prompt_layer_request {
             vec![ToolCall {
+                tool_call_id: None,
                 tool: "update_prompt_layer".to_string(),
                 args_json: json!({
                     "layer_id": 6,
@@ -119,6 +121,7 @@ impl InferenceAdapter for MockInferenceAdapter {
             }]
         } else {
             vec![ToolCall {
+                tool_call_id: None,
                 tool: "record_signal".to_string(),
                 args_json: r#"{"signal":"tick"}"#.to_string(),
             }]
@@ -411,6 +414,7 @@ fn parse_ic_llm_response(response: IcLlmResponse) -> Result<InferenceOutput, Str
         let args_json = serde_json::to_string(&args)
             .map_err(|error| format!("failed to serialize ic_llm tool args: {error}"))?;
         tool_calls.push(ToolCall {
+            tool_call_id: Some(tool_call.id).filter(|id| !id.trim().is_empty()),
             tool: tool_call.function.name,
             args_json,
         });
@@ -990,6 +994,7 @@ fn parse_openrouter_completion(raw: &str) -> Result<InferenceOutput, String> {
             let parsed_arguments = parse_openrouter_tool_arguments(&tool_call.function.arguments)?;
 
             tool_calls.push(ToolCall {
+                tool_call_id: tool_call.id.clone().filter(|id| !id.trim().is_empty()),
                 tool: tool_call.function.name.clone(),
                 args_json: parsed_arguments.to_string(),
             });
@@ -1082,6 +1087,7 @@ mod tests {
 
         let out = parse_ic_llm_response(response).expect("response should parse");
         assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(out.tool_calls[0].tool, "record_signal");
         assert_eq!(out.tool_calls[0].args_json, r#"{"signal":"tick"}"#);
     }
@@ -1110,6 +1116,7 @@ mod tests {
 
         let out = parse_openrouter_completion(payload).expect("response should parse");
         assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(out.tool_calls[0].tool, "sign_message");
         assert_eq!(
             out.tool_calls[0].args_json,
