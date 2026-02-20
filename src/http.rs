@@ -82,6 +82,17 @@ struct InferenceConfigSuccess {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ConversationLookupRequest {
+    sender: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConversationLookupError {
+    ok: bool,
+    error: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct InferenceConfigUpdateRequest {
     #[serde(default)]
     provider: Option<String>,
@@ -215,6 +226,24 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
                 }
             }
         }
+        (&Method::POST, "/api/conversation") => {
+            match parse_conversation_lookup_request(request.body()) {
+                Ok(payload) => match stable::get_conversation_log(&payload.sender) {
+                    Some(log) => json_update_response(StatusCode::OK, &log),
+                    None => json_update_response(
+                        StatusCode::NOT_FOUND,
+                        &ConversationLookupError {
+                            ok: false,
+                            error: format!("conversation not found for sender {}", payload.sender),
+                        },
+                    ),
+                },
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
         (&Method::GET, "/api/inference/config") => {
             let config = stable::inference_config_view();
             json_update_response(StatusCode::OK, &config)
@@ -309,6 +338,7 @@ fn build_certification_state() -> HttpCertificationState {
         upgrade_route(Method::GET, "/api/snapshot"),
         upgrade_route(Method::GET, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/inference/config"),
+        upgrade_route(Method::POST, "/api/conversation"),
         upgrade_route(Method::POST, "/api/inbox"),
     ];
     for route in &routes {
@@ -551,6 +581,23 @@ fn parse_inference_config_request(
     })
 }
 
+fn parse_conversation_lookup_request(body: &[u8]) -> Result<ConversationLookupRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("conversation lookup body cannot be empty".to_string());
+    }
+
+    let payload = serde_json::from_slice::<ConversationLookupRequest>(body)
+        .map_err(|error| format!("invalid conversation lookup payload: {error}"))?;
+    let sender = payload.sender.trim();
+    if sender.is_empty() {
+        return Err("sender cannot be empty".to_string());
+    }
+
+    Ok(ConversationLookupRequest {
+        sender: sender.to_string(),
+    })
+}
+
 fn apply_inference_config_update(
     payload: InferenceConfigUpdateRequest,
 ) -> Result<InferenceConfigView, String> {
@@ -718,6 +765,56 @@ mod tests {
 
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn post_conversation_route_is_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::post("/api/conversation").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn conversation_lookup_returns_conversation_log() {
+        init_certification();
+        stable::init_storage();
+        stable::append_conversation_entry(
+            "0xAbCd00000000000000000000000000000000Ef12",
+            crate::domain::types::ConversationEntry {
+                inbox_message_id: "inbox:1".to_string(),
+                sender_body: "hello".to_string(),
+                agent_reply: "hi".to_string(),
+                turn_id: "turn-1".to_string(),
+                timestamp_ns: 1,
+            },
+        );
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/conversation")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"sender":"0xabcd00000000000000000000000000000000ef12"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.get("sender").and_then(Value::as_str),
+            Some("0xabcd00000000000000000000000000000000ef12")
+        );
+        assert_eq!(
+            body.get("entries")
+                .and_then(Value::as_array)
+                .map(|entries| entries.len()),
+            Some(1)
+        );
     }
 
     #[test]

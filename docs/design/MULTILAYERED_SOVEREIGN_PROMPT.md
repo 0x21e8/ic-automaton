@@ -455,10 +455,10 @@ The inference adapter selects compact vs. full based on the provider:
 
 ### Phase 6: Observability & UI
 
-- [ ] **6.1** Add prompt layers to observability snapshot (`get_observability_snapshot`)
-- [ ] **6.2** Add prompt layer display to the embedded UI (read-only view of all layers)
-- [ ] **6.3** Show which layers are immutable vs. mutable
-- [ ] **6.4** Add conversation history view (list of senders, click to see exchange history)
+- [x] **6.1** Add prompt layers to observability snapshot (`get_observability_snapshot`)
+- [x] **6.2** Add prompt layer display to the embedded UI (read-only view of all layers)
+- [x] **6.3** Show which layers are immutable vs. mutable
+- [x] **6.4** Add conversation history view (list of senders, click to see exchange history)
 
 ---
 

@@ -5,6 +5,9 @@ const state = {
   knownJobIds: new Set(),
   pollHandle: null,
   inferenceDirty: false,
+  selectedConversationSender: "",
+  selectedConversationLastActivityNs: 0,
+  conversationSummaries: [],
   inferenceConfig: {
     provider: "llm_canister",
     model: "",
@@ -23,6 +26,9 @@ const el = {
   transitions: document.getElementById("transitions-list"),
   jobs: document.getElementById("jobs-list"),
   chat: document.getElementById("chat-list"),
+  promptLayers: document.getElementById("prompt-layers-list"),
+  conversations: document.getElementById("conversations-list"),
+  conversationDetail: document.getElementById("conversation-detail"),
   inferenceForm: document.getElementById("inference-form"),
   inferenceSubmit: document.getElementById("inference-submit"),
   inferenceStatus: document.getElementById("inference-status"),
@@ -130,6 +136,101 @@ function renderChat(container, inboxMessages, outboxMessages) {
           .join("");
 }
 
+function renderPromptLayers(container, layers) {
+  container.innerHTML =
+    !Array.isArray(layers) || layers.length === 0
+      ? "<p class=\"muted\">No prompt layers available.</p>"
+      : layers
+          .map((layer) => {
+            const layerId = Number(layer.layer_id ?? -1);
+            const mutable = Boolean(layer.is_mutable);
+            const versionText = mutable ? `v${Number(layer.version || 0)}` : "const";
+            const updatedBy = mutable ? String(layer.updated_by_turn || "n/a") : "compiler";
+            const content = String(layer.content || "");
+            const mutabilityKind = mutable ? "warn" : "ok";
+            const mutabilityLabel = mutable ? "mutable" : "immutable";
+            return `<article class="layer-row">
+              <p class="layer-head">
+                <strong>Layer ${escapeHtml(layerId)}</strong>
+                ${statusBadge(mutabilityLabel, mutabilityKind)}
+              </p>
+              <p class="layer-meta">version ${escapeHtml(versionText)} · updated_by ${escapeHtml(updatedBy)}</p>
+              <pre class="layer-body">${escapeHtml(content)}</pre>
+            </article>`;
+          })
+          .join("");
+}
+
+function renderConversationSummaries(container, summaries) {
+  container.innerHTML =
+    !Array.isArray(summaries) || summaries.length === 0
+      ? "<p class=\"muted\">No conversations yet.</p>"
+      : summaries
+          .map((summary) => {
+            const sender = String(summary.sender || "");
+            const selected = sender === state.selectedConversationSender;
+            const className = selected ? "timeline-row conversation-row selected" : "timeline-row conversation-row";
+            const entryCount = Number(summary.entry_count || 0);
+            return `<button type="button" class="${className}" data-sender="${escapeHtml(sender)}">
+              <span>${escapeHtml(sender)}</span>
+              <code>${entryCount} exchanges · ${escapeHtml(relativeTimeFromNs(summary.last_activity_ns))}</code>
+            </button>`;
+          })
+          .join("");
+}
+
+function renderConversationDetail(container, log) {
+  if (!log || !Array.isArray(log.entries) || log.entries.length === 0) {
+    container.innerHTML = "<p class=\"muted\">Select a sender to inspect conversation history.</p>";
+    return;
+  }
+
+  const sender = String(log.sender || "sender");
+  const rows = [];
+  for (const entry of log.entries) {
+    rows.push({
+      role: "user",
+      body: String(entry.sender_body || ""),
+      id: String(entry.inbox_message_id || ""),
+      ts: Number(entry.timestamp_ns || 0),
+      meta: `${sender} · ${relativeTimeFromNs(entry.timestamp_ns)}`,
+    });
+    rows.push({
+      role: "assistant",
+      body: String(entry.agent_reply || ""),
+      id: String(entry.turn_id || ""),
+      ts: Number(entry.timestamp_ns || 0),
+      meta: `turn ${entry.turn_id || "unknown"} · ${relativeTimeFromNs(entry.timestamp_ns)}`,
+    });
+  }
+
+  container.innerHTML = rows
+    .map(
+      (row) => `<article class="chat-row ${row.role}">
+      <p class="chat-meta">${escapeHtml(row.role)} · ${escapeHtml(row.meta)}</p>
+      <div class="chat-bubble"><p>${escapeHtml(row.body)}</p></div>
+      <code>${escapeHtml(row.id)}</code>
+    </article>`
+    )
+    .join("");
+}
+
+async function refreshConversationDetail(sender) {
+  if (!sender) {
+    renderConversationDetail(el.conversationDetail, null);
+    return;
+  }
+
+  const log = await apiFetch("/api/conversation", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ sender }),
+  });
+  renderConversationDetail(el.conversationDetail, log);
+}
+
 function inferModelFromForm() {
   const customModel = el.inferenceModelCustom.value.trim();
   if (customModel) {
@@ -216,6 +317,9 @@ async function refreshSnapshot() {
     const inboxStats = snapshot.inbox_stats || {};
     const messages = snapshot.inbox_messages || [];
     const outboxMessages = snapshot.outbox_messages || [];
+    const promptLayers = snapshot.prompt_layers || [];
+    const conversationSummaries = snapshot.conversation_summaries || [];
+    state.conversationSummaries = conversationSummaries;
     const jobs = snapshot.recent_jobs || [];
     const transitions = snapshot.recent_transitions || [];
 
@@ -270,6 +374,32 @@ async function refreshSnapshot() {
       state.knownJobIds
     );
     renderChat(el.chat, messages, outboxMessages);
+    renderPromptLayers(el.promptLayers, promptLayers);
+
+    const selectedSummary = state.conversationSummaries.find(
+      (summary) => summary.sender === state.selectedConversationSender
+    );
+    if (!selectedSummary && state.conversationSummaries.length > 0) {
+      state.selectedConversationSender = String(state.conversationSummaries[0].sender || "");
+      state.selectedConversationLastActivityNs = 0;
+    }
+    if (state.conversationSummaries.length === 0) {
+      state.selectedConversationSender = "";
+      state.selectedConversationLastActivityNs = 0;
+    }
+    renderConversationSummaries(el.conversations, state.conversationSummaries);
+
+    const latestActivity = Number(
+      (state.conversationSummaries.find((summary) => summary.sender === state.selectedConversationSender) || {})
+        .last_activity_ns || 0
+    );
+    if (state.selectedConversationSender && latestActivity !== state.selectedConversationLastActivityNs) {
+      await refreshConversationDetail(state.selectedConversationSender);
+      state.selectedConversationLastActivityNs = latestActivity;
+    }
+    if (!state.selectedConversationSender) {
+      renderConversationDetail(el.conversationDetail, null);
+    }
 
     el.status.textContent = `Live · updated ${new Date().toLocaleTimeString()}`;
   } catch (error) {
@@ -420,6 +550,27 @@ el.inferenceKeyAction.addEventListener("change", () => {
 
 el.inferenceApiKey.addEventListener("input", () => {
   state.inferenceDirty = true;
+});
+
+el.conversations.addEventListener("click", async (event) => {
+  const target = event.target;
+  const sender =
+    target instanceof Element ? target.closest("[data-sender]")?.getAttribute("data-sender") : null;
+  if (!sender) {
+    return;
+  }
+  if (sender !== state.selectedConversationSender) {
+    state.selectedConversationSender = sender;
+    state.selectedConversationLastActivityNs = 0;
+  }
+  try {
+    await refreshConversationDetail(sender);
+    const selectedSummary = state.conversationSummaries.find((summary) => summary.sender === sender);
+    state.selectedConversationLastActivityNs = Number(selectedSummary?.last_activity_ns || 0);
+    renderConversationSummaries(el.conversations, state.conversationSummaries);
+  } catch (error) {
+    el.status.textContent = `Conversation load failed: ${error.message}`;
+  }
 });
 
 async function boot() {
