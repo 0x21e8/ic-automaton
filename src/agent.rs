@@ -983,6 +983,7 @@ mod tests {
     fn suppress_duplicate_autonomy_tool_calls_respects_60m_window() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         let call = ToolCall {
+            tool_call_id: None,
             tool: "evm_read".to_string(),
             args_json:
                 r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
