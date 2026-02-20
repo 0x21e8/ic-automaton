@@ -14,13 +14,23 @@ use crate::domain::types::{
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
 use crate::tools::ToolManager;
+use candid::CandidType;
 use ic_cdk_timers::set_timer_interval_serial;
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
+use serde::Deserialize;
 use std::time::Duration;
 
+#[derive(CandidType, Deserialize)]
+struct InitArgs {
+    ecdsa_key_name: String,
+}
+
 #[ic_cdk::init]
-fn init() {
+fn init(args: InitArgs) {
     stable::init_storage();
+    let _ = stable::set_ecdsa_key_name(args.ecdsa_key_name)
+        .unwrap_or_else(|error| ic_cdk::trap(&error));
+    let _ = stable::set_evm_address(None).unwrap_or_else(|error| ic_cdk::trap(&error));
     crate::features::MockSkillLoader::install_defaults();
     crate::http::init_certification();
     arm_timer();

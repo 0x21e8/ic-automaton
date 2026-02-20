@@ -98,6 +98,10 @@ pub struct RuntimeSnapshot {
     pub openrouter_base_url: String,
     #[serde(default = "default_openrouter_max_response_bytes")]
     pub openrouter_max_response_bytes: u64,
+    #[serde(default)]
+    pub ecdsa_key_name: String,
+    #[serde(default)]
+    pub evm_address: Option<String>,
 }
 
 impl Default for RuntimeSnapshot {
@@ -119,6 +123,8 @@ impl Default for RuntimeSnapshot {
             openrouter_api_key: None,
             openrouter_base_url: default_openrouter_base_url(),
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
+            ecdsa_key_name: String::new(),
+            evm_address: None,
         }
     }
 }
