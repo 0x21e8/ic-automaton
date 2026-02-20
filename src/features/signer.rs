@@ -1,4 +1,5 @@
 use crate::tools::SignerPort;
+use async_trait::async_trait;
 
 #[allow(dead_code)]
 pub trait SignerAdapter: SignerPort {
@@ -18,8 +19,9 @@ impl MockSignerAdapter {
     }
 }
 
+#[async_trait(?Send)]
 impl SignerPort for MockSignerAdapter {
-    fn sign_message(&self, message: &str) -> Result<String, String> {
+    async fn sign_message(&self, message: &str) -> Result<String, String> {
         Ok(format!("mock-signature-{message}"))
     }
 }
@@ -33,8 +35,9 @@ impl SignerAdapter for MockSignerAdapter {
 #[allow(dead_code)]
 pub struct StubSignerAdapter;
 
+#[async_trait(?Send)]
 impl SignerPort for StubSignerAdapter {
-    fn sign_message(&self, _message: &str) -> Result<String, String> {
+    async fn sign_message(&self, _message: &str) -> Result<String, String> {
         Err("stub signer adapter disabled in v1".to_string())
     }
 }

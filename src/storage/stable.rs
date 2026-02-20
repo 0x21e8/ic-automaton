@@ -552,6 +552,55 @@ pub fn get_soul() -> String {
     runtime_snapshot().soul
 }
 
+pub fn set_ecdsa_key_name(key_name: String) -> Result<String, String> {
+    let trimmed = key_name.trim();
+    if trimmed.is_empty() {
+        return Err("ecdsa key name cannot be empty".to_string());
+    }
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.ecdsa_key_name = trimmed.to_string();
+    snapshot.last_transition_at_ns = now_ns();
+    let out = snapshot.ecdsa_key_name.clone();
+    save_runtime_snapshot(&snapshot);
+    Ok(out)
+}
+
+#[allow(dead_code)]
+pub fn get_ecdsa_key_name() -> String {
+    runtime_snapshot().ecdsa_key_name
+}
+
+pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String> {
+    let normalized = match address {
+        Some(raw) => {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            let valid_len = trimmed.len() == 42;
+            let valid_prefix = trimmed.starts_with("0x");
+            let valid_hex = trimmed
+                .as_bytes()
+                .iter()
+                .skip(2)
+                .all(|byte| byte.is_ascii_hexdigit());
+            if !(valid_len && valid_prefix && valid_hex) {
+                return Err("evm address must be a 0x-prefixed 20-byte hex string".to_string());
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_address = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
+}
+
+pub fn get_evm_address() -> Option<String> {
+    runtime_snapshot().evm_address
+}
+
 pub fn set_last_error(error: Option<String>) {
     let mut snapshot = runtime_snapshot();
     snapshot.last_error = error;
@@ -1589,5 +1638,34 @@ mod tests {
         let snapshot = observability_snapshot(10);
         assert_eq!(snapshot.outbox_stats.total_messages, 2);
         assert_eq!(snapshot.outbox_messages.len(), 2);
+    }
+
+    #[test]
+    fn ecdsa_key_name_requires_non_empty_value() {
+        init_storage();
+        assert!(set_ecdsa_key_name("".to_string()).is_err());
+        let stored = set_ecdsa_key_name("dfx_test_key".to_string())
+            .expect("valid key name should be stored");
+        assert_eq!(stored, "dfx_test_key");
+        assert_eq!(get_ecdsa_key_name(), "dfx_test_key");
+    }
+
+    #[test]
+    fn evm_address_validation_enforces_hex_format() {
+        init_storage();
+        assert!(set_evm_address(Some("bad".to_string())).is_err());
+
+        let stored = set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("valid address should store");
+        assert_eq!(
+            stored.as_deref().unwrap_or_default(),
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            get_evm_address().as_deref().unwrap_or_default(),
+            "0x1111111111111111111111111111111111111111"
+        );
     }
 }

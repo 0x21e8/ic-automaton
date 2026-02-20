@@ -90,6 +90,11 @@ struct RuntimeView {
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct InitArgs {
+    ecdsa_key_name: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
 struct InboxStats {
     total_messages: u64,
     pending_count: u64,
@@ -115,9 +120,13 @@ fn with_backend_canister() -> (PocketIc, Principal) {
     let pic = PocketIc::new();
     let canister_id = pic.create_canister();
     let wasm = assert_wasm_artifact_present();
+    let init_args = encode_args((InitArgs {
+        ecdsa_key_name: "dfx_test_key".to_string(),
+    },))
+    .expect("failed to encode init args");
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
-    pic.install_canister(canister_id, wasm, vec![], None);
+    pic.install_canister(canister_id, wasm, init_args, None);
 
     (pic, canister_id)
 }

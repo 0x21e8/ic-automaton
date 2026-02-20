@@ -97,7 +97,7 @@ impl InferenceAdapter for MockInferenceAdapter {
         let tool_calls = if input.context_snippet.contains("sign") {
             vec![ToolCall {
                 tool: "sign_message".to_string(),
-                args_json: r#"{"message":"heartbeat"}"#.to_string(),
+                args_json: r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#.to_string(),
             }]
         } else {
             vec![ToolCall {
@@ -192,15 +192,17 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
     vec![
         IcLlmTool::Function(IcLlmFunction {
             name: "sign_message".to_string(),
-            description: Some("Sign a message with the configured signer.".to_string()),
+            description: Some(
+                "Sign a 32-byte message hash with the configured signer.".to_string(),
+            ),
             parameters: Some(IcLlmParameters {
                 type_: "object".to_string(),
                 properties: Some(vec![IcLlmProperty {
                     type_: "string".to_string(),
-                    name: "message".to_string(),
-                    description: Some("Message to sign".to_string()),
+                    name: "message_hash".to_string(),
+                    description: Some("0x-prefixed 32-byte hash to sign".to_string()),
                 }]),
-                required: Some(vec!["message".to_string()]),
+                required: Some(vec!["message_hash".to_string()]),
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
@@ -552,11 +554,11 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
                 "type": "function",
                 "function": {
                     "name": "sign_message",
-                    "description": "Sign a message with the configured signer.",
+                    "description": "Sign a 32-byte message hash with the configured signer.",
                     "parameters": {
                         "type": "object",
-                        "properties": { "message": { "type": "string" } },
-                        "required": ["message"]
+                        "properties": { "message_hash": { "type": "string" } },
+                        "required": ["message_hash"]
                     }
                 }
             },
@@ -707,7 +709,7 @@ mod tests {
                                 "type": "function",
                                 "function": {
                                     "name": "sign_message",
-                                    "arguments": "{\"message\":\"heartbeat\"}"
+                                    "arguments": "{\"message_hash\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}"
                                 }
                             }
                         ]
@@ -719,7 +721,10 @@ mod tests {
         let out = parse_openrouter_completion(payload).expect("response should parse");
         assert_eq!(out.tool_calls.len(), 1);
         assert_eq!(out.tool_calls[0].tool, "sign_message");
-        assert_eq!(out.tool_calls[0].args_json, r#"{"message":"heartbeat"}"#);
+        assert_eq!(
+            out.tool_calls[0].args_json,
+            r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#
+        );
     }
 
     #[test]

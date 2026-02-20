@@ -1,4 +1,5 @@
 use crate::domain::types::{EvmEvent, EvmPollCursor};
+use async_trait::async_trait;
 
 pub struct EvmPollResult {
     pub cursor: EvmPollCursor,
@@ -16,14 +17,16 @@ pub trait EvmBroadcaster {
     fn broadcast(&self, signed_transaction: &str) -> Result<EvmBroadcastResult, String>;
 }
 
+#[async_trait(?Send)]
 pub trait EvmPoller {
-    fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String>;
+    async fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String>;
 }
 
 pub struct MockEvmPoller;
 
+#[async_trait(?Send)]
 impl EvmPoller for MockEvmPoller {
-    fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String> {
+    async fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String> {
         let next_block = cursor.next_block.saturating_add(1);
         let next_log_index = cursor.next_log_index.saturating_add(1);
 

@@ -1,9 +1,11 @@
 use crate::domain::state_machine;
 use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{AgentEvent, AgentState, InferenceInput, TurnRecord};
+#[cfg(target_arch = "wasm32")]
+use crate::features::ThresholdSignerAdapter;
 use crate::features::{infer_with_provider, EvmPoller, MockEvmPoller, MockSignerAdapter};
 use crate::storage::stable;
-use crate::tools::ToolManager;
+use crate::tools::{SignerPort, ToolManager};
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -26,6 +28,14 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     }
 
     let snapshot = stable::increment_turn_counter();
+    #[cfg(target_arch = "wasm32")]
+    if snapshot.evm_address.is_none() && !snapshot.ecdsa_key_name.trim().is_empty() {
+        let _ = crate::features::threshold_signer::derive_and_cache_evm_address(
+            &snapshot.ecdsa_key_name,
+        )
+        .await;
+    }
+
     let turn_id = snapshot
         .last_turn_id
         .clone()
@@ -59,7 +69,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     let can_poll =
         stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, started_at_ns);
     let poll = if can_poll {
-        Some(MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor))
+        Some(MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor).await)
     } else {
         None
     };
@@ -131,10 +141,20 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
                 {
                     last_error = Some(error);
                 } else {
-                    let signer = MockSignerAdapter::new();
+                    #[cfg(target_arch = "wasm32")]
+                    let signer: Box<dyn SignerPort> = if snapshot.ecdsa_key_name.trim().is_empty() {
+                        Box::new(MockSignerAdapter::new())
+                    } else {
+                        Box::new(ThresholdSignerAdapter::new(snapshot.ecdsa_key_name.clone()))
+                    };
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let signer: Box<dyn SignerPort> = Box::new(MockSignerAdapter::new());
+
                     let mut manager = ToolManager::new();
-                    tool_calls =
-                        manager.execute_actions(&state, &inference.tool_calls, &signer, &turn_id);
+                    tool_calls = manager
+                        .execute_actions(&state, &inference.tool_calls, signer.as_ref(), &turn_id)
+                        .await;
 
                     if tool_calls.iter().any(|record| !record.success) {
                         last_error = Some("tool execution reported failures".to_string());
