@@ -260,6 +260,13 @@ fn list_outbox_messages(pic: &PocketIc, canister_id: Principal, limit: u32) -> V
     call_query(pic, canister_id, "list_outbox_messages", payload)
 }
 
+fn list_turns(pic: &PocketIc, canister_id: Principal, limit: u32) -> Vec<String> {
+    let payload = encode_args((limit,)).unwrap_or_else(|error| {
+        panic!("failed to encode list_turns args: {error}");
+    });
+    call_query(pic, canister_id, "list_turns", payload)
+}
+
 fn configure_only_agent_turn(pic: &PocketIc, canister_id: Principal, interval_secs: u64) {
     for kind in [
         TaskKind::AgentTurn,
@@ -310,9 +317,25 @@ fn loop_disabled_agent_turn_is_counted_as_successful_skip() {
 #[test]
 fn agent_turn_self_recovers_after_transient_inference_failure() {
     let (pic, canister_id) = with_backend_canister();
-    configure_only_agent_turn(&pic, canister_id, 60);
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
 
-    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
+    post_inbox_message(&pic, canister_id, "force external-input failure path")
+        .expect("inbox message should post");
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, false);
+
+    set_inference_provider(&pic, canister_id, InferenceProvider::OpenRouter);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
     pic.advance_time(Duration::from_secs(61));
     pic.tick();
 
@@ -458,7 +481,10 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
         .into_iter()
         .find(|message| message.source_inbox_ids.contains(&update_message_id))
         .expect("first turn should produce outbox response");
-    assert!(update_outbox.body.contains("mocked inference"));
+    assert!(
+        update_outbox.body.contains("mocked continuation"),
+        "outbox should prefer continuation text after tool execution"
+    );
 
     let probe_message_id = post_inbox_message(&pic, canister_id, "request_layer_6_probe:true")
         .expect("probe message should post");
@@ -477,5 +503,82 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
         .into_iter()
         .find(|message| message.source_inbox_ids.contains(&probe_message_id))
         .expect("second turn should produce outbox response");
-    assert_eq!(probe_outbox.body, "layer6_probe:present");
+    assert!(
+        probe_outbox.body.contains("mocked continuation"),
+        "continuation response should be posted as final outbox body"
+    );
+
+    let turns = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("layer6_probe:present")),
+        "turn logs should retain first-round probe explanation before continuation"
+    );
+}
+
+#[test]
+fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
+    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+
+    let message_id = post_inbox_message(&pic, canister_id, "request_update_prompt_layer:true")
+        .expect("inbox message should post");
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, false);
+
+    let runtime_before_agent = get_runtime_view(&pic, canister_id);
+    assert_eq!(
+        runtime_before_agent.turn_counter, 0,
+        "staging input should not increment turn counter"
+    );
+
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let runtime_after_agent = get_runtime_view(&pic, canister_id);
+    assert_eq!(
+        runtime_after_agent.turn_counter, 1,
+        "single scheduler tick should complete one agent turn"
+    );
+    assert_eq!(
+        runtime_after_agent.state,
+        AgentState::Sleeping,
+        "agent turn should complete successfully"
+    );
+
+    let outbox = list_outbox_messages(&pic, canister_id, 20);
+    let turn_outbox = outbox
+        .into_iter()
+        .find(|message| message.source_inbox_ids.contains(&message_id))
+        .expect("agent turn should post an outbox response");
+    assert!(
+        turn_outbox.body.contains("mocked continuation"),
+        "reply body should come from continuation round after tool output"
+    );
+
+    let agent_turn_jobs = list_scheduler_jobs(&pic, canister_id)
+        .into_iter()
+        .filter(|job| job.kind == TaskKind::AgentTurn)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agent_turn_jobs.len(),
+        1,
+        "expected one materialized agent-turn job"
+    );
+    assert_eq!(agent_turn_jobs[0].status, JobStatus::Succeeded);
 }

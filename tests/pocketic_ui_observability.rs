@@ -101,7 +101,7 @@ fn parse_json_response(response: &HttpUpdateResponse<'_>, context: &str) -> Valu
 }
 
 #[test]
-fn serves_certified_root_and_supports_ui_observability_flow() {
+fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
     let (pic, canister_id) = with_backend_canister();
 
     let root_request = HttpRequest::get("/").build();
@@ -224,6 +224,15 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
             .unwrap_or_default()
             .starts_with("outbox:")),
         "snapshot should include at least one outbox record id"
+    );
+    assert!(
+        after_turn_snapshot.outbox_messages.iter().any(|msg| {
+            msg.get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("mocked continuation")
+        }),
+        "outbox body should reflect continuation-stage model response after tool execution"
     );
     assert!(
         !after_turn_snapshot.conversation_summaries.is_empty(),

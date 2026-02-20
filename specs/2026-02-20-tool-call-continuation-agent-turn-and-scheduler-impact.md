@@ -180,7 +180,7 @@ Required impact response:
       - Validation: `cargo test -q refresh_due_jobs_advances_single_interval_once` and new lease-duration regression coverage
       - Notes: Increase `AgentTurn` lease TTL to 240s; keep serial dispatch model unchanged.
 
-- [ ] **Task 6: Integration validation with PocketIC**
+- [x] **Task 6: Integration validation with PocketIC**
       - Files: `tests/pocketic_agent_autonomy.rs`, `tests/pocketic_ui_observability.rs`
       - Validation: `icp build && cargo test -q --features pocketic_tests continuation`
       - Notes: Build before PocketIC tests to avoid stale Wasm artifacts.
