@@ -248,6 +248,36 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["method".to_string(), "address".to_string()]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "send_eth".to_string(),
+            description: Some(
+                "Send ETH on Base. The runtime handles nonce, gas, signing, and broadcast."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "to".to_string(),
+                        description: Some("0x-prefixed destination address.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "value_wei".to_string(),
+                        description: Some("Amount in wei as decimal string.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "data".to_string(),
+                        description: Some(
+                            "Optional calldata for contract interaction.".to_string(),
+                        ),
+                    },
+                ]),
+                required: Some(vec!["to".to_string(), "value_wei".to_string()]),
+            }),
+        }),
     ]
 }
 
@@ -619,6 +649,22 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
                         "required": ["method", "address"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_eth",
+                    "description": "Send ETH on Base. Runtime handles nonce, gas, signing, and broadcast.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to": { "type": "string" },
+                            "value_wei": { "type": "string" },
+                            "data": { "type": "string" }
+                        },
+                        "required": ["to", "value_wei"]
+                    }
+                }
             }
         ]
     })
@@ -861,6 +907,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(names.contains(&"evm_read".to_string()));
+        assert!(names.contains(&"send_eth".to_string()));
     }
 
     #[test]
@@ -885,5 +932,6 @@ mod tests {
             .filter_map(|name| name.as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"evm_read"));
+        assert!(names.contains(&"send_eth"));
     }
 }

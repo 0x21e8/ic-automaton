@@ -4,18 +4,25 @@ use crate::domain::cycle_admission::{
 };
 use crate::domain::types::{EvmEvent, EvmPollCursor, RuntimeSnapshot};
 use crate::storage::stable;
+use crate::tools::SignerPort;
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::str::FromStr;
 
 #[cfg(target_arch = "wasm32")]
 use candid::Nat;
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::management_canister::{http_request, HttpHeader, HttpMethod, HttpRequestArgs};
+#[cfg(target_arch = "wasm32")]
+use sha3::{Digest, Keccak256};
 
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
+const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
 
 pub struct EvmPollResult {
     pub cursor: EvmPollCursor,
@@ -151,14 +158,14 @@ impl EvmBroadcaster for MockEvmBroadcaster {
 }
 
 #[derive(Clone, Debug)]
-struct HttpEvmRpcClient {
+pub struct HttpEvmRpcClient {
     rpc_url: String,
     fallback_rpc_url: Option<String>,
     max_response_bytes: u64,
 }
 
 impl HttpEvmRpcClient {
-    fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
+    pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
         let rpc_url = snapshot.evm_rpc_url.trim();
         if rpc_url.is_empty() {
             return Err("evm rpc url is not configured".to_string());
@@ -219,7 +226,7 @@ impl HttpEvmRpcClient {
             .map_err(|error| format!("failed to decode eth_getLogs result: {error}"))
     }
 
-    async fn eth_get_balance(&self, address: &str) -> Result<String, String> {
+    pub async fn eth_get_balance(&self, address: &str) -> Result<String, String> {
         let response = self
             .rpc_call("eth_getBalance", json!([address, "latest"]), 256)
             .await
@@ -231,7 +238,7 @@ impl HttpEvmRpcClient {
         normalize_hex_quantity(raw, "eth_getBalance result")
     }
 
-    async fn eth_call(&self, address: &str, calldata: &str) -> Result<String, String> {
+    pub async fn eth_call(&self, address: &str, calldata: &str) -> Result<String, String> {
         let response = self
             .rpc_call(
                 "eth_call",
@@ -245,6 +252,71 @@ impl HttpEvmRpcClient {
             .and_then(Value::as_str)
             .ok_or_else(|| "eth_call result was missing".to_string())?;
         normalize_hex_blob(raw, "eth_call result")
+    }
+
+    pub async fn eth_get_transaction_count(&self, address: &str) -> Result<u64, String> {
+        let response = self
+            .rpc_call("eth_getTransactionCount", json!([address, "pending"]), 256)
+            .await
+            .map_err(|error| format!("eth_getTransactionCount failed: {error}"))?;
+        let raw = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_getTransactionCount result was missing".to_string())?;
+        parse_hex_u64(raw, "eth_getTransactionCount")
+    }
+
+    pub async fn eth_gas_price(&self) -> Result<U256, String> {
+        let response = self
+            .rpc_call("eth_gasPrice", json!([]), 256)
+            .await
+            .map_err(|error| format!("eth_gasPrice failed: {error}"))?;
+        let raw = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_gasPrice result was missing".to_string())?;
+        parse_hex_u256(raw, "eth_gasPrice")
+    }
+
+    pub async fn eth_estimate_gas(
+        &self,
+        from: &str,
+        to: &str,
+        value_wei: U256,
+        data_hex: &str,
+    ) -> Result<u64, String> {
+        let value_hex = format!("0x{:x}", value_wei);
+        let response = self
+            .rpc_call(
+                "eth_estimateGas",
+                json!([{
+                    "from": from,
+                    "to": to,
+                    "value": value_hex,
+                    "data": data_hex
+                }]),
+                256,
+            )
+            .await
+            .map_err(|error| format!("eth_estimateGas failed: {error}"))?;
+        let raw = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_estimateGas result was missing".to_string())?;
+        parse_hex_u64(raw, "eth_estimateGas")
+    }
+
+    pub async fn eth_send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String, String> {
+        let payload = format!("0x{}", hex::encode(raw_tx));
+        let response = self
+            .rpc_call("eth_sendRawTransaction", json!([payload]), 256)
+            .await
+            .map_err(|error| format!("eth_sendRawTransaction failed: {error}"))?;
+        let raw = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_sendRawTransaction result was missing".to_string())?;
+        normalize_hex_blob(raw, "eth_sendRawTransaction result")
     }
 
     async fn rpc_call(
@@ -345,6 +417,14 @@ impl HttpEvmRpcClient {
             "eth_getLogs" => json!({"jsonrpc":"2.0","id":1,"result":[]}),
             "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
             "eth_call" => json!({"jsonrpc":"2.0","id":1,"result":"0x"}),
+            "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
+            "eth_gasPrice" => json!({"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}),
+            "eth_estimateGas" => json!({"jsonrpc":"2.0","id":1,"result":"0x5208"}),
+            "eth_sendRawTransaction" => json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "result":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
             unsupported => {
                 return Err(format!(
                     "host rpc stub does not support method {unsupported}"
@@ -536,9 +616,360 @@ pub async fn evm_read_tool(args_json: &str) -> Result<String, String> {
     }
 }
 
+#[derive(Deserialize)]
+struct SendEthArgs {
+    to: String,
+    value_wei: String,
+    #[serde(default)]
+    data: Option<String>,
+}
+
+struct ParsedSendEthArgs {
+    to: Address,
+    to_hex: String,
+    value_wei: U256,
+    data: Bytes,
+    data_hex: String,
+}
+
+#[derive(Clone, Debug)]
+struct Eip1559UnsignedTx {
+    chain_id: U256,
+    nonce: U256,
+    max_priority_fee_per_gas: U256,
+    max_fee_per_gas: U256,
+    gas_limit: U256,
+    to: Address,
+    value: U256,
+    data: Bytes,
+}
+
+impl Eip1559UnsignedTx {
+    fn payload_length(&self) -> usize {
+        self.chain_id.length()
+            + self.nonce.length()
+            + self.max_priority_fee_per_gas.length()
+            + self.max_fee_per_gas.length()
+            + self.gas_limit.length()
+            + self.to.length()
+            + self.value.length()
+            + self.data.length()
+            + EMPTY_ACCESS_LIST_RLP_LEN
+    }
+}
+
+impl Encodable for Eip1559UnsignedTx {
+    fn encode(&self, out: &mut dyn BufMut) {
+        Header {
+            list: true,
+            payload_length: self.payload_length(),
+        }
+        .encode(out);
+        self.chain_id.encode(out);
+        self.nonce.encode(out);
+        self.max_priority_fee_per_gas.encode(out);
+        self.max_fee_per_gas.encode(out);
+        self.gas_limit.encode(out);
+        self.to.encode(out);
+        self.value.encode(out);
+        self.data.encode(out);
+        Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_length = self.payload_length();
+        payload_length + length_of_length(payload_length)
+    }
+}
+
+struct Eip1559SignedTx<'a> {
+    tx: &'a Eip1559UnsignedTx,
+    y_parity: u8,
+    r: U256,
+    s: U256,
+}
+
+impl Eip1559SignedTx<'_> {
+    fn payload_length(&self) -> usize {
+        self.tx.chain_id.length()
+            + self.tx.nonce.length()
+            + self.tx.max_priority_fee_per_gas.length()
+            + self.tx.max_fee_per_gas.length()
+            + self.tx.gas_limit.length()
+            + self.tx.to.length()
+            + self.tx.value.length()
+            + self.tx.data.length()
+            + EMPTY_ACCESS_LIST_RLP_LEN
+            + self.y_parity.length()
+            + self.r.length()
+            + self.s.length()
+    }
+}
+
+impl Encodable for Eip1559SignedTx<'_> {
+    fn encode(&self, out: &mut dyn BufMut) {
+        Header {
+            list: true,
+            payload_length: self.payload_length(),
+        }
+        .encode(out);
+        self.tx.chain_id.encode(out);
+        self.tx.nonce.encode(out);
+        self.tx.max_priority_fee_per_gas.encode(out);
+        self.tx.max_fee_per_gas.encode(out);
+        self.tx.gas_limit.encode(out);
+        self.tx.to.encode(out);
+        self.tx.value.encode(out);
+        self.tx.data.encode(out);
+        Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(out);
+        self.y_parity.encode(out);
+        self.r.encode(out);
+        self.s.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_length = self.payload_length();
+        payload_length + length_of_length(payload_length)
+    }
+}
+
+fn parse_send_eth_args(args_json: &str) -> Result<ParsedSendEthArgs, String> {
+    let args: SendEthArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid send_eth args json: {error}"))?;
+
+    let to_hex = normalize_address(&args.to)?;
+    let to = Address::from_str(&to_hex)
+        .map_err(|error| format!("invalid destination address for send_eth: {error}"))?;
+    let value_wei = parse_decimal_u256(&args.value_wei, "value_wei")?;
+    let data_hex = match args.data {
+        Some(data) => normalize_hex_blob(&data, "data")?,
+        None => "0x".to_string(),
+    };
+    let data = Bytes::from(
+        hex::decode(data_hex.trim_start_matches("0x"))
+            .map_err(|error| format!("data must be valid hex: {error}"))?,
+    );
+
+    Ok(ParsedSendEthArgs {
+        to,
+        to_hex,
+        value_wei,
+        data,
+        data_hex,
+    })
+}
+
+fn parse_decimal_u256(raw: &str, field: &str) -> Result<U256, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    if !trimmed.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{field} must be a decimal string"));
+    }
+    U256::from_str(trimmed).map_err(|error| format!("failed to parse {field} as decimal: {error}"))
+}
+
+fn parse_hex_u256(raw: &str, field: &str) -> Result<U256, String> {
+    let normalized = normalize_hex_quantity(raw, field)?;
+    let without_prefix = normalized.trim_start_matches("0x");
+    if without_prefix.is_empty() {
+        return Ok(U256::ZERO);
+    }
+    if without_prefix.len() > 64 {
+        return Err(format!("{field} exceeds 32 bytes"));
+    }
+    let padded = if without_prefix.len() % 2 == 0 {
+        without_prefix.to_string()
+    } else {
+        format!("0{without_prefix}")
+    };
+    let bytes = hex::decode(&padded)
+        .map_err(|error| format!("failed to decode {field} as hex: {error}"))?;
+    Ok(U256::from_be_slice(&bytes))
+}
+
+fn parse_compact_signature(raw: &str) -> Result<[u8; 64], String> {
+    let normalized = normalize_hex_blob(raw, "signature")?;
+    let without_prefix = normalized.trim_start_matches("0x");
+    if without_prefix.len() != 128 {
+        return Err("signature must be 64 bytes (r||s)".to_string());
+    }
+    let mut out = [0u8; 64];
+    hex::decode_to_slice(without_prefix, &mut out)
+        .map_err(|error| format!("failed to decode signature: {error}"))?;
+    Ok(out)
+}
+
+fn encode_eip1559_unsigned_payload(tx: &Eip1559UnsignedTx) -> Vec<u8> {
+    alloy_rlp::encode(tx)
+}
+
+fn encode_eip1559_unsigned(tx: &Eip1559UnsignedTx) -> Vec<u8> {
+    let payload = encode_eip1559_unsigned_payload(tx);
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(0x02);
+    out.extend_from_slice(&payload);
+    out
+}
+
+fn encode_eip1559_signed(tx: &Eip1559UnsignedTx, y_parity: u8, r: U256, s: U256) -> Vec<u8> {
+    let payload = alloy_rlp::encode(Eip1559SignedTx { tx, y_parity, r, s });
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(0x02);
+    out.extend_from_slice(&payload);
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn recover_y_parity(
+    _tx_hash: &B256,
+    _signature_compact: &[u8; 64],
+    _expected_address: &str,
+) -> Result<u8, String> {
+    Ok(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn recover_y_parity(
+    tx_hash: &B256,
+    signature_compact: &[u8; 64],
+    expected_address: &str,
+) -> Result<u8, String> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let signature = Signature::from_slice(signature_compact)
+        .map_err(|error| format!("invalid compact signature bytes: {error}"))?;
+    let expected = expected_address.trim().to_ascii_lowercase();
+
+    for candidate in [0u8, 1u8] {
+        let Some(recovery_id) = RecoveryId::from_byte(candidate) else {
+            continue;
+        };
+        let recovered =
+            match VerifyingKey::recover_from_prehash(tx_hash.as_slice(), &signature, recovery_id) {
+                Ok(key) => key,
+                Err(_) => continue,
+            };
+        let uncompressed = recovered.to_encoded_point(false);
+        let bytes = uncompressed.as_bytes();
+        if bytes.len() != 65 || bytes.first().copied() != Some(0x04) {
+            continue;
+        }
+        let digest = Keccak256::digest(&bytes[1..]);
+        let address = format!("0x{}", hex::encode(&digest[12..32]));
+        if address == expected {
+            return Ok(candidate);
+        }
+    }
+
+    Err("failed to recover EIP-1559 y_parity for send_eth signature".to_string())
+}
+
+fn estimate_send_eth_workflow_cost(key_name: &str) -> Result<u128, String> {
+    let sign_cost = estimate_operation_cost(&OperationClass::ThresholdSign {
+        key_name: key_name.to_string(),
+        ecdsa_curve: 0,
+    })?;
+    let http_cost = estimate_operation_cost(&OperationClass::HttpOutcall {
+        request_size_bytes: 512,
+        max_response_bytes: 4_096,
+    })?
+    .saturating_mul(4);
+    Ok(sign_cost.saturating_add(http_cost))
+}
+
+fn ensure_send_eth_affordable(key_name: &str) -> Result<(), String> {
+    let estimated = estimate_send_eth_workflow_cost(key_name)?;
+    let requirements = affordability_requirements(
+        estimated,
+        DEFAULT_SAFETY_MARGIN_BPS,
+        DEFAULT_RESERVE_FLOOR_CYCLES,
+    );
+    let liquid = liquid_cycle_balance();
+    if !can_afford(liquid, &requirements) {
+        return Err(format!(
+            "insufficient cycles for send_eth workflow: need {} liquid, have {}",
+            requirements.required_cycles, liquid
+        ));
+    }
+    Ok(())
+}
+
+pub async fn send_eth_tool(args_json: &str, signer: &dyn SignerPort) -> Result<String, String> {
+    let args = parse_send_eth_args(args_json)?;
+    let snapshot = stable::runtime_snapshot();
+    let from_address = snapshot
+        .evm_address
+        .clone()
+        .ok_or_else(|| "evm address not derived yet".to_string())?;
+    ensure_send_eth_affordable(&snapshot.ecdsa_key_name)?;
+
+    let rpc = HttpEvmRpcClient::from_snapshot(&snapshot)?;
+    let balance = parse_hex_u256(
+        &rpc.eth_get_balance(&from_address).await?,
+        "eth_getBalance result",
+    )?;
+    if balance < args.value_wei {
+        return Err(format!(
+            "insufficient balance for send_eth: balance={} value={}",
+            balance, args.value_wei
+        ));
+    }
+
+    let nonce = rpc.eth_get_transaction_count(&from_address).await?;
+    let gas_limit = if args.data.is_empty() {
+        21_000u64
+    } else {
+        rpc.eth_estimate_gas(&from_address, &args.to_hex, args.value_wei, &args.data_hex)
+            .await
+            .unwrap_or(300_000)
+    };
+
+    let base_fee = rpc
+        .eth_gas_price()
+        .await
+        .unwrap_or_else(|_| U256::from(1_000_000_000u64));
+    let max_priority_fee_per_gas = U256::from(1_000_000_000u64);
+    let max_fee_per_gas = base_fee + max_priority_fee_per_gas;
+
+    let tx = Eip1559UnsignedTx {
+        chain_id: U256::from(snapshot.evm_cursor.chain_id),
+        nonce: U256::from(nonce),
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        gas_limit: U256::from(gas_limit),
+        to: args.to,
+        value: args.value_wei,
+        data: args.data,
+    };
+
+    let unsigned = encode_eip1559_unsigned(&tx);
+    let tx_hash = keccak256(&unsigned);
+    let message_hash = format!("0x{}", hex::encode(tx_hash.as_slice()));
+    let signature = parse_compact_signature(&signer.sign_message(&message_hash).await?)?;
+    let y_parity = recover_y_parity(&tx_hash, &signature, &from_address)?;
+    let r = U256::from_be_slice(&signature[..32]);
+    let s = U256::from_be_slice(&signature[32..]);
+    let signed = encode_eip1559_signed(&tx, y_parity, r, s);
+
+    rpc.eth_send_raw_transaction(&signed).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::SignerPort;
+    use async_trait::async_trait;
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -603,5 +1034,38 @@ mod tests {
         .expect("evm_read should succeed in host-mode stub");
 
         assert_eq!(out, "0x1");
+    }
+
+    struct FixedSignatureSigner;
+
+    #[async_trait(?Send)]
+    impl SignerPort for FixedSignatureSigner {
+        async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+            Ok(format!("0x{}", "11".repeat(64)))
+        }
+    }
+
+    #[test]
+    fn send_eth_tool_returns_tx_hash_in_host_mode() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be set");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key should be set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("address should be set");
+
+        let signer = FixedSignatureSigner;
+        let tx_hash = block_on_with_spin(send_eth_tool(
+            r#"{"to":"0x2222222222222222222222222222222222222222","value_wei":"1"}"#,
+            &signer,
+        ))
+        .expect("send_eth should succeed");
+
+        assert_eq!(
+            tx_hash,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 }
