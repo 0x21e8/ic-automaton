@@ -60,6 +60,73 @@ function relativeTimeFromNs(ns) {
   return `${Math.floor(diffMs / 3600000)}h ago`;
 }
 
+function asFiniteNumber(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function formatCycleValue(value) {
+  const numeric = asFiniteNumber(value);
+  if (numeric === null) {
+    return "n/a";
+  }
+  if (numeric >= 1e12) {
+    return `${(numeric / 1e12).toFixed(3)}T`;
+  }
+  if (numeric >= 1e9) {
+    return `${(numeric / 1e9).toFixed(3)}B`;
+  }
+  if (numeric >= 1e6) {
+    return `${(numeric / 1e6).toFixed(3)}M`;
+  }
+  return numeric.toFixed(0);
+}
+
+function formatUsd(value) {
+  const numeric = asFiniteNumber(value);
+  if (numeric === null) {
+    return "n/a";
+  }
+  if (numeric < 0.01) {
+    return "<$0.01";
+  }
+  return `$${numeric.toFixed(2)}`;
+}
+
+function formatBurnRate(cyclesValue, usdValue) {
+  if (cyclesValue === null || cyclesValue === undefined || usdValue === null || usdValue === undefined) {
+    return "n/a";
+  }
+  return `${formatCycleValue(cyclesValue)} cycles · ${formatUsd(usdValue)}`;
+}
+
+function formatDurationFromSeconds(seconds) {
+  const numeric = asFiniteNumber(seconds);
+  if (numeric === null || numeric < 0) {
+    return "n/a";
+  }
+  if (numeric === 0) {
+    return "0s";
+  }
+  const total = Math.floor(numeric);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m`;
+  }
+  return `${total}s`;
+}
+
 function statusBadge(text, kind = "ok") {
   const cls = kind === "ok" ? "badge" : kind === "warn" ? "badge warn" : "badge danger";
   return `<span class="${cls}">${text}</span>`;
@@ -314,6 +381,7 @@ async function refreshSnapshot() {
     const snapshot = await apiFetch("/api/snapshot", { method: "GET" });
     const runtime = snapshot.runtime || {};
     const scheduler = snapshot.scheduler || {};
+    const cycles = snapshot.cycles || {};
     const inboxStats = snapshot.inbox_stats || {};
     const messages = snapshot.inbox_messages || [];
     const outboxMessages = snapshot.outbox_messages || [];
@@ -337,6 +405,8 @@ async function refreshSnapshot() {
 
     const lastTickErr = scheduler.last_tick_error ? "yes" : "no";
     const mode = scheduler.low_cycles_mode ? "low-cycles" : "normal";
+    const cycleWindowSeconds = Number(cycles.moving_window_seconds || 0);
+    const cycleWindowMinutes = Math.floor(cycleWindowSeconds / 60);
     renderStats(el.scheduler, [
       ["mode", mode],
       ["enabled", String(scheduler.enabled)],
@@ -344,6 +414,24 @@ async function refreshSnapshot() {
       ["next seq", String(scheduler.next_job_seq || 0)],
       ["last tick", relativeTimeFromNs(scheduler.last_tick_finished_ns)],
       ["last tick error", lastTickErr],
+      ["balance (total)", formatCycleValue(cycles.total_cycles)],
+      ["balance (liquid)", formatCycleValue(cycles.liquid_cycles)],
+      ["freezing threshold", formatCycleValue(cycles.freezing_threshold_cycles)],
+      [
+        "burn / hour",
+        formatBurnRate(cycles.burn_rate_cycles_per_hour, cycles.burn_rate_usd_per_hour),
+      ],
+      ["burn / day", formatBurnRate(cycles.burn_rate_cycles_per_day, cycles.burn_rate_usd_per_day)],
+      [
+        "runway to freezing",
+        formatDurationFromSeconds(cycles.estimated_seconds_until_freezing_threshold),
+      ],
+      [
+        "burn window",
+        `${formatDurationFromSeconds(cycles.window_duration_seconds)} span · ${String(
+          cycles.window_sample_count || 0
+        )} samples · target ${cycleWindowMinutes}m`,
+      ],
     ]);
 
     renderStats(el.inbox, [
