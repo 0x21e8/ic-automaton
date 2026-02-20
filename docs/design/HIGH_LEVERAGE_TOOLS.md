@@ -1115,11 +1115,11 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 - [x] 3c. Add full-workflow cycle budget estimation
 - [x] 3d. Add `send_eth` to inference tool schemas
 
-[ ] Phase 4: Agent memory (gives the agent a brain)
-- [ ] 4a. Add `MEMORY_FACTS_MAP` to stable storage (`MemoryId::new(16)`)
-- [ ] 4b. Implement `remember` / `recall` / `forget` tools
-- [ ] 4c. Add memory context injection in `agent.rs`
-- [ ] 4d. Add memory tools to inference tool schemas
+[x] Phase 4: Agent memory (gives the agent a brain)
+- [x] 4a. Add `MEMORY_FACTS_MAP` to stable storage (`MemoryId::new(16)`)
+- [x] 4b. Implement `remember` / `recall` / `forget` tools
+- [x] 4c. Add memory context injection in `agent.rs`
+- [x] 4d. Add memory tools to inference tool schemas
 
 [ ] Phase 5: HTTP fetch (gives the agent broader awareness)
 - [ ] 5a. Add `HTTP_DOMAIN_ALLOWLIST_MAP` to stable storage (`MemoryId::new(17)`)

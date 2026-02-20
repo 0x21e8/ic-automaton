@@ -1,6 +1,6 @@
 use crate::domain::state_machine;
 use crate::domain::types::SurvivalOperationClass;
-use crate::domain::types::{AgentEvent, AgentState, InferenceInput, TurnRecord};
+use crate::domain::types::{AgentEvent, AgentState, InferenceInput, MemoryFact, TurnRecord};
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
@@ -21,6 +21,28 @@ fn current_time_ns() -> u64 {
             .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
             .unwrap_or_default()
     }
+}
+
+fn build_inference_context_summary(
+    staged_message_count: usize,
+    evm_events: usize,
+    inbox_preview: &str,
+    memory_facts: &[MemoryFact],
+) -> String {
+    let mut parts = vec![
+        format!("inbox_messages:{staged_message_count}"),
+        format!("evm_events:{evm_events}"),
+    ];
+    if !memory_facts.is_empty() {
+        let memory_lines = memory_facts
+            .iter()
+            .map(|fact| format!("{}={}", fact.key, fact.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!("[memory]\n{memory_lines}"));
+    }
+    parts.push(format!("inbox_preview:{inbox_preview}"));
+    parts.join(";")
 }
 
 pub async fn run_scheduled_turn_job() -> Result<(), String> {
@@ -126,8 +148,12 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             .map(|message| message.body.as_str())
             .collect::<Vec<_>>()
             .join(" | ");
-        let context_summary = format!(
-            "inbox_messages:{staged_message_count};evm_events:{evm_events};inbox_preview:{inbox_preview}"
+        let memory_facts = stable::list_all_memory_facts(20);
+        let context_summary = build_inference_context_summary(
+            staged_message_count,
+            evm_events,
+            &inbox_preview,
+            &memory_facts,
         );
         let input = InferenceInput {
             input: if staged_message_count > 0 {
@@ -267,7 +293,7 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::RuntimeSnapshot;
+    use crate::domain::types::{MemoryFact, RuntimeSnapshot};
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -383,5 +409,21 @@ mod tests {
             snapshot.last_error.is_none(),
             "successful recovery turn should clear persisted error"
         );
+    }
+
+    #[test]
+    fn inference_context_summary_includes_memory_lines() {
+        let memory = vec![MemoryFact {
+            key: "strategy".to_string(),
+            value: "buy dips".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 2,
+            source_turn_id: "turn-1".to_string(),
+        }];
+        let summary = build_inference_context_summary(2, 3, "hello | world", &memory);
+        assert!(summary.contains("inbox_messages:2"));
+        assert!(summary.contains("evm_events:3"));
+        assert!(summary.contains("[memory]"));
+        assert!(summary.contains("strategy=buy dips"));
     }
 }

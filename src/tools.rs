@@ -1,4 +1,6 @@
-use crate::domain::types::{AgentState, SurvivalOperationClass, ToolCall, ToolCallRecord};
+use crate::domain::types::{
+    AgentState, MemoryFact, SurvivalOperationClass, ToolCall, ToolCallRecord,
+};
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::storage::stable;
 use async_trait::async_trait;
@@ -11,6 +13,11 @@ fn current_time_ns() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     return 1;
 }
+
+const MAX_MEMORY_FACTS: usize = 500;
+const MAX_MEMORY_KEY_BYTES: usize = 128;
+const MAX_MEMORY_VALUE_BYTES: usize = 4096;
+const MAX_MEMORY_RECALL_RESULTS: usize = 50;
 
 #[async_trait(?Send)]
 pub trait SignerPort {
@@ -100,6 +107,30 @@ impl ToolManager {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
                 max_calls_per_turn: 1,
+            },
+        );
+        policies.insert(
+            "remember".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+                max_calls_per_turn: 5,
+            },
+        );
+        policies.insert(
+            "recall".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+                max_calls_per_turn: 3,
+            },
+        );
+        policies.insert(
+            "forget".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+                max_calls_per_turn: 5,
             },
         );
 
@@ -257,6 +288,9 @@ impl ToolManager {
                     }
                 }
                 "record_signal" => Ok("recorded".to_string()),
+                "remember" => remember_fact_tool(&call.args_json, turn_id),
+                "recall" => recall_facts_tool(&call.args_json),
+                "forget" => forget_fact_tool(&call.args_json),
                 "evm_read" => {
                     let now_ns = current_time_ns();
                     if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns)
@@ -351,6 +385,123 @@ fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| "missing required field: message_hash".to_string())
+}
+
+fn normalize_memory_key(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > MAX_MEMORY_KEY_BYTES {
+        return Err(format!("key must be 1-{MAX_MEMORY_KEY_BYTES} bytes"));
+    }
+    if normalized.chars().any(|char| char.is_control()) {
+        return Err("key must not contain control characters".to_string());
+    }
+    Ok(normalized)
+}
+
+fn normalize_memory_prefix(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.len() > MAX_MEMORY_KEY_BYTES {
+        return Err(format!(
+            "prefix must be at most {MAX_MEMORY_KEY_BYTES} bytes"
+        ));
+    }
+    if normalized.chars().any(|char| char.is_control()) {
+        return Err("prefix must not contain control characters".to_string());
+    }
+    Ok(normalized)
+}
+
+fn parse_remember_args(args_json: &str) -> Result<(String, String), String> {
+    let value: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid remember args json: {error}"))?;
+    let key_raw = value
+        .get("key")
+        .and_then(|entry| entry.as_str())
+        .ok_or_else(|| "missing required field: key".to_string())?;
+    let value_raw = value
+        .get("value")
+        .and_then(|entry| entry.as_str())
+        .ok_or_else(|| "missing required field: value".to_string())?;
+    if value_raw.len() > MAX_MEMORY_VALUE_BYTES {
+        return Err(format!(
+            "value must be at most {MAX_MEMORY_VALUE_BYTES} bytes"
+        ));
+    }
+    Ok((normalize_memory_key(key_raw)?, value_raw.to_string()))
+}
+
+fn parse_recall_args(args_json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid recall args json: {error}"))?;
+    match value.get("prefix") {
+        Some(prefix) => {
+            let prefix = prefix
+                .as_str()
+                .ok_or_else(|| "prefix must be a string".to_string())?;
+            normalize_memory_prefix(prefix)
+        }
+        None => Ok(String::new()),
+    }
+}
+
+fn parse_forget_args(args_json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid forget args json: {error}"))?;
+    let key_raw = value
+        .get("key")
+        .and_then(|entry| entry.as_str())
+        .ok_or_else(|| "missing required field: key".to_string())?;
+    normalize_memory_key(key_raw)
+}
+
+fn remember_fact_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let (key, value) = parse_remember_args(args_json)?;
+    let now_ns = current_time_ns();
+    let existing = stable::get_memory_fact(&key);
+
+    if existing.is_none() && stable::memory_fact_count() >= MAX_MEMORY_FACTS {
+        return Err(format!("memory full: max {MAX_MEMORY_FACTS} facts"));
+    }
+
+    stable::set_memory_fact(&MemoryFact {
+        key: key.clone(),
+        value,
+        created_at_ns: existing
+            .as_ref()
+            .map(|fact| fact.created_at_ns)
+            .unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    });
+    Ok(format!("stored: {key}"))
+}
+
+fn recall_facts_tool(args_json: &str) -> Result<String, String> {
+    let prefix = parse_recall_args(args_json)?;
+    let facts = if prefix.is_empty() {
+        stable::list_all_memory_facts(MAX_MEMORY_RECALL_RESULTS)
+    } else {
+        stable::list_memory_facts_by_prefix(&prefix, MAX_MEMORY_RECALL_RESULTS)
+    };
+
+    if facts.is_empty() {
+        return Ok("no facts found".to_string());
+    }
+
+    Ok(facts
+        .into_iter()
+        .map(|fact| format!("{}={}", fact.key, fact.value))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn forget_fact_tool(args_json: &str) -> Result<String, String> {
+    let key = parse_forget_args(args_json)?;
+    if stable::remove_memory_fact(&key) {
+        Ok(format!("forgot: {key}"))
+    } else {
+        Ok(format!("no fact for key: {key}"))
+    }
 }
 
 #[cfg(test)]
@@ -594,5 +745,60 @@ mod tests {
             records[0].output,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn remember_and_recall_tools_round_trip() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![
+            ToolCall {
+                tool: "remember".to_string(),
+                args_json: r#"{"key":"strategy","value":"buy-dips"}"#.to_string(),
+            },
+            ToolCall {
+                tool: "recall".to_string(),
+                args_json: r#"{"prefix":"str"}"#.to_string(),
+            },
+        ];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 2);
+        assert!(records[0].success);
+        assert!(records[1].success);
+        assert!(records[1].output.contains("strategy=buy-dips"));
+    }
+
+    #[test]
+    fn forget_tool_removes_fact() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![
+            ToolCall {
+                tool: "remember".to_string(),
+                args_json: r#"{"key":"target.price","value":"2500"}"#.to_string(),
+            },
+            ToolCall {
+                tool: "forget".to_string(),
+                args_json: r#"{"key":"target.price"}"#.to_string(),
+            },
+            ToolCall {
+                tool: "recall".to_string(),
+                args_json: r#"{"prefix":"target."}"#.to_string(),
+            },
+        ];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 3);
+        assert!(records[0].success);
+        assert!(records[1].success);
+        assert!(records[2].success);
+        assert_eq!(records[2].output, "no facts found");
     }
 }
