@@ -160,7 +160,7 @@ Required impact response:
       - Validation: `cargo test -q parse_openrouter_completion` and `cargo test -q parse_ic_llm_response_maps_tool_calls`
       - Notes: Carry tool-call IDs forward; preserve strict JSON argument parsing.
 
-- [ ] **Task 2: Add transcript-based inference request building for initial and continuation rounds**
+- [x] **Task 2: Add transcript-based inference request building for initial and continuation rounds**
       - Files: `src/features/inference.rs`
       - Validation: `cargo test -q openrouter_request_body_uses_full_assembled_prompt_with_conversation_context` and new continuation-request unit tests
       - Notes: Keep system prompt + dynamic context on round 0; append assistant/tool messages for subsequent rounds.
