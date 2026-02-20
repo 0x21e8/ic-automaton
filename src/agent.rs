@@ -143,6 +143,20 @@ fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match inner_dialogue {
+        Some(current) => {
+            current.push_str("\n\n");
+            current.push_str(trimmed);
+        }
+        None => *inner_dialogue = Some(trimmed.to_string()),
+    }
+}
+
 fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String {
     let unique_senders = staged_messages
         .iter()
@@ -237,9 +251,7 @@ fn build_available_tools_section(turn_id: &str) -> String {
             continue;
         }
         let used = usage.get(&name).copied().unwrap_or_default();
-        let max = usize::from(policy.max_calls_per_turn);
-        let remaining = max.saturating_sub(used);
-        lines.push(format!("- {name}: remaining={remaining}/{max}"));
+        lines.push(format!("- {name}: calls_this_turn={used}"));
     }
     if lines.len() == 1 {
         lines.push("- none".to_string());
@@ -372,6 +384,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     let mut last_error: Option<String> = None;
     let mut tool_calls = Vec::new();
     let mut assistant_reply: Option<String> = None;
+    let mut inner_dialogue: Option<String> = None;
 
     if let Err(error) = advance_state(&mut state, &AgentEvent::TimerTick, &turn_id) {
         let _ = advance_state(
@@ -429,13 +442,14 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         }
         None => (snapshot.evm_cursor.clone(), 0),
     };
-    let has_input = evm_events > 0 || staged_message_count > 0;
+    let has_external_input = evm_events > 0 || staged_message_count > 0;
+    let should_infer = true;
 
     if let Err(reason) = advance_state(
         &mut state,
         &AgentEvent::EvmPollCompleted {
             new_events: evm_events as u32,
-            has_input,
+            has_input: should_infer,
         },
         &turn_id,
     ) {
@@ -444,7 +458,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         return Err(reason);
     }
 
-    if has_input {
+    if should_infer {
         let inbox_preview = staged_messages
             .iter()
             .map(|message| message.body.as_str())
@@ -464,8 +478,10 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         let input = InferenceInput {
             input: if staged_message_count > 0 {
                 format!("inbox:{inbox_preview}")
+            } else if evm_events > 0 {
+                format!("poll:new_events={evm_events}")
             } else {
-                "poll:".to_string()
+                "autonomy_tick".to_string()
             },
             context_snippet: context_summary,
             turn_id: turn_id.clone(),
@@ -475,6 +491,10 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             Ok(inference) => {
                 let trimmed_reply = inference.explanation.trim().to_string();
                 if !trimmed_reply.is_empty() {
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        &format!("inference: {trimmed_reply}"),
+                    );
                     assistant_reply = Some(trimmed_reply);
                 }
                 if let Err(error) =
@@ -497,6 +517,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
                         .execute_actions(&state, &inference.tool_calls, signer.as_ref(), &turn_id)
                         .await;
                     if let Some(tool_results_reply) = render_tool_results_reply(&tool_calls) {
+                        append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
                         assistant_reply = Some(tool_results_reply);
                     }
 
@@ -512,14 +533,30 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
                 }
             }
             Err(reason) => {
-                let _ = advance_state(
-                    &mut state,
-                    &AgentEvent::TurnFailed {
-                        reason: reason.clone(),
-                    },
-                    &turn_id,
-                );
-                last_error = Some(reason);
+                if has_external_input {
+                    let _ = advance_state(
+                        &mut state,
+                        &AgentEvent::TurnFailed {
+                            reason: reason.clone(),
+                        },
+                        &turn_id,
+                    );
+                    last_error = Some(reason);
+                } else {
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        &format!("autonomy inference error: {reason}"),
+                    );
+                    if let Err(error) =
+                        advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)
+                    {
+                        last_error = Some(error);
+                    } else if let Err(error) =
+                        advance_state(&mut state, &AgentEvent::ActionsCompleted, &turn_id)
+                    {
+                        last_error = Some(error);
+                    }
+                }
             }
         }
 
@@ -529,7 +566,8 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
                 last_error = Some(reason);
             } else {
                 if staged_message_count > 0 {
-                    if let Some(reply) = assistant_reply.clone() {
+                    if let Some(reply) = assistant_reply.clone().or_else(|| inner_dialogue.clone())
+                    {
                         match stable::post_outbox_message(
                             turn_id.clone(),
                             reply.clone(),
@@ -566,6 +604,9 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     if let Some(reason) = last_error.clone() {
         let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason }, &turn_id);
     }
+    if inner_dialogue.is_none() && !has_external_input && last_error.is_none() {
+        inner_dialogue = Some("autonomy tick complete: no action".to_string());
+    }
 
     let turn_record = TurnRecord {
         id: turn_id.clone(),
@@ -575,14 +616,15 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         source_events: (evm_events as u32)
             .saturating_add(u32::try_from(staged_message_count).unwrap_or(u32::MAX)),
         tool_call_count: u32::try_from(tool_calls.len()).unwrap_or(0),
-        input_summary: if has_input {
+        input_summary: if has_external_input {
             format!(
                 "inbox:{}:evm:{}:{}",
                 staged_message_count, next_cursor.chain_id, evm_events
             )
         } else {
-            "no-input".to_string()
+            "autonomy:no-input".to_string()
         },
+        inner_dialogue,
         error: last_error.clone(),
     };
 
@@ -890,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_context_reports_remaining_tool_budget_for_turn() {
+    fn dynamic_context_reports_tool_usage_for_turn() {
         reset_runtime(AgentState::Sleeping, true, false, 3);
         let turn_id = "turn-3";
         stable::set_tool_records(
@@ -925,8 +967,8 @@ mod tests {
 
         let snapshot = stable::runtime_snapshot();
         let context = build_dynamic_context(&snapshot, &[], 0, &[], turn_id, 5);
-        assert!(context.contains("- record_signal: remaining=3/5"));
-        assert!(context.contains("- evm_read: remaining=2/3"));
+        assert!(context.contains("- record_signal: calls_this_turn=2"));
+        assert!(context.contains("- evm_read: calls_this_turn=1"));
     }
 
     #[test]
@@ -954,6 +996,32 @@ mod tests {
         assert!(context.contains("sender-3"));
         assert!(!context.contains("sender-1"));
         assert!(!context.contains("sender-0"));
+    }
+
+    #[test]
+    fn no_input_turn_runs_autonomous_inference_and_records_inner_dialogue() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be set");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok(), "autonomous no-input turn should complete");
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.input_summary, "autonomy:no-input");
+        assert!(
+            turn.tool_call_count >= 1,
+            "mock autonomous turn should execute at least one tool"
+        );
+        assert!(
+            turn.inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Tool results"),
+            "inner dialogue should include tool execution summary"
+        );
     }
 
     #[test]

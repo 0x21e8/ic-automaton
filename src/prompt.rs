@@ -97,7 +97,11 @@ pub const LAYER_6_DECISION_LOOP_DEFAULT: &str = r#"## Layer 6: Economic Decision
 3. Value check:
 - Rank options by expected value per unit cost and confidence.
 4. Execution discipline:
-- Execute smallest viable action set; verify outcomes; record useful memory."#;
+- Execute useful action chains end-to-end; verify outcomes; record useful memory.
+5. Autonomy:
+- On `autonomy_tick` (no inbox message), proactively pick and execute meaningful actions.
+- Do not wait for explicit user prompts when high-confidence, policy-compliant work is available.
+- Prefer concrete tool outputs over plans, and keep momentum across turns."#;
 
 pub const LAYER_7_INBOX_DEFAULT: &str = r#"## Layer 7: Inbox Message Handling (Mutable Default)
 1. Validate:

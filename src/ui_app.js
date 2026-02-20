@@ -26,6 +26,7 @@ const el = {
   transitions: document.getElementById("transitions-list"),
   jobs: document.getElementById("jobs-list"),
   chat: document.getElementById("chat-list"),
+  innerDialogue: document.getElementById("inner-dialogue-list"),
   promptLayers: document.getElementById("prompt-layers-list"),
   conversations: document.getElementById("conversations-list"),
   conversationDetail: document.getElementById("conversation-detail"),
@@ -198,6 +199,34 @@ function renderChat(container, inboxMessages, outboxMessages) {
       <p class="chat-meta">${escapeHtml(row.role)} · ${row.meta}</p>
       <div class="chat-bubble"><p>${escapeHtml(row.body)}</p></div>
       <code>${escapeHtml(row.id)}</code>
+    </article>`
+          )
+          .join("");
+}
+
+function renderInnerDialogue(container, turns) {
+  const rows = Array.isArray(turns)
+    ? turns
+        .filter((turn) => String(turn.inner_dialogue || "").trim().length > 0)
+        .map((turn) => ({
+          turnId: String(turn.id || "turn:unknown"),
+          inputSummary: String(turn.input_summary || "unknown"),
+          body: String(turn.inner_dialogue || ""),
+          ts: Number(turn.created_at_ns || 0),
+        }))
+    : [];
+
+  container.innerHTML =
+    rows.length === 0
+      ? "<p class=\"muted\">No inner dialogue yet.</p>"
+      : rows
+          .map(
+            (row) => `<article class="chat-row assistant">
+      <p class="chat-meta">${escapeHtml(row.turnId)} · ${escapeHtml(row.inputSummary)} · ${escapeHtml(
+                relativeTimeFromNs(row.ts)
+              )}</p>
+      <div class="chat-bubble"><p>${escapeHtml(row.body)}</p></div>
+      <code>${escapeHtml(row.turnId)}</code>
     </article>`
           )
           .join("");
@@ -385,6 +414,7 @@ async function refreshSnapshot() {
     const inboxStats = snapshot.inbox_stats || {};
     const messages = snapshot.inbox_messages || [];
     const outboxMessages = snapshot.outbox_messages || [];
+    const recentTurns = snapshot.recent_turns || [];
     const promptLayers = snapshot.prompt_layers || [];
     const conversationSummaries = snapshot.conversation_summaries || [];
     state.conversationSummaries = conversationSummaries;
@@ -462,6 +492,7 @@ async function refreshSnapshot() {
       state.knownJobIds
     );
     renderChat(el.chat, messages, outboxMessages);
+    renderInnerDialogue(el.innerDialogue, recentTurns);
     renderPromptLayers(el.promptLayers, promptLayers);
 
     const selectedSummary = state.conversationSummaries.find(
