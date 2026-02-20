@@ -50,6 +50,15 @@ pub struct ToolCallRecord {
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct MemoryFact {
+    pub key: String,
+    pub value: String,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+    pub source_turn_id: String,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmPollCursor {
     pub chain_id: u64,
     pub next_block: u64,

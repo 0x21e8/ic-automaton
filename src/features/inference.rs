@@ -278,6 +278,57 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["to".to_string(), "value_wei".to_string()]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "remember".to_string(),
+            description: Some(
+                "Store a persistent memory fact by key; overwrites existing value for that key."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "key".to_string(),
+                        description: Some("Memory key identifier.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "value".to_string(),
+                        description: Some("Memory value payload.".to_string()),
+                    },
+                ]),
+                required: Some(vec!["key".to_string(), "value".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "recall".to_string(),
+            description: Some(
+                "Retrieve memory facts. Optionally filter by key prefix.".to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "prefix".to_string(),
+                    description: Some("Optional key prefix filter.".to_string()),
+                }]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "forget".to_string(),
+            description: Some("Delete a memory fact by key.".to_string()),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "key".to_string(),
+                    description: Some("Memory key identifier.".to_string()),
+                }]),
+                required: Some(vec!["key".to_string()]),
+            }),
+        }),
     ]
 }
 
@@ -665,6 +716,48 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
                         "required": ["to", "value_wei"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "remember",
+                    "description": "Store a persistent memory fact by key; overwrites existing value for that key.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string" },
+                            "value": { "type": "string" }
+                        },
+                        "required": ["key", "value"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "recall",
+                    "description": "Retrieve memory facts. Optionally filter by key prefix.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prefix": { "type": "string" }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "forget",
+                    "description": "Delete a memory fact by key.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string" }
+                        },
+                        "required": ["key"]
+                    }
+                }
             }
         ]
     })
@@ -899,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn ic_llm_tools_include_evm_read() {
+    fn ic_llm_tools_include_agent_memory_tools() {
         let names = ic_llm_tools()
             .into_iter()
             .map(|tool| match tool {
@@ -908,10 +1001,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"evm_read".to_string()));
         assert!(names.contains(&"send_eth".to_string()));
+        assert!(names.contains(&"remember".to_string()));
+        assert!(names.contains(&"recall".to_string()));
+        assert!(names.contains(&"forget".to_string()));
     }
 
     #[test]
-    fn openrouter_request_body_includes_evm_read_tool() {
+    fn openrouter_request_body_includes_agent_memory_tools() {
         let body = build_openrouter_request_body(
             &InferenceInput {
                 input: "hello".to_string(),
@@ -933,5 +1029,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"evm_read"));
         assert!(names.contains(&"send_eth"));
+        assert!(names.contains(&"remember"));
+        assert!(names.contains(&"recall"));
+        assert!(names.contains(&"forget"));
     }
 }

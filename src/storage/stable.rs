@@ -1,9 +1,9 @@
 use crate::domain::types::{
     AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, JobStatus, ObservabilitySnapshot, OutboxMessage,
-    OutboxStats, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime,
-    SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
-    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
+    OutboxMessage, OutboxStats, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
+    SchedulerRuntime, SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
@@ -242,6 +242,11 @@ thread_local! {
         StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(15)))
+    ));
+    static MEMORY_FACTS_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(16)))
     ));
 }
 
@@ -611,6 +616,71 @@ pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String
 
 pub fn get_evm_address() -> Option<String> {
     runtime_snapshot().evm_address
+}
+
+pub fn set_memory_fact(fact: &MemoryFact) {
+    MEMORY_FACTS_MAP.with(|map| {
+        map.borrow_mut().insert(fact.key.clone(), encode_json(fact));
+    });
+}
+
+pub fn get_memory_fact(key: &str) -> Option<MemoryFact> {
+    MEMORY_FACTS_MAP
+        .with(|map| map.borrow().get(&key.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn remove_memory_fact(key: &str) -> bool {
+    MEMORY_FACTS_MAP
+        .with(|map| map.borrow_mut().remove(&key.to_string()))
+        .is_some()
+}
+
+pub fn memory_fact_count() -> usize {
+    MEMORY_FACTS_MAP.with(|map| map.borrow().len() as usize)
+}
+
+pub fn list_all_memory_facts(limit: usize) -> Vec<MemoryFact> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let facts = MEMORY_FACTS_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+    sort_memory_facts_desc_by_updated(facts, limit)
+}
+
+pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let normalized_prefix = prefix.trim().to_ascii_lowercase();
+    let facts = MEMORY_FACTS_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter(|entry| entry.key().starts_with(&normalized_prefix))
+            .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+    sort_memory_facts_desc_by_updated(facts, limit)
+}
+
+fn sort_memory_facts_desc_by_updated(mut facts: Vec<MemoryFact>, limit: usize) -> Vec<MemoryFact> {
+    facts.sort_by(|left, right| {
+        right
+            .updated_at_ns
+            .cmp(&left.updated_at_ns)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    if facts.len() > limit {
+        facts.truncate(limit);
+    }
+    facts
 }
 
 pub fn set_evm_rpc_url(url: String) -> Result<String, String> {
@@ -1494,7 +1564,7 @@ fn read_json<T: DeserializeOwned>(value: Option<&[u8]>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{InboxMessageStatus, TaskKind, TaskLane};
+    use crate::domain::types::{InboxMessageStatus, MemoryFact, TaskKind, TaskLane};
 
     fn sample_job(id: &str, kind: TaskKind, when: u64, priority: u8) -> ScheduledJob {
         ScheduledJob {
@@ -1755,5 +1825,51 @@ mod tests {
             "https://base.publicnode.com"
         );
         assert_eq!(snapshot.evm_rpc_max_response_bytes, 65_536);
+    }
+
+    #[test]
+    fn memory_fact_store_list_prefix_and_delete() {
+        init_storage();
+        let first = MemoryFact {
+            key: "strategy.primary".to_string(),
+            value: "hold".to_string(),
+            created_at_ns: 10,
+            updated_at_ns: 10,
+            source_turn_id: "turn-1".to_string(),
+        };
+        let second = MemoryFact {
+            key: "balance.eth".to_string(),
+            value: "42".to_string(),
+            created_at_ns: 20,
+            updated_at_ns: 20,
+            source_turn_id: "turn-2".to_string(),
+        };
+
+        set_memory_fact(&first);
+        set_memory_fact(&second);
+
+        assert_eq!(memory_fact_count(), 2);
+        assert_eq!(
+            get_memory_fact("strategy.primary")
+                .as_ref()
+                .map(|fact| fact.value.as_str())
+                .unwrap_or_default(),
+            "hold"
+        );
+
+        let prefix = list_memory_facts_by_prefix("balance.", 10);
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].key, "balance.eth");
+
+        let all = list_all_memory_facts(10);
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all[0].key, "balance.eth",
+            "facts should be returned in descending updated_at order"
+        );
+
+        assert!(remove_memory_fact("strategy.primary"));
+        assert!(!remove_memory_fact("strategy.primary"));
+        assert_eq!(memory_fact_count(), 1);
     }
 }
