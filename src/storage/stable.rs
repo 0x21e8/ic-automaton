@@ -1,10 +1,10 @@
 use crate::domain::types::{
-    AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
-    OutboxMessage, OutboxStats, PromptLayer, RuntimeSnapshot, RuntimeView, ScheduledJob,
-    SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind,
-    TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord,
-    TurnRecord,
+    AgentEvent, AgentState, ConversationEntry, ConversationLog, EvmPollCursor, InboxMessage,
+    InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider, JobStatus, MemoryFact,
+    ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, RuntimeSnapshot, RuntimeView,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
+    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    TransitionLogRecord, TurnRecord,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -37,6 +37,10 @@ const HTTP_ALLOWLIST_INITIALIZED_KEY: &str = "http.allowlist.initialized";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
+const MAX_CONVERSATION_ENTRIES_PER_SENDER: usize = 20;
+const MAX_CONVERSATION_SENDERS: usize = 200;
+const MAX_CONVERSATION_BODY_CHARS: usize = 500;
+const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
 pub const SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED: u32 = 3;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
@@ -268,6 +272,11 @@ thread_local! {
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(18)))
     ));
+    static CONVERSATION_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(19)))
+    ));
 }
 
 pub fn init_storage() {
@@ -356,6 +365,47 @@ pub fn save_prompt_layer(layer: &PromptLayer) -> Result<(), String> {
         map.borrow_mut().insert(layer.layer_id, encode_json(layer));
     });
     Ok(())
+}
+
+pub fn append_conversation_entry(sender: &str, mut entry: ConversationEntry) {
+    let sender_key = normalize_conversation_sender(sender);
+    if sender_key.is_empty() {
+        return;
+    }
+
+    entry.sender_body = truncate_to_chars(&entry.sender_body, MAX_CONVERSATION_BODY_CHARS);
+    entry.agent_reply = truncate_to_chars(&entry.agent_reply, MAX_CONVERSATION_REPLY_CHARS);
+
+    let mut log = get_conversation_log(&sender_key).unwrap_or_else(|| ConversationLog {
+        sender: sender_key.clone(),
+        entries: Vec::new(),
+        last_activity_ns: 0,
+    });
+    log.sender = sender_key.clone();
+    log.last_activity_ns = entry.timestamp_ns;
+    log.entries.push(entry);
+    if log.entries.len() > MAX_CONVERSATION_ENTRIES_PER_SENDER {
+        let drop_count = log
+            .entries
+            .len()
+            .saturating_sub(MAX_CONVERSATION_ENTRIES_PER_SENDER);
+        log.entries.drain(0..drop_count);
+    }
+
+    CONVERSATION_MAP.with(|map| {
+        map.borrow_mut().insert(sender_key, encode_json(&log));
+    });
+    evict_oldest_conversation_sender_if_needed();
+}
+
+pub fn get_conversation_log(sender: &str) -> Option<ConversationLog> {
+    let sender_key = normalize_conversation_sender(sender);
+    if sender_key.is_empty() {
+        return None;
+    }
+    CONVERSATION_MAP
+        .with(|map| map.borrow().get(&sender_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
 pub fn runtime_snapshot() -> RuntimeSnapshot {
@@ -1716,6 +1766,42 @@ fn save_inbox_message(message: &InboxMessage) {
     });
 }
 
+fn normalize_conversation_sender(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn truncate_to_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
+}
+
+fn evict_oldest_conversation_sender_if_needed() {
+    loop {
+        let len = CONVERSATION_MAP.with(|map| map.borrow().len() as usize);
+        if len <= MAX_CONVERSATION_SENDERS {
+            return;
+        }
+
+        let candidate = CONVERSATION_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .filter_map(|entry| {
+                    read_json::<ConversationLog>(Some(entry.value().as_slice()))
+                        .map(|log| (entry.key().clone(), log.last_activity_ns))
+                })
+                .min_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)))
+        });
+        let Some((sender, _)) = candidate else {
+            return;
+        };
+        CONVERSATION_MAP.with(|map| {
+            map.borrow_mut().remove(&sender);
+        });
+    }
+}
+
 fn next_inbox_seq() -> u64 {
     let next = runtime_u64(INBOX_SEQ_KEY).unwrap_or(0).saturating_add(1);
     save_runtime_u64(INBOX_SEQ_KEY, next);
@@ -1759,7 +1845,28 @@ fn read_json<T: DeserializeOwned>(value: Option<&[u8]>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{InboxMessageStatus, MemoryFact, PromptLayer, TaskKind, TaskLane};
+    use crate::domain::types::{
+        ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer, TaskKind, TaskLane,
+    };
+
+    fn clear_conversation_map() {
+        let keys = CONVERSATION_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        CONVERSATION_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn sender_for(seed: usize) -> String {
+        format!("0x{seed:040x}")
+    }
 
     fn sample_job(id: &str, kind: TaskKind, when: u64, priority: u8) -> ScheduledJob {
         ScheduledJob {
@@ -2012,6 +2119,124 @@ mod tests {
         let snapshot = observability_snapshot(10);
         assert_eq!(snapshot.outbox_stats.total_messages, 2);
         assert_eq!(snapshot.outbox_messages.len(), 2);
+    }
+
+    #[test]
+    fn conversation_append_and_get_normalizes_sender() {
+        init_storage();
+        clear_conversation_map();
+        let mixed_case = "0xAbCd00000000000000000000000000000000Ef12";
+        let expected_sender = mixed_case.to_ascii_lowercase();
+        append_conversation_entry(
+            mixed_case,
+            ConversationEntry {
+                inbox_message_id: "inbox:1".to_string(),
+                sender_body: "hello".to_string(),
+                agent_reply: "hi".to_string(),
+                turn_id: "turn-1".to_string(),
+                timestamp_ns: 1,
+            },
+        );
+
+        let stored = get_conversation_log(&expected_sender)
+            .expect("conversation log should be retrievable with normalized sender");
+        assert_eq!(stored.sender, expected_sender);
+        assert_eq!(stored.entries.len(), 1);
+        assert_eq!(stored.entries[0].inbox_message_id, "inbox:1");
+    }
+
+    #[test]
+    fn conversation_append_truncates_long_fields() {
+        init_storage();
+        clear_conversation_map();
+        let sender = sender_for(1);
+        append_conversation_entry(
+            &sender,
+            ConversationEntry {
+                inbox_message_id: "inbox:trunc".to_string(),
+                sender_body: "s".repeat(700),
+                agent_reply: "r".repeat(900),
+                turn_id: "turn-trunc".to_string(),
+                timestamp_ns: 10,
+            },
+        );
+
+        let stored = get_conversation_log(&sender).expect("conversation log should exist");
+        assert_eq!(stored.entries.len(), 1);
+        assert_eq!(stored.entries[0].sender_body.len(), 500);
+        assert_eq!(stored.entries[0].agent_reply.len(), 500);
+    }
+
+    #[test]
+    fn conversation_append_applies_fifo_eviction_per_sender() {
+        init_storage();
+        clear_conversation_map();
+        let sender = sender_for(2);
+        for idx in 0..25u64 {
+            append_conversation_entry(
+                &sender,
+                ConversationEntry {
+                    inbox_message_id: format!("inbox:{idx}"),
+                    sender_body: format!("msg-{idx}"),
+                    agent_reply: "reply".to_string(),
+                    turn_id: format!("turn-{idx}"),
+                    timestamp_ns: idx,
+                },
+            );
+        }
+
+        let stored = get_conversation_log(&sender).expect("conversation log should exist");
+        assert_eq!(stored.entries.len(), 20);
+        assert_eq!(stored.entries[0].inbox_message_id, "inbox:5");
+        assert_eq!(stored.entries[19].inbox_message_id, "inbox:24");
+        assert_eq!(stored.last_activity_ns, 24);
+    }
+
+    #[test]
+    fn conversation_append_evicts_oldest_sender_when_capacity_exceeded() {
+        init_storage();
+        clear_conversation_map();
+
+        for idx in 0..200u64 {
+            let sender = sender_for(idx as usize);
+            append_conversation_entry(
+                &sender,
+                ConversationEntry {
+                    inbox_message_id: format!("inbox:{idx}"),
+                    sender_body: "hello".to_string(),
+                    agent_reply: "reply".to_string(),
+                    turn_id: format!("turn-{idx}"),
+                    timestamp_ns: idx,
+                },
+            );
+        }
+
+        let oldest_sender = sender_for(0);
+        assert!(
+            get_conversation_log(&oldest_sender).is_some(),
+            "oldest sender should still exist at exact capacity"
+        );
+
+        let newest_sender = sender_for(200);
+        append_conversation_entry(
+            &newest_sender,
+            ConversationEntry {
+                inbox_message_id: "inbox:200".to_string(),
+                sender_body: "hello".to_string(),
+                agent_reply: "reply".to_string(),
+                turn_id: "turn-200".to_string(),
+                timestamp_ns: 200,
+            },
+        );
+
+        assert!(
+            get_conversation_log(&oldest_sender).is_none(),
+            "least recently active sender should be evicted"
+        );
+        assert!(
+            get_conversation_log(&newest_sender).is_some(),
+            "newest sender should be retained"
+        );
     }
 
     #[test]

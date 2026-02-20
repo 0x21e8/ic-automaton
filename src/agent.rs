@@ -1,6 +1,8 @@
 use crate::domain::state_machine;
 use crate::domain::types::SurvivalOperationClass;
-use crate::domain::types::{AgentEvent, AgentState, InferenceInput, MemoryFact, TurnRecord};
+use crate::domain::types::{
+    AgentEvent, AgentState, ConversationEntry, InboxMessage, InferenceInput, MemoryFact, TurnRecord,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
@@ -8,6 +10,7 @@ use crate::features::{
 };
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
+use std::collections::BTreeSet;
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -43,6 +46,38 @@ fn build_inference_context_summary(
     }
     parts.push(format!("inbox_preview:{inbox_preview}"));
     parts.join(";")
+}
+
+fn record_conversation_entries(
+    turn_id: &str,
+    staged_messages: &[InboxMessage],
+    consumed_message_ids: &[String],
+    agent_reply: &str,
+    timestamp_ns: u64,
+) {
+    if consumed_message_ids.is_empty() || agent_reply.trim().is_empty() {
+        return;
+    }
+
+    let consumed_ids = consumed_message_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for message in staged_messages {
+        if !consumed_ids.contains(message.id.as_str()) {
+            continue;
+        }
+        stable::append_conversation_entry(
+            &message.posted_by,
+            ConversationEntry {
+                inbox_message_id: message.id.clone(),
+                sender_body: message.body.clone(),
+                agent_reply: agent_reply.to_string(),
+                turn_id: turn_id.to_string(),
+                timestamp_ns,
+            },
+        );
+    }
 }
 
 pub async fn run_scheduled_turn_job() -> Result<(), String> {
@@ -221,12 +256,23 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             } else {
                 if staged_message_count > 0 {
                     if let Some(reply) = assistant_reply.clone() {
-                        if let Err(error) = stable::post_outbox_message(
+                        match stable::post_outbox_message(
                             turn_id.clone(),
-                            reply,
+                            reply.clone(),
                             staged_message_ids.clone(),
                         ) {
-                            last_error = Some(error);
+                            Ok(_) => {
+                                record_conversation_entries(
+                                    &turn_id,
+                                    &staged_messages,
+                                    &staged_message_ids,
+                                    &reply,
+                                    current_time_ns(),
+                                );
+                            }
+                            Err(error) => {
+                                last_error = Some(error);
+                            }
                         }
                     }
                 }
@@ -425,5 +471,41 @@ mod tests {
         assert!(summary.contains("evm_events:3"));
         assert!(summary.contains("[memory]"));
         assert!(summary.contains("strategy=buy dips"));
+    }
+
+    #[test]
+    fn scheduled_turn_records_conversation_entries_for_consumed_inbox_messages() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let sender_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let sender_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+
+        stable::post_inbox_message("hello sender a".to_string(), sender_a.clone())
+            .expect("first inbox message should be accepted");
+        stable::post_inbox_message("hello sender b".to_string(), sender_b.clone())
+            .expect("second inbox message should be accepted");
+        assert_eq!(
+            stable::stage_pending_inbox_messages(10, 100),
+            2,
+            "both pending messages should be staged before turn execution"
+        );
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok(), "turn should complete successfully");
+
+        let outbox = stable::list_outbox_messages(10);
+        assert_eq!(outbox.len(), 1, "one assistant reply should be recorded");
+        let expected_reply = outbox[0].body.clone();
+
+        let sender_a_log = stable::get_conversation_log(&sender_a)
+            .expect("sender A conversation should be recorded");
+        assert_eq!(sender_a_log.entries.len(), 1);
+        assert_eq!(sender_a_log.entries[0].sender_body, "hello sender a");
+        assert_eq!(sender_a_log.entries[0].agent_reply, expected_reply);
+
+        let sender_b_log = stable::get_conversation_log(&sender_b)
+            .expect("sender B conversation should be recorded");
+        assert_eq!(sender_b_log.entries.len(), 1);
+        assert_eq!(sender_b_log.entries[0].sender_body, "hello sender b");
+        assert_eq!(sender_b_log.entries[0].agent_reply, expected_reply);
     }
 }
