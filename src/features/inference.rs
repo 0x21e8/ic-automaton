@@ -71,11 +71,28 @@ pub enum InferenceTranscriptMessage {
 #[async_trait(?Send)]
 pub trait InferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String>;
+
+    async fn infer_with_transcript(
+        &self,
+        input: &InferenceInput,
+        transcript: &[InferenceTranscriptMessage],
+    ) -> Result<InferenceOutput, String> {
+        let _ = transcript;
+        self.infer(input).await
+    }
 }
 
 pub async fn infer_with_provider(
     snapshot: &RuntimeSnapshot,
     input: &InferenceInput,
+) -> Result<InferenceOutput, String> {
+    infer_with_provider_transcript(snapshot, input, &[]).await
+}
+
+pub async fn infer_with_provider_transcript(
+    snapshot: &RuntimeSnapshot,
+    input: &InferenceInput,
+    transcript: &[InferenceTranscriptMessage],
 ) -> Result<InferenceOutput, String> {
     let now_ns = current_time_ns();
     if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
@@ -86,15 +103,19 @@ pub async fn infer_with_provider(
     }
 
     let output = match snapshot.inference_provider {
-        InferenceProvider::Mock => MockInferenceAdapter.infer(input).await,
+        InferenceProvider::Mock => {
+            MockInferenceAdapter
+                .infer_with_transcript(input, transcript)
+                .await
+        }
         InferenceProvider::IcLlm => {
             IcLlmInferenceAdapter::from_snapshot(snapshot)
-                .infer(input)
+                .infer_with_transcript(input, transcript)
                 .await
         }
         InferenceProvider::OpenRouter => {
             OpenRouterInferenceAdapter::from_snapshot(snapshot)
-                .infer(input)
+                .infer_with_transcript(input, transcript)
                 .await
         }
     };
@@ -110,10 +131,41 @@ pub struct MockInferenceAdapter;
 #[async_trait(?Send)]
 impl InferenceAdapter for MockInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
+        self.infer_with_transcript(input, &[]).await
+    }
+
+    async fn infer_with_transcript(
+        &self,
+        input: &InferenceInput,
+        transcript: &[InferenceTranscriptMessage],
+    ) -> Result<InferenceOutput, String> {
         let explicit_sign_request = input.input.contains("request_sign_message:true")
             || input.context_snippet.contains("request_sign_message:true");
         let update_prompt_layer_request = input.input.contains("request_update_prompt_layer:true");
         let layer_6_probe_request = input.input.contains("request_layer_6_probe:true");
+        let continuation_loop_request = input.input.contains("request_continuation_loop:true")
+            || input
+                .context_snippet
+                .contains("request_continuation_loop:true");
+        let continuation_error_request = input.input.contains("request_continuation_error:true")
+            || input
+                .context_snippet
+                .contains("request_continuation_error:true");
+
+        let has_tool_transcript = transcript
+            .iter()
+            .any(|entry| matches!(entry, InferenceTranscriptMessage::Tool { .. }));
+
+        if continuation_error_request && has_tool_transcript {
+            return Err("mock continuation inference failed after tool execution".to_string());
+        }
+
+        if has_tool_transcript && !continuation_loop_request {
+            return Ok(InferenceOutput {
+                tool_calls: Vec::new(),
+                explanation: format!("mocked continuation for {}", input.turn_id),
+            });
+        }
 
         let tool_calls = if explicit_sign_request {
             vec![ToolCall {
@@ -189,8 +241,16 @@ struct IcLlmRequest {
 #[async_trait(?Send)]
 impl InferenceAdapter for IcLlmInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
+        self.infer_with_transcript(input, &[]).await
+    }
+
+    async fn infer_with_transcript(
+        &self,
+        input: &InferenceInput,
+        transcript: &[InferenceTranscriptMessage],
+    ) -> Result<InferenceOutput, String> {
         let model = parse_ic_llm_model(&self.model)?;
-        let request = build_ic_llm_request(input, model);
+        let request = build_ic_llm_request_with_transcript(input, model, transcript);
 
         log!(
             InferenceLogPriority::Info,
@@ -221,6 +281,7 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
     }
 }
 
+#[allow(dead_code)]
 fn build_ic_llm_request(input: &InferenceInput, model: IcLlmModel) -> IcLlmRequest {
     build_ic_llm_request_with_transcript(input, model, &[])
 }
@@ -682,6 +743,14 @@ impl OpenRouterInferenceAdapter {
 #[async_trait(?Send)]
 impl InferenceAdapter for OpenRouterInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
+        self.infer_with_transcript(input, &[]).await
+    }
+
+    async fn infer_with_transcript(
+        &self,
+        input: &InferenceInput,
+        transcript: &[InferenceTranscriptMessage],
+    ) -> Result<InferenceOutput, String> {
         let now_ns = current_time_ns();
         if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
             return Ok(InferenceOutput {
@@ -693,8 +762,12 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
         self.validate_config()?;
 
         let api_key = self.api_key.clone().unwrap_or_default();
-        let payload = serde_json::to_vec(&build_openrouter_request_body(input, &self.model))
-            .map_err(|error| format!("failed to build openrouter request payload: {error}"))?;
+        let payload = serde_json::to_vec(&build_openrouter_request_body_with_transcript(
+            input,
+            &self.model,
+            transcript,
+        ))
+        .map_err(|error| format!("failed to build openrouter request payload: {error}"))?;
         let request_size_bytes = Self::estimate_request_size_bytes(&payload);
         let requirements =
             Self::affordability_requirements(request_size_bytes, self.max_response_bytes)?;
@@ -815,6 +888,7 @@ fn parse_openrouter_http_response(response: HttpRequestResult) -> Result<Inferen
     parse_openrouter_completion(&body)
 }
 
+#[allow(dead_code)]
 fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
     build_openrouter_request_body_with_transcript(input, model, &[])
 }

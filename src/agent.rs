@@ -7,7 +7,8 @@ use crate::domain::types::{
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
-    infer_with_provider, EvmPoller, HttpEvmPoller, MockEvmPoller, MockSignerAdapter,
+    infer_with_provider, infer_with_provider_transcript, EvmPoller, HttpEvmPoller,
+    InferenceTranscriptMessage, MockEvmPoller, MockSignerAdapter,
 };
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
@@ -17,6 +18,8 @@ use std::collections::BTreeSet;
 
 const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60 * 60;
 const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
+const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 3;
+const MAX_AGENT_TURN_DURATION_NS: u64 = 90 * 1_000_000_000;
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -205,6 +208,33 @@ fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeede
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
         stable::record_autonomy_tool_success(&fingerprint, succeeded_at_ns);
     }
+}
+
+fn normalize_tool_call_ids(calls: Vec<ToolCall>, round_index: usize) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(tool_index, mut call)| {
+            let normalized_id = call
+                .tool_call_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("round-{round_index}-tool-{tool_index}"));
+            call.tool_call_id = Some(normalized_id);
+            call
+        })
+        .collect()
+}
+
+fn continuation_tool_content(record: &ToolCallRecord) -> String {
+    serde_json::json!({
+        "success": record.success,
+        "output": record.output,
+        "error": record.error,
+    })
+    .to_string()
 }
 
 fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) {
@@ -502,6 +532,14 @@ fn record_conversation_entries(
 }
 
 pub async fn run_scheduled_turn_job() -> Result<(), String> {
+    run_scheduled_turn_job_with_limits(MAX_INFERENCE_ROUNDS_PER_TURN, MAX_AGENT_TURN_DURATION_NS)
+        .await
+}
+
+async fn run_scheduled_turn_job_with_limits(
+    max_inference_rounds: usize,
+    max_turn_duration_ns: u64,
+) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
     if !snapshot.loop_enabled || snapshot.turn_in_flight {
         return Ok(());
@@ -524,7 +562,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     let initial_state = snapshot.state.clone();
     let mut state = snapshot.state.clone();
     let mut last_error: Option<String> = None;
-    let mut tool_calls = Vec::new();
+    let mut all_tool_calls = Vec::new();
     let mut assistant_reply: Option<String> = None;
     let mut inner_dialogue: Option<String> = None;
 
@@ -629,106 +667,183 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             turn_id: turn_id.clone(),
         };
 
-        match infer_with_provider(&snapshot, &input).await {
-            Ok(inference) => {
-                let trimmed_reply = inference.explanation.trim().to_string();
-                if !trimmed_reply.is_empty() {
-                    append_inner_dialogue(
-                        &mut inner_dialogue,
-                        &format!("inference: {trimmed_reply}"),
-                    );
-                    assistant_reply = Some(trimmed_reply);
+        #[cfg(target_arch = "wasm32")]
+        let signer: Box<dyn SignerPort> = if snapshot.ecdsa_key_name.trim().is_empty() {
+            Box::new(MockSignerAdapter::new())
+        } else {
+            Box::new(ThresholdSignerAdapter::new(snapshot.ecdsa_key_name.clone()))
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let signer: Box<dyn SignerPort> = Box::new(MockSignerAdapter::new());
+
+        let mut manager = ToolManager::new();
+        let mut transcript = Vec::<InferenceTranscriptMessage>::new();
+        let mut inference_round_count = 0usize;
+        let mut inference_completed = false;
+        let mut executed_any_tool = false;
+
+        loop {
+            if inference_round_count >= max_inference_rounds {
+                append_inner_dialogue(
+                    &mut inner_dialogue,
+                    &format!(
+                        "continuation stopped: max inference rounds reached ({max_inference_rounds})"
+                    ),
+                );
+                break;
+            }
+
+            let elapsed_ns = current_time_ns().saturating_sub(started_at_ns);
+            if elapsed_ns >= max_turn_duration_ns {
+                append_inner_dialogue(
+                    &mut inner_dialogue,
+                    &format!(
+                        "continuation stopped: max turn duration reached ({} ms)",
+                        max_turn_duration_ns / 1_000_000
+                    ),
+                );
+                break;
+            }
+
+            inference_round_count = inference_round_count.saturating_add(1);
+            let inference_result = if transcript.is_empty() {
+                infer_with_provider(&snapshot, &input).await
+            } else {
+                infer_with_provider_transcript(&snapshot, &input, &transcript).await
+            };
+            let inference = match inference_result {
+                Ok(inference) => inference,
+                Err(reason) => {
+                    if inference_round_count == 1 {
+                        if has_external_input {
+                            last_error = Some(reason);
+                        } else {
+                            append_inner_dialogue(
+                                &mut inner_dialogue,
+                                &format!("autonomy inference error: {reason}"),
+                            );
+                            if !inference_completed {
+                                if let Err(error) = advance_state(
+                                    &mut state,
+                                    &AgentEvent::InferenceCompleted,
+                                    &turn_id,
+                                ) {
+                                    last_error = Some(error);
+                                } else {
+                                    inference_completed = true;
+                                }
+                            }
+                        }
+                    } else if executed_any_tool {
+                        append_inner_dialogue(
+                            &mut inner_dialogue,
+                            &format!(
+                                "continuation inference degraded after tool execution: {reason}"
+                            ),
+                        );
+                    } else {
+                        last_error = Some(reason);
+                    }
+                    break;
                 }
+            };
+
+            let trimmed_reply = inference.explanation.trim().to_string();
+            if !trimmed_reply.is_empty() {
+                append_inner_dialogue(&mut inner_dialogue, &format!("inference: {trimmed_reply}"));
+                assistant_reply = Some(trimmed_reply.clone());
+            }
+
+            if !inference_completed {
                 if let Err(error) =
                     advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)
                 {
                     last_error = Some(error);
-                } else {
-                    let mut planned_tool_calls = inference.tool_calls;
-                    if !has_external_input {
-                        let (filtered_calls, suppressed_calls) =
-                            suppress_duplicate_autonomy_tool_calls(
-                                &planned_tool_calls,
-                                started_at_ns,
-                            );
-                        planned_tool_calls = filtered_calls;
-                        if !suppressed_calls.is_empty() {
-                            append_inner_dialogue(
-                                &mut inner_dialogue,
-                                &format!(
-                                    "autonomy dedupe suppressed {} repeated successful tool call(s) within {} seconds:\n- {}",
-                                    suppressed_calls.len(),
-                                    BALANCE_FRESHNESS_WINDOW_SECS,
-                                    suppressed_calls.join("\n- "),
-                                ),
-                            );
-                        }
-                    }
-
-                    #[cfg(target_arch = "wasm32")]
-                    let signer: Box<dyn SignerPort> = if snapshot.ecdsa_key_name.trim().is_empty() {
-                        Box::new(MockSignerAdapter::new())
-                    } else {
-                        Box::new(ThresholdSignerAdapter::new(snapshot.ecdsa_key_name.clone()))
-                    };
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let signer: Box<dyn SignerPort> = Box::new(MockSignerAdapter::new());
-
-                    let mut manager = ToolManager::new();
-                    tool_calls = manager
-                        .execute_actions(&state, &planned_tool_calls, signer.as_ref(), &turn_id)
-                        .await;
-                    let execution_completed_ns = current_time_ns();
-                    if !has_external_input {
-                        record_successful_autonomy_tool_calls(&tool_calls, execution_completed_ns);
-                    }
-                    persist_eth_balance_from_tool_calls(
-                        &tool_calls,
-                        &turn_id,
-                        execution_completed_ns,
-                    );
-                    if let Some(tool_results_reply) = render_tool_results_reply(&tool_calls) {
-                        append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
-                        assistant_reply = Some(tool_results_reply);
-                    }
-
-                    if tool_calls.iter().any(|record| !record.success) {
-                        last_error = Some("tool execution reported failures".to_string());
-                    }
-
-                    if let Err(error) =
-                        advance_state(&mut state, &AgentEvent::ActionsCompleted, &turn_id)
-                    {
-                        last_error = Some(error);
-                    }
+                    break;
                 }
+                inference_completed = true;
             }
-            Err(reason) => {
-                if has_external_input {
-                    let _ = advance_state(
-                        &mut state,
-                        &AgentEvent::TurnFailed {
-                            reason: reason.clone(),
-                        },
-                        &turn_id,
-                    );
-                    last_error = Some(reason);
-                } else {
+
+            let mut planned_tool_calls =
+                normalize_tool_call_ids(inference.tool_calls, inference_round_count - 1);
+            if inference_round_count == 1 && !has_external_input {
+                let (filtered_calls, suppressed_calls) =
+                    suppress_duplicate_autonomy_tool_calls(&planned_tool_calls, started_at_ns);
+                planned_tool_calls = filtered_calls;
+                if !suppressed_calls.is_empty() {
                     append_inner_dialogue(
                         &mut inner_dialogue,
-                        &format!("autonomy inference error: {reason}"),
+                        &format!(
+                            "autonomy dedupe suppressed {} repeated successful tool call(s) within {} seconds:\n- {}",
+                            suppressed_calls.len(),
+                            BALANCE_FRESHNESS_WINDOW_SECS,
+                            suppressed_calls.join("\n- "),
+                        ),
                     );
-                    if let Err(error) =
-                        advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)
-                    {
-                        last_error = Some(error);
-                    } else if let Err(error) =
-                        advance_state(&mut state, &AgentEvent::ActionsCompleted, &turn_id)
-                    {
-                        last_error = Some(error);
-                    }
                 }
+            }
+
+            if planned_tool_calls.is_empty() {
+                break;
+            }
+
+            transcript.push(InferenceTranscriptMessage::Assistant {
+                content: if trimmed_reply.is_empty() {
+                    None
+                } else {
+                    Some(trimmed_reply)
+                },
+                tool_calls: planned_tool_calls.clone(),
+            });
+
+            let executed = manager
+                .execute_actions(&state, &planned_tool_calls, signer.as_ref(), &turn_id)
+                .await;
+            executed_any_tool = executed_any_tool || !executed.is_empty();
+
+            let execution_completed_ns = current_time_ns();
+            if !has_external_input {
+                record_successful_autonomy_tool_calls(&executed, execution_completed_ns);
+            }
+            persist_eth_balance_from_tool_calls(&executed, &turn_id, execution_completed_ns);
+            if let Some(tool_results_reply) = render_tool_results_reply(&executed) {
+                append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
+                assistant_reply = Some(tool_results_reply);
+            }
+
+            if executed.iter().any(|record| !record.success) {
+                last_error = Some("tool execution reported failures".to_string());
+            }
+
+            for (call, record) in planned_tool_calls.iter().zip(executed.iter()) {
+                if let Some(tool_call_id) = call.tool_call_id.clone() {
+                    transcript.push(InferenceTranscriptMessage::Tool {
+                        tool_call_id,
+                        content: continuation_tool_content(record),
+                    });
+                }
+            }
+
+            all_tool_calls.extend(executed);
+
+            if last_error.is_some() {
+                break;
+            }
+        }
+
+        if last_error.is_none() && !inference_completed {
+            if let Err(error) = advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)
+            {
+                last_error = Some(error);
+            } else {
+                inference_completed = true;
+            }
+        }
+
+        if last_error.is_none() && inference_completed {
+            if let Err(error) = advance_state(&mut state, &AgentEvent::ActionsCompleted, &turn_id) {
+                last_error = Some(error);
             }
         }
 
@@ -787,7 +902,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         state_to: state.clone(),
         source_events: (evm_events as u32)
             .saturating_add(u32::try_from(staged_message_count).unwrap_or(u32::MAX)),
-        tool_call_count: u32::try_from(tool_calls.len()).unwrap_or(0),
+        tool_call_count: u32::try_from(all_tool_calls.len()).unwrap_or(0),
         input_summary: if has_external_input {
             format!(
                 "inbox:{}:evm:{}:{}",
@@ -800,7 +915,7 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
         error: last_error.clone(),
     };
 
-    stable::append_turn_record(&turn_record, &tool_calls);
+    stable::append_turn_record(&turn_record, &all_tool_calls);
     if last_error.is_none() {
         stable::set_evm_cursor(&next_cursor);
     }
@@ -1320,6 +1435,105 @@ mod tests {
                 .unwrap_or_default()
                 .contains("autonomy dedupe suppressed"),
             "inner dialogue should explain autonomous dedupe suppression"
+        );
+    }
+
+    #[test]
+    fn scheduled_turn_performs_continuation_inference_after_tool_execution() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "please continue after tool call".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok(), "continuation turn should succeed");
+
+        let outbox = stable::list_outbox_messages(10);
+        assert_eq!(outbox.len(), 1, "reply should be posted for staged input");
+        assert!(
+            outbox[0].body.contains("mocked continuation"),
+            "outbox should prefer continuation model text"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].tool_call_count >= 1,
+            "initial round should execute at least one tool"
+        );
+    }
+
+    #[test]
+    fn scheduled_turn_stops_continuation_when_max_rounds_reached() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_continuation_loop:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job_with_limits(2, u64::MAX));
+        assert!(
+            result.is_ok(),
+            "turn should stop at round cap without failing"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].tool_call_count, 2,
+            "two rounds should produce two executed tool calls"
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max inference rounds reached (2)"),
+            "inner dialogue should explain round-cap stop reason"
+        );
+    }
+
+    #[test]
+    fn continuation_inference_error_after_tools_is_degraded_success() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_continuation_error:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "continuation-stage inference errors after tool execution must degrade, not fail"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].error.is_none(),
+            "degraded continuation should not mark turn as failed"
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("continuation inference degraded after tool execution"),
+            "inner dialogue should capture degraded continuation reason"
+        );
+
+        let outbox = stable::list_outbox_messages(10);
+        assert_eq!(outbox.len(), 1, "reply should still be posted");
+        assert!(
+            outbox[0].body.contains("Tool results:"),
+            "fallback response should use deterministic tool summary"
         );
     }
 
