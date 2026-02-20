@@ -895,6 +895,87 @@ struct OpenRouterFunction {
     arguments: String,
 }
 
+enum OpenRouterToolArgsError {
+    JsonParse(String),
+    NotObject,
+}
+
+fn parse_relaxed_json_value(raw: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => Ok(value),
+        Err(primary_error) => match json5::from_str::<Value>(raw) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(primary_error.to_string()),
+        },
+    }
+}
+
+fn parse_openrouter_tool_args_candidate(raw: &str) -> Result<Value, OpenRouterToolArgsError> {
+    let parsed =
+        parse_relaxed_json_value(raw).map_err(OpenRouterToolArgsError::JsonParse)?;
+    match parsed {
+        Value::Object(_) => Ok(parsed),
+        Value::String(nested) => {
+            let nested_trimmed = nested.trim();
+            match parse_relaxed_json_value(nested_trimmed) {
+                Ok(nested_parsed) if matches!(nested_parsed, Value::Object(_)) => Ok(nested_parsed),
+                Ok(_) => Err(OpenRouterToolArgsError::NotObject),
+                Err(_) => Err(OpenRouterToolArgsError::NotObject),
+            }
+        }
+        _ => Err(OpenRouterToolArgsError::NotObject),
+    }
+}
+
+fn strip_markdown_code_fence(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+
+    let mut lines = trimmed.lines();
+    let opening = lines.next()?;
+    if !opening.trim_start().starts_with("```") {
+        return None;
+    }
+
+    let mut body = lines.collect::<Vec<_>>();
+    if body.last().map(|line| line.trim()) != Some("```") {
+        return None;
+    }
+    body.pop();
+    Some(body.join("\n"))
+}
+
+fn parse_openrouter_tool_arguments(arguments: &str) -> Result<Value, String> {
+    let mut candidates = vec![arguments.trim().to_string()];
+    if let Some(stripped) = strip_markdown_code_fence(arguments) {
+        let stripped_trimmed = stripped.trim().to_string();
+        if !stripped_trimmed.is_empty() && stripped_trimmed != candidates[0] {
+            candidates.push(stripped_trimmed);
+        }
+    }
+
+    let mut last_json_error: Option<String> = None;
+    let mut saw_non_object = false;
+    for candidate in candidates {
+        match parse_openrouter_tool_args_candidate(&candidate) {
+            Ok(parsed) => return Ok(parsed),
+            Err(OpenRouterToolArgsError::JsonParse(error)) => last_json_error = Some(error),
+            Err(OpenRouterToolArgsError::NotObject) => saw_non_object = true,
+        }
+    }
+
+    if saw_non_object {
+        return Err("openrouter tool arguments must be a JSON object".to_string());
+    }
+
+    Err(format!(
+        "openrouter tool arguments were invalid json: {}",
+        last_json_error.unwrap_or_else(|| "unknown parse error".to_string())
+    ))
+}
+
 fn parse_openrouter_completion(raw: &str) -> Result<InferenceOutput, String> {
     let response: OpenRouterResponse = serde_json::from_str(raw)
         .map_err(|error| format!("failed to parse openrouter response json: {error}"))?;
@@ -907,11 +988,7 @@ fn parse_openrouter_completion(raw: &str) -> Result<InferenceOutput, String> {
     let mut tool_calls = Vec::new();
     if let Some(calls) = first_choice.message.tool_calls.as_ref() {
         for tool_call in calls {
-            let parsed_arguments: Value = serde_json::from_str(&tool_call.function.arguments)
-                .map_err(|error| format!("openrouter tool arguments were invalid json: {error}"))?;
-            if !parsed_arguments.is_object() {
-                return Err("openrouter tool arguments must be a JSON object".to_string());
-            }
+            let parsed_arguments = parse_openrouter_tool_arguments(&tool_call.function.arguments)?;
 
             tool_calls.push(ToolCall {
                 tool: tool_call.function.name.clone(),
@@ -1063,6 +1140,58 @@ mod tests {
 
         let error = parse_openrouter_completion(payload).expect_err("must reject invalid args");
         assert!(error.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn parse_openrouter_completion_accepts_json5_style_arguments() {
+        let payload = r#"{
+            "choices": [
+                {
+                    "message": {
+                        "content": "calling tool",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "record_signal",
+                                    "arguments": "{signal: 'tick',}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let out = parse_openrouter_completion(payload).expect("json5 args should parse");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool, "record_signal");
+        assert_eq!(out.tool_calls[0].args_json, r#"{"signal":"tick"}"#);
+    }
+
+    #[test]
+    fn parse_openrouter_completion_accepts_nested_json_string_arguments() {
+        let payload = r#"{
+            "choices": [
+                {
+                    "message": {
+                        "content": "calling tool",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "record_signal",
+                                    "arguments": "\"{\\\"signal\\\":\\\"tick\\\"}\""
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let out = parse_openrouter_completion(payload).expect("nested json string should parse");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool, "record_signal");
+        assert_eq!(out.tool_calls[0].args_json, r#"{"signal":"tick"}"#);
     }
 
     #[test]
