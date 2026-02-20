@@ -15,3 +15,6 @@ target/
 
 # ingore the icp-cli cache
 .icp/cache/
+
+# ark index files
+.ark/

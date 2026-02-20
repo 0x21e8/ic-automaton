@@ -5,6 +5,7 @@ use crate::domain::cycle_admission::{
 use crate::domain::types::{
     InferenceInput, InferenceProvider, RuntimeSnapshot, SurvivalOperationClass, ToolCall,
 };
+use crate::prompt;
 use crate::storage::stable;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
@@ -16,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 const IC_LLM_CANISTER_ID: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
+const MOCK_LAYER_6_MARKER: &str = "phase5-layer6-marker";
+const MOCK_LAYER_6_UPDATE_CONTENT: &str =
+    "## Layer 6: Economic Decision Loop (Mutable Default)\n- phase5-layer6-marker";
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -94,10 +98,24 @@ pub struct MockInferenceAdapter;
 #[async_trait(?Send)]
 impl InferenceAdapter for MockInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
-        let tool_calls = if input.context_snippet.contains("sign") {
+        let explicit_sign_request = input.input.contains("request_sign_message:true")
+            || input.context_snippet.contains("request_sign_message:true");
+        let update_prompt_layer_request = input.input.contains("request_update_prompt_layer:true");
+        let layer_6_probe_request = input.input.contains("request_layer_6_probe:true");
+
+        let tool_calls = if explicit_sign_request {
             vec![ToolCall {
                 tool: "sign_message".to_string(),
                 args_json: r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#.to_string(),
+            }]
+        } else if update_prompt_layer_request {
+            vec![ToolCall {
+                tool: "update_prompt_layer".to_string(),
+                args_json: json!({
+                    "layer_id": 6,
+                    "content": MOCK_LAYER_6_UPDATE_CONTENT
+                })
+                .to_string(),
             }]
         } else {
             vec![ToolCall {
@@ -106,9 +124,20 @@ impl InferenceAdapter for MockInferenceAdapter {
             }]
         };
 
+        let explanation = if layer_6_probe_request {
+            let assembled = prompt::assemble_system_prompt(&input.context_snippet);
+            if assembled.contains(MOCK_LAYER_6_MARKER) {
+                "layer6_probe:present".to_string()
+            } else {
+                "layer6_probe:missing".to_string()
+            }
+        } else {
+            format!("mocked inference for {}", input.turn_id)
+        };
+
         Ok(InferenceOutput {
             tool_calls,
-            explanation: format!("mocked inference for {}", input.turn_id),
+            explanation,
         })
     }
 }
@@ -146,18 +175,7 @@ struct IcLlmRequest {
 impl InferenceAdapter for IcLlmInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
         let model = parse_ic_llm_model(&self.model)?;
-        let request = IcLlmRequest {
-            model: model.to_string(),
-            messages: vec![
-                IcLlmChatMessage::System {
-                    content: "You are an automaton that can only invoke known tools.".to_string(),
-                },
-                IcLlmChatMessage::User {
-                    content: format!("{}\n{}", input.input, input.context_snippet),
-                },
-            ],
-            tools: Some(ic_llm_tools()),
-        };
+        let request = build_ic_llm_request(input, model);
 
         log!(
             InferenceLogPriority::Info,
@@ -185,6 +203,21 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
             );
             error
         })
+    }
+}
+
+fn build_ic_llm_request(input: &InferenceInput, model: IcLlmModel) -> IcLlmRequest {
+    IcLlmRequest {
+        model: model.to_string(),
+        messages: vec![
+            IcLlmChatMessage::System {
+                content: prompt::assemble_system_prompt_compact(&input.context_snippet),
+            },
+            IcLlmChatMessage::User {
+                content: input.input.clone(),
+            },
+        ],
+        tools: Some(ic_llm_tools()),
     }
 }
 
@@ -340,6 +373,29 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     description: Some("HTTPS URL on an allowed domain.".to_string()),
                 }]),
                 required: Some(vec!["url".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "update_prompt_layer".to_string(),
+            description: Some(
+                "Update a mutable prompt layer (6-9). Immutable layers cannot be modified."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "integer".to_string(),
+                        name: "layer_id".to_string(),
+                        description: Some("Mutable layer id, must be between 6 and 9.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "content".to_string(),
+                        description: Some("Replacement markdown content.".to_string()),
+                    },
+                ]),
+                required: Some(vec!["layer_id".to_string(), "content".to_string()]),
             }),
         }),
     ]
@@ -666,11 +722,12 @@ fn parse_openrouter_http_response(response: HttpRequestResult) -> Result<Inferen
 }
 
 fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
+    let system_prompt = prompt::assemble_system_prompt(&input.context_snippet);
     json!({
         "model": model,
         "messages": [
-            { "role": "system", "content": "You are an automaton that can only invoke known tools." },
-            { "role": "user", "content": format!("{}\n{}", input.input, input.context_snippet) }
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": input.input }
         ],
         "tool_choice": "auto",
         "tools": [
@@ -785,6 +842,21 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
                         "required": ["url"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_prompt_layer",
+                    "description": "Update a mutable prompt layer (6-9). Immutable layers cannot be modified.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "layer_id": { "type": "integer" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["layer_id", "content"]
+                    }
+                }
             }
         ]
     })
@@ -864,6 +936,36 @@ fn nat_to_status_code(status: &Nat) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::types::SkillRecord;
+    use crate::storage::stable;
+    use std::future::Future;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
+        unsafe fn clone(_ptr: *const ()) -> RawWaker {
+            dummy_raw_waker()
+        }
+        unsafe fn wake(_ptr: *const ()) {}
+        unsafe fn wake_by_ref(_ptr: *const ()) {}
+        unsafe fn drop(_ptr: *const ()) {}
+
+        fn dummy_raw_waker() -> RawWaker {
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+
+        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+
+        for _ in 0..10_000 {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::hint::spin_loop(),
+            }
+        }
+        panic!("future did not complete in test polling loop");
+    }
 
     #[test]
     fn parses_ic_llm_models() {
@@ -1019,7 +1121,72 @@ mod tests {
     }
 
     #[test]
-    fn ic_llm_tools_include_agent_memory_tools() {
+    fn ic_llm_request_uses_compact_assembled_prompt_with_conversation_context() {
+        stable::init_storage();
+        stable::set_soul("compact-soul".to_string());
+        stable::upsert_skill(&SkillRecord {
+            name: "compact-skill".to_string(),
+            description: "compact".to_string(),
+            instructions: "Keep it short.".to_string(),
+            enabled: true,
+            mutable: true,
+        });
+        let input = InferenceInput {
+            input: "hello".to_string(),
+            context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xabc\n  [0xabc]: hi\n  [you]: hello".to_string(),
+            turn_id: "turn-compact".to_string(),
+        };
+
+        let request = build_ic_llm_request(&input, IcLlmModel::Llama3_1_8B);
+        assert_eq!(request.messages.len(), 2);
+        let IcLlmChatMessage::System { content } = &request.messages[0] else {
+            panic!("first message must be system");
+        };
+
+        assert!(content.contains("## Layer 0: Interpretation & Precedence"));
+        assert!(content.contains("## Layer 1: Constitution - Safety & Non-Harm"));
+        assert!(content.contains("## Layer 5: Operational Reality"));
+        assert!(content.contains("## Layer 10: Dynamic Context"));
+        assert!(content.contains("### Conversation with 0xabc"));
+        assert!(content.contains("compact-skill"));
+        assert!(!content.contains("## Layer 2: Survival Economics"));
+        assert!(!content.contains("## Layer 3: Identity & On-Chain Personhood"));
+        assert!(!content.contains("## Layer 6: Economic Decision Loop"));
+    }
+
+    #[test]
+    fn openrouter_request_body_uses_full_assembled_prompt_with_conversation_context() {
+        stable::init_storage();
+        stable::set_soul("full-soul".to_string());
+        let input = InferenceInput {
+            input: "hello".to_string(),
+            context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xdef\n  [0xdef]: ping\n  [you]: pong".to_string(),
+            turn_id: "turn-openrouter".to_string(),
+        };
+        let body = build_openrouter_request_body(&input, "openai/gpt-4o-mini");
+
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages array must exist");
+        let system_prompt = messages
+            .first()
+            .and_then(|value| value.get("content"))
+            .and_then(|value| value.as_str())
+            .expect("first message content must exist");
+
+        assert!(system_prompt.contains("## Layer 0: Interpretation & Precedence"));
+        assert!(system_prompt.contains("## Layer 1: Constitution - Safety & Non-Harm"));
+        assert!(system_prompt.contains("## Layer 2: Survival Economics"));
+        assert!(system_prompt.contains("## Layer 3: Identity & On-Chain Personhood"));
+        assert!(system_prompt.contains("full-soul"));
+        assert!(system_prompt.contains("## Layer 10: Dynamic Context"));
+        assert!(system_prompt.contains("### Conversation with 0xdef"));
+        assert!(system_prompt.contains("## Layer 6: Economic Decision Loop"));
+    }
+
+    #[test]
+    fn ic_llm_tools_include_agent_runtime_tools() {
         let names = ic_llm_tools()
             .into_iter()
             .map(|tool| match tool {
@@ -1032,10 +1199,11 @@ mod tests {
         assert!(names.contains(&"recall".to_string()));
         assert!(names.contains(&"forget".to_string()));
         assert!(names.contains(&"http_fetch".to_string()));
+        assert!(names.contains(&"update_prompt_layer".to_string()));
     }
 
     #[test]
-    fn openrouter_request_body_includes_agent_memory_tools() {
+    fn openrouter_request_body_includes_agent_runtime_tools() {
         let body = build_openrouter_request_body(
             &InferenceInput {
                 input: "hello".to_string(),
@@ -1061,5 +1229,39 @@ mod tests {
         assert!(names.contains(&"recall"));
         assert!(names.contains(&"forget"));
         assert!(names.contains(&"http_fetch"));
+        assert!(names.contains(&"update_prompt_layer"));
+    }
+
+    #[test]
+    fn mock_inference_layer_6_probe_reflects_prompt_layer_updates() {
+        stable::init_storage();
+        let adapter = MockInferenceAdapter;
+        let no_marker = InferenceInput {
+            input: "request_layer_6_probe:true".to_string(),
+            context_snippet: "ctx".to_string(),
+            turn_id: "turn-probe-1".to_string(),
+        };
+
+        let first =
+            block_on_with_spin(adapter.infer(&no_marker)).expect("mock inference should succeed");
+        assert_eq!(first.explanation, "layer6_probe:missing");
+
+        stable::save_prompt_layer(&crate::domain::types::PromptLayer {
+            layer_id: 6,
+            content: MOCK_LAYER_6_UPDATE_CONTENT.to_string(),
+            updated_at_ns: 1,
+            updated_by_turn: "test".to_string(),
+            version: 99,
+        })
+        .expect("layer save should succeed");
+
+        let with_marker = InferenceInput {
+            input: "request_layer_6_probe:true".to_string(),
+            context_snippet: "ctx".to_string(),
+            turn_id: "turn-probe-2".to_string(),
+        };
+        let second =
+            block_on_with_spin(adapter.infer(&with_marker)).expect("mock inference should succeed");
+        assert_eq!(second.explanation, "layer6_probe:present");
     }
 }

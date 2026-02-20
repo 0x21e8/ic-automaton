@@ -189,6 +189,16 @@ pub struct PromptLayer {
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PromptLayerView {
+    pub layer_id: u8,
+    pub is_mutable: bool,
+    pub content: String,
+    pub updated_at_ns: Option<u64>,
+    pub updated_by_turn: Option<String>,
+    pub version: Option<u32>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ConversationEntry {
     pub inbox_message_id: String,
     pub sender_body: String,
@@ -202,6 +212,13 @@ pub struct ConversationLog {
     pub sender: String,
     pub entries: Vec<ConversationEntry>,
     pub last_activity_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub sender: String,
+    pub last_activity_ns: u64,
+    pub entry_count: u32,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]

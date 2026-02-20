@@ -433,25 +433,25 @@ The inference adapter selects compact vs. full based on the provider:
 
 ### Phase 4: Inference Integration
 
-- [ ] **4.1** Update `IcLlmInferenceAdapter::infer()` to use `assemble_system_prompt()`
-- [ ] **4.2** Update OpenRouter request builder to use `assemble_system_prompt()`
-- [ ] **4.3** Implement compact mode for IcLlm provider (Layers 0,1,5,10 only; conversation history limited to 2 entries/sender)
-- [ ] **4.4** Inject active skills into Layer 5 section
-- [ ] **4.5** Wire `soul` field into Layer 3 identity section
-- [ ] **4.6** Integration test: verify assembled prompt reaches inference adapter with conversation context
+- [x] **4.1** Update `IcLlmInferenceAdapter::infer()` to use `assemble_system_prompt()`
+- [x] **4.2** Update OpenRouter request builder to use `assemble_system_prompt()`
+- [x] **4.3** Implement compact mode for IcLlm provider (Layers 0,1,5,10 only; conversation history limited to 2 entries/sender)
+- [x] **4.4** Inject active skills into Layer 5 section
+- [x] **4.5** Wire `soul` field into Layer 3 identity section
+- [x] **4.6** Integration test: verify assembled prompt reaches inference adapter with conversation context
 
 ### Phase 5: Mutable Layer Tool + API
 
-- [ ] **5.1** Implement `update_prompt_layer` tool in `tools.rs`
-- [ ] **5.2** Add tool policy (ExecutingActions only, max 1/turn, layers 6–9 only)
-- [ ] **5.3** Add content validation (size limit, anti-override keywords)
-- [ ] **5.4** Add tool schema to IcLlm and OpenRouter tool definitions
-- [ ] **5.5** Expose `get_prompt_layers` query endpoint in `lib.rs`
-- [ ] **5.6** Expose `update_prompt_layer_admin` update endpoint (controller-only)
-- [ ] **5.7** Expose `list_conversations` query endpoint (returns sender addresses + last activity)
-- [ ] **5.8** Expose `get_conversation(sender)` query endpoint (returns full log for a sender)
-- [ ] **5.9** Unit tests: tool execution, validation, rejection of immutable layer writes
-- [ ] **5.10** PocketIC integration test: agent modifies Layer 6, next turn uses updated prompt
+- [x] **5.1** Implement `update_prompt_layer` tool in `tools.rs`
+- [x] **5.2** Add tool policy (ExecutingActions only, max 1/turn, layers 6–9 only)
+- [x] **5.3** Add content validation (size limit, anti-override keywords)
+- [x] **5.4** Add tool schema to IcLlm and OpenRouter tool definitions
+- [x] **5.5** Expose `get_prompt_layers` query endpoint in `lib.rs`
+- [x] **5.6** Expose `update_prompt_layer_admin` update endpoint (controller-only)
+- [x] **5.7** Expose `list_conversations` query endpoint (returns sender addresses + last activity)
+- [x] **5.8** Expose `get_conversation(sender)` query endpoint (returns full log for a sender)
+- [x] **5.9** Unit tests: tool execution, validation, rejection of immutable layer writes
+- [x] **5.10** PocketIC integration test: agent modifies Layer 6, next turn uses updated prompt
 
 ### Phase 6: Observability & UI
 

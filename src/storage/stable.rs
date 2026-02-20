@@ -1,10 +1,10 @@
 use crate::domain::types::{
-    AgentEvent, AgentState, ConversationEntry, ConversationLog, EvmPollCursor, InboxMessage,
-    InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider, JobStatus, MemoryFact,
-    ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
-    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
-    TransitionLogRecord, TurnRecord,
+    AgentEvent, AgentState, ConversationEntry, ConversationLog, ConversationSummary, EvmPollCursor,
+    InboxMessage, InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider,
+    JobStatus, MemoryFact, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer,
+    PromptLayerView, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime,
+    SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
+    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -367,6 +367,53 @@ pub fn save_prompt_layer(layer: &PromptLayer) -> Result<(), String> {
     Ok(())
 }
 
+pub fn list_prompt_layers() -> Vec<PromptLayerView> {
+    let mut layers = Vec::with_capacity(
+        usize::from(prompt::IMMUTABLE_LAYER_MAX_ID - prompt::IMMUTABLE_LAYER_MIN_ID + 1)
+            + usize::from(prompt::MUTABLE_LAYER_MAX_ID - prompt::MUTABLE_LAYER_MIN_ID + 1),
+    );
+
+    for layer_id in prompt::IMMUTABLE_LAYER_MIN_ID..=prompt::IMMUTABLE_LAYER_MAX_ID {
+        if let Some(content) = prompt::immutable_layer_content(layer_id) {
+            layers.push(PromptLayerView {
+                layer_id,
+                is_mutable: false,
+                content: content.to_string(),
+                updated_at_ns: None,
+                updated_by_turn: None,
+                version: None,
+            });
+        }
+    }
+
+    for layer_id in prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID {
+        if let Some(layer) = get_prompt_layer(layer_id) {
+            layers.push(PromptLayerView {
+                layer_id,
+                is_mutable: true,
+                content: layer.content,
+                updated_at_ns: Some(layer.updated_at_ns),
+                updated_by_turn: Some(layer.updated_by_turn),
+                version: Some(layer.version),
+            });
+            continue;
+        }
+
+        layers.push(PromptLayerView {
+            layer_id,
+            is_mutable: true,
+            content: prompt::default_layer_content(layer_id)
+                .unwrap_or_default()
+                .to_string(),
+            updated_at_ns: None,
+            updated_by_turn: None,
+            version: None,
+        });
+    }
+
+    layers
+}
+
 pub fn append_conversation_entry(sender: &str, mut entry: ConversationEntry) {
     let sender_key = normalize_conversation_sender(sender);
     if sender_key.is_empty() {
@@ -406,6 +453,28 @@ pub fn get_conversation_log(sender: &str) -> Option<ConversationLog> {
     CONVERSATION_MAP
         .with(|map| map.borrow().get(&sender_key))
         .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn list_conversation_summaries() -> Vec<ConversationSummary> {
+    let mut summaries = CONVERSATION_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<ConversationLog>(Some(entry.value().as_slice())))
+            .map(|log| ConversationSummary {
+                sender: log.sender,
+                last_activity_ns: log.last_activity_ns,
+                entry_count: u32::try_from(log.entries.len()).unwrap_or(u32::MAX),
+            })
+            .collect::<Vec<_>>()
+    });
+
+    summaries.sort_by(|left, right| {
+        right
+            .last_activity_ns
+            .cmp(&left.last_activity_ns)
+            .then_with(|| left.sender.cmp(&right.sender))
+    });
+    summaries
 }
 
 pub fn runtime_snapshot() -> RuntimeSnapshot {
@@ -1956,6 +2025,24 @@ mod tests {
     }
 
     #[test]
+    fn list_prompt_layers_includes_immutable_and_mutable_layers() {
+        init_storage();
+        let layers = list_prompt_layers();
+        assert_eq!(layers.len(), 10);
+        assert_eq!(layers[0].layer_id, 0);
+        assert!(!layers[0].is_mutable);
+        assert!(layers[0].content.contains("Layer 0"));
+
+        let layer_6 = layers
+            .iter()
+            .find(|layer| layer.layer_id == 6)
+            .expect("layer 6 must exist");
+        assert!(layer_6.is_mutable);
+        assert!(layer_6.updated_by_turn.is_some());
+        assert!(layer_6.version.is_some());
+    }
+
+    #[test]
     fn pop_next_pending_job_obeys_queue_order() {
         let lane = TaskLane::Mutating;
 
@@ -2237,6 +2324,42 @@ mod tests {
             get_conversation_log(&newest_sender).is_some(),
             "newest sender should be retained"
         );
+    }
+
+    #[test]
+    fn list_conversation_summaries_orders_by_last_activity_desc() {
+        init_storage();
+        clear_conversation_map();
+        let sender_a = sender_for(10);
+        let sender_b = sender_for(11);
+
+        append_conversation_entry(
+            &sender_a,
+            ConversationEntry {
+                inbox_message_id: "inbox:a".to_string(),
+                sender_body: "hello".to_string(),
+                agent_reply: "reply".to_string(),
+                turn_id: "turn-a".to_string(),
+                timestamp_ns: 10,
+            },
+        );
+        append_conversation_entry(
+            &sender_b,
+            ConversationEntry {
+                inbox_message_id: "inbox:b".to_string(),
+                sender_body: "hello".to_string(),
+                agent_reply: "reply".to_string(),
+                turn_id: "turn-b".to_string(),
+                timestamp_ns: 20,
+            },
+        );
+
+        let summaries = list_conversation_summaries();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].sender, sender_b);
+        assert_eq!(summaries[0].last_activity_ns, 20);
+        assert_eq!(summaries[0].entry_count, 1);
+        assert_eq!(summaries[1].sender, sender_a);
     }
 
     #[test]
