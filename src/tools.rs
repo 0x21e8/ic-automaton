@@ -2,6 +2,7 @@ use crate::domain::types::{
     AgentState, MemoryFact, SurvivalOperationClass, ToolCall, ToolCallRecord,
 };
 use crate::features::evm::{evm_read_tool, send_eth_tool};
+use crate::features::http_fetch::http_fetch_tool;
 use crate::storage::stable;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -131,6 +132,14 @@ impl ToolManager {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
                 max_calls_per_turn: 5,
+            },
+        );
+        policies.insert(
+            "http_fetch".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+                max_calls_per_turn: 2,
             },
         );
 
@@ -291,6 +300,7 @@ impl ToolManager {
                 "remember" => remember_fact_tool(&call.args_json, turn_id),
                 "recall" => recall_facts_tool(&call.args_json),
                 "forget" => forget_fact_tool(&call.args_json),
+                "http_fetch" => http_fetch_tool(&call.args_json).await,
                 "evm_read" => {
                     let now_ns = current_time_ns();
                     if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns)
@@ -800,5 +810,37 @@ mod tests {
         assert!(records[1].success);
         assert!(records[2].success);
         assert_eq!(records[2].output, "no facts found");
+    }
+
+    #[test]
+    fn http_fetch_tool_requires_allowlisted_domain() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.coingecko.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![
+            ToolCall {
+                tool: "http_fetch".to_string(),
+                args_json: r#"{"url":"https://api.coingecko.com/api/v3/ping"}"#.to_string(),
+            },
+            ToolCall {
+                tool: "http_fetch".to_string(),
+                args_json: r#"{"url":"https://example.com/forbidden"}"#.to_string(),
+            },
+        ];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 2);
+        assert!(records[0].success);
+        assert!(records[0].output.contains("stub"));
+        assert!(!records[1].success);
+        assert!(records[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("domain not in allowlist"));
     }
 }

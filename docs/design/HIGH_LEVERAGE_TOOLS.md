@@ -1121,11 +1121,11 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 - [x] 4c. Add memory context injection in `agent.rs`
 - [x] 4d. Add memory tools to inference tool schemas
 
-[ ] Phase 5: HTTP fetch (gives the agent broader awareness)
-- [ ] 5a. Add `HTTP_DOMAIN_ALLOWLIST_MAP` to stable storage (`MemoryId::new(17)`)
-- [ ] 5b. Implement `http_fetch` tool with domain validation
-- [ ] 5c. Add `set_http_allowed_domains` update method
-- [ ] 5d. Add `http_fetch` to inference tool schemas
+[x] Phase 5: HTTP fetch (gives the agent broader awareness)
+- [x] 5a. Add `HTTP_DOMAIN_ALLOWLIST_MAP` to stable storage (`MemoryId::new(17)`)
+- [x] 5b. Implement `http_fetch` tool with domain validation
+- [x] 5c. Add `set_http_allowed_domains` update method
+- [x] 5d. Add `http_fetch` to inference tool schemas
 
 Each phase is independently deployable. Phase 1 is the only one that requires a structural refactor (async traits). Phases 2–5 are additive.
 

@@ -329,6 +329,19 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["key".to_string()]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "http_fetch".to_string(),
+            description: Some("Fetch text from an allowlisted HTTPS URL via GET.".to_string()),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "url".to_string(),
+                    description: Some("HTTPS URL on an allowed domain.".to_string()),
+                }]),
+                required: Some(vec!["url".to_string()]),
+            }),
+        }),
     ]
 }
 
@@ -758,6 +771,20 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
                         "required": ["key"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "http_fetch",
+                    "description": "Fetch text from an allowlisted HTTPS URL via GET.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": { "type": "string" }
+                        },
+                        "required": ["url"]
+                    }
+                }
             }
         ]
     })
@@ -1004,6 +1031,7 @@ mod tests {
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"recall".to_string()));
         assert!(names.contains(&"forget".to_string()));
+        assert!(names.contains(&"http_fetch".to_string()));
     }
 
     #[test]
@@ -1032,5 +1060,6 @@ mod tests {
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"recall"));
         assert!(names.contains(&"forget"));
+        assert!(names.contains(&"http_fetch"));
     }
 }
