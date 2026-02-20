@@ -165,7 +165,7 @@ Required impact response:
       - Validation: `cargo test -q openrouter_request_body_uses_full_assembled_prompt_with_conversation_context` and new continuation-request unit tests
       - Notes: Keep system prompt + dynamic context on round 0; append assistant/tool messages for subsequent rounds.
 
-- [ ] **Task 3: Refactor agent loop into bounded multi-round infer/execute/continue cycle**
+- [x] **Task 3: Refactor agent loop into bounded multi-round infer/execute/continue cycle**
       - Files: `src/agent.rs`, `src/tools.rs`
       - Validation: `cargo test -q no_input_turn_runs_autonomous_inference_and_records_inner_dialogue` and new continuation loop tests
       - Notes: Implement max rounds/time guards and degraded continuation fallback behavior.

@@ -6,7 +6,9 @@ pub mod skills;
 pub mod threshold_signer;
 
 pub use evm::{EvmPoller, HttpEvmPoller, MockEvmPoller};
-pub use inference::infer_with_provider;
+pub use inference::{
+    infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
+};
 pub use signer::MockSignerAdapter;
 pub use skills::MockSkillLoader;
 #[cfg(target_arch = "wasm32")]
