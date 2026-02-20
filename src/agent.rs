@@ -1,18 +1,19 @@
 use crate::domain::state_machine;
-use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{
-    AgentEvent, AgentState, ConversationEntry, InboxMessage, InferenceInput, InferenceProvider,
-    MemoryFact, ToolCall, ToolCallRecord, TurnRecord,
+    AgentEvent, AgentState, ContinuationStopReason, ConversationEntry, InboxMessage,
+    InferenceInput, InferenceProvider, MemoryFact, ToolCall, ToolCallRecord, TurnRecord,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
-    infer_with_provider, infer_with_provider_transcript, EvmPoller, HttpEvmPoller,
-    InferenceTranscriptMessage, MockEvmPoller, MockSignerAdapter,
+    infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
+    MockSignerAdapter,
 };
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
 use alloy_primitives::U256;
+use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeSet;
 
@@ -20,7 +21,22 @@ const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60 * 60;
 const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
 const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 3;
 const MAX_AGENT_TURN_DURATION_NS: u64 = 90 * 1_000_000_000;
+const MAX_TOOL_CALLS_PER_TURN: usize = 12;
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, LogPriorityLevels)]
+enum AgentLogPriority {
+    #[log_level(capacity = 2000, name = "AGENT_INFO")]
+    Info,
+    #[log_level(capacity = 500, name = "AGENT_ERROR")]
+    Error,
+}
+
+impl GetLogFilter for AgentLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -330,6 +346,28 @@ fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
     }
 }
 
+fn current_turn_goal_and_why(staged_message_count: usize, evm_events: usize) -> (String, String) {
+    if staged_message_count > 0 {
+        return (
+            format!("respond to {staged_message_count} staged inbox message(s)"),
+            "new external inbox input is waiting and requires a response".to_string(),
+        );
+    }
+
+    if evm_events > 0 {
+        return (
+            format!("process {evm_events} newly observed EVM event(s)"),
+            "new chain activity was detected during the latest poll".to_string(),
+        );
+    }
+
+    (
+        "run an autonomy tick and execute useful low-risk maintenance work".to_string(),
+        "the scheduler fired with no external input, so proactive autonomous work is allowed"
+            .to_string(),
+    )
+}
+
 fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String {
     let unique_senders = staged_messages
         .iter()
@@ -557,13 +595,31 @@ fn record_conversation_entries(
 }
 
 pub async fn run_scheduled_turn_job() -> Result<(), String> {
-    run_scheduled_turn_job_with_limits(MAX_INFERENCE_ROUNDS_PER_TURN, MAX_AGENT_TURN_DURATION_NS)
-        .await
+    run_scheduled_turn_job_with_limits_and_tool_cap(
+        MAX_INFERENCE_ROUNDS_PER_TURN,
+        MAX_AGENT_TURN_DURATION_NS,
+        MAX_TOOL_CALLS_PER_TURN,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn run_scheduled_turn_job_with_limits(
     max_inference_rounds: usize,
     max_turn_duration_ns: u64,
+) -> Result<(), String> {
+    run_scheduled_turn_job_with_limits_and_tool_cap(
+        max_inference_rounds,
+        max_turn_duration_ns,
+        MAX_TOOL_CALLS_PER_TURN,
+    )
+    .await
+}
+
+async fn run_scheduled_turn_job_with_limits_and_tool_cap(
+    max_inference_rounds: usize,
+    max_turn_duration_ns: u64,
+    max_tool_calls_per_turn: usize,
 ) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
     if !snapshot.loop_enabled || snapshot.turn_in_flight {
@@ -590,6 +646,8 @@ async fn run_scheduled_turn_job_with_limits(
     let mut all_tool_calls = Vec::new();
     let mut assistant_reply: Option<String> = None;
     let mut inner_dialogue: Option<String> = None;
+    let mut inference_round_count = 0usize;
+    let mut continuation_stop_reason = ContinuationStopReason::None;
 
     if let Err(error) = advance_state(&mut state, &AgentEvent::TimerTick, &turn_id) {
         let _ = advance_state(
@@ -610,44 +668,9 @@ async fn run_scheduled_turn_job_with_limits(
         .collect::<Vec<_>>();
     let staged_message_count = staged_messages.len();
 
-    let can_poll =
-        stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, started_at_ns);
-    let poll = if can_poll {
-        if snapshot.evm_rpc_url.trim().is_empty() {
-            Some(MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor).await)
-        } else {
-            Some(match HttpEvmPoller::from_snapshot(&snapshot) {
-                Ok(poller) => poller.poll(&snapshot.evm_cursor).await,
-                Err(error) => Err(error),
-            })
-        }
-    } else {
-        None
-    };
-    let (next_cursor, evm_events) = match poll {
-        Some(Ok(poll)) => {
-            stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
-            (poll.cursor, poll.events.len())
-        }
-        Some(Err(reason)) => {
-            stable::record_survival_operation_failure(
-                &SurvivalOperationClass::EvmPoll,
-                started_at_ns,
-                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
-            );
-            let _ = advance_state(
-                &mut state,
-                &AgentEvent::TurnFailed {
-                    reason: reason.clone(),
-                },
-                &turn_id,
-            );
-            stable::complete_turn(AgentState::Faulted, Some(reason.clone()));
-            return Err(reason);
-        }
-        None => (snapshot.evm_cursor.clone(), 0),
-    };
-    let has_external_input = evm_events > 0 || staged_message_count > 0;
+    let next_cursor = snapshot.evm_cursor.clone();
+    let evm_events = 0usize;
+    let has_external_input = staged_message_count > 0;
     let should_infer = true;
 
     if let Err(reason) = advance_state(
@@ -664,6 +687,9 @@ async fn run_scheduled_turn_job_with_limits(
     }
 
     if should_infer {
+        let (goal, why) = current_turn_goal_and_why(staged_message_count, evm_events);
+        append_inner_dialogue(&mut inner_dialogue, &format!("goal: {goal}\nwhy: {why}"));
+
         let inbox_preview = staged_messages
             .iter()
             .map(|message| message.body.as_str())
@@ -704,7 +730,6 @@ async fn run_scheduled_turn_job_with_limits(
 
         let mut manager = ToolManager::new();
         let mut transcript = Vec::<InferenceTranscriptMessage>::new();
-        let mut inference_round_count = 0usize;
         let mut inference_completed = false;
         let mut executed_any_tool = false;
 
@@ -715,6 +740,16 @@ async fn run_scheduled_turn_job_with_limits(
                     &format!(
                         "continuation stopped: max inference rounds reached ({max_inference_rounds})"
                     ),
+                );
+                continuation_stop_reason = ContinuationStopReason::MaxRounds;
+                log!(
+                    AgentLogPriority::Info,
+                    "turn={} continuation_stop reason=max_rounds rounds={} max_rounds={} max_duration_ms={} tool_calls_so_far={}",
+                    turn_id,
+                    inference_round_count,
+                    max_inference_rounds,
+                    max_turn_duration_ns / 1_000_000,
+                    all_tool_calls.len(),
                 );
                 break;
             }
@@ -727,6 +762,16 @@ async fn run_scheduled_turn_job_with_limits(
                         "continuation stopped: max turn duration reached ({} ms)",
                         max_turn_duration_ns / 1_000_000
                     ),
+                );
+                continuation_stop_reason = ContinuationStopReason::MaxDuration;
+                log!(
+                    AgentLogPriority::Info,
+                    "turn={} continuation_stop reason=max_duration rounds={} elapsed_ms={} max_duration_ms={} tool_calls_so_far={}",
+                    turn_id,
+                    inference_round_count,
+                    elapsed_ns / 1_000_000,
+                    max_turn_duration_ns / 1_000_000,
+                    all_tool_calls.len(),
                 );
                 break;
             }
@@ -767,6 +812,15 @@ async fn run_scheduled_turn_job_with_limits(
                                 "continuation inference degraded after tool execution: {reason}"
                             ),
                         );
+                        continuation_stop_reason = ContinuationStopReason::InferenceError;
+                        log!(
+                            AgentLogPriority::Error,
+                            "turn={} continuation_stop reason=inference_error rounds={} tool_calls_so_far={} error={}",
+                            turn_id,
+                            inference_round_count,
+                            all_tool_calls.len(),
+                            reason,
+                        );
                     } else {
                         last_error = Some(reason);
                     }
@@ -790,8 +844,40 @@ async fn run_scheduled_turn_job_with_limits(
                 inference_completed = true;
             }
 
-            let planned_tool_calls =
+            let mut planned_tool_calls =
                 normalize_tool_call_ids(inference.tool_calls, inference_round_count - 1);
+            if !planned_tool_calls.is_empty() {
+                let remaining_tool_budget =
+                    max_tool_calls_per_turn.saturating_sub(all_tool_calls.len());
+                if remaining_tool_budget == 0 {
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        &format!(
+                            "continuation stopped: max tool calls reached ({max_tool_calls_per_turn})"
+                        ),
+                    );
+                    continuation_stop_reason = ContinuationStopReason::MaxToolCalls;
+                    log!(
+                        AgentLogPriority::Info,
+                        "turn={} continuation_stop reason=max_tool_calls rounds={} max_tool_calls={} elapsed_ms={}",
+                        turn_id,
+                        inference_round_count,
+                        max_tool_calls_per_turn,
+                        elapsed_ns / 1_000_000,
+                    );
+                    break;
+                }
+                if planned_tool_calls.len() > remaining_tool_budget {
+                    planned_tool_calls.truncate(remaining_tool_budget);
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        &format!(
+                            "continuation limited: truncated tool calls to remaining cap {} of {}",
+                            remaining_tool_budget, max_tool_calls_per_turn
+                        ),
+                    );
+                }
+            }
             let mut executable_tool_calls = planned_tool_calls.clone();
             let mut suppressed_autonomy_calls = Vec::new();
             if inference_round_count == 1 && !has_external_input {
@@ -994,6 +1080,8 @@ async fn run_scheduled_turn_job_with_limits(
             "autonomy:no-input".to_string()
         },
         inner_dialogue,
+        inference_round_count: u32::try_from(inference_round_count).unwrap_or(u32::MAX),
+        continuation_stop_reason,
         error: last_error.clone(),
     };
 
@@ -1003,6 +1091,17 @@ async fn run_scheduled_turn_job_with_limits(
     }
 
     stable::complete_turn(state, last_error.clone());
+    log!(
+        AgentLogPriority::Info,
+        "turn={} completed state={:?} error_present={} inference_round_count={} continuation_stop_reason={:?} tool_calls={} duration_ms={}",
+        turn_id,
+        turn_record.state_to,
+        turn_record.error.is_some(),
+        turn_record.inference_round_count,
+        turn_record.continuation_stop_reason,
+        all_tool_calls.len(),
+        current_time_ns().saturating_sub(started_at_ns) / 1_000_000,
+    );
     if let Some(reason) = last_error {
         return Err(reason);
     }
@@ -1025,7 +1124,8 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        InboxMessageStatus, MemoryFact, RuntimeSnapshot, SurvivalTier, ToolCall, ToolCallRecord,
+        ContinuationStopReason, InboxMessageStatus, MemoryFact, RuntimeSnapshot, SurvivalTier,
+        ToolCall, ToolCallRecord,
     };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -1484,6 +1584,20 @@ mod tests {
             turn.inner_dialogue
                 .as_deref()
                 .unwrap_or_default()
+                .contains("goal: run an autonomy tick"),
+            "inner dialogue should include autonomous turn goal"
+        );
+        assert!(
+            turn.inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("why: the scheduler fired with no external input"),
+            "inner dialogue should include autonomous turn rationale"
+        );
+        assert!(
+            turn.inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
                 .contains("Tool results"),
             "inner dialogue should include tool execution summary"
         );
@@ -1590,6 +1704,22 @@ mod tests {
             turns[0].tool_call_count >= 1,
             "initial round should execute at least one tool"
         );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("goal: respond to 1 staged inbox message(s)"),
+            "inner dialogue should include inbox-driven turn goal"
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("why: new external inbox input is waiting"),
+            "inner dialogue should include inbox-driven rationale"
+        );
     }
 
     #[test]
@@ -1622,6 +1752,88 @@ mod tests {
                 .contains("max inference rounds reached (2)"),
             "inner dialogue should explain round-cap stop reason"
         );
+        assert_eq!(turns[0].inference_round_count, 2);
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::MaxRounds
+        );
+    }
+
+    #[test]
+    fn scheduled_turn_stops_continuation_when_max_duration_reached() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_continuation_loop:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job_with_limits(5, 0));
+        assert!(
+            result.is_ok(),
+            "turn should stop at duration cap without failing"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].tool_call_count, 0,
+            "duration cap hit before first inference should avoid executing tools"
+        );
+        assert_eq!(turns[0].inference_round_count, 0);
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::MaxDuration
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max turn duration reached (0 ms)"),
+            "inner dialogue should explain duration-cap stop reason"
+        );
+    }
+
+    #[test]
+    fn scheduled_turn_stops_continuation_when_max_tool_calls_reached() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_continuation_loop:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job_with_limits_and_tool_cap(
+            10,
+            u64::MAX,
+            1,
+        ));
+        assert!(
+            result.is_ok(),
+            "turn should stop at per-turn tool call cap without failing"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].tool_call_count, 1,
+            "tool call cap should prevent additional round executions"
+        );
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::MaxToolCalls
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max tool calls reached (1)"),
+            "inner dialogue should explain tool-call cap stop reason"
+        );
     }
 
     #[test]
@@ -1653,6 +1865,11 @@ mod tests {
                 .unwrap_or_default()
                 .contains("continuation inference degraded after tool execution"),
             "inner dialogue should capture degraded continuation reason"
+        );
+        assert_eq!(turns[0].inference_round_count, 2);
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::InferenceError
         );
 
         let outbox = stable::list_outbox_messages(10);
