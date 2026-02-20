@@ -2,7 +2,7 @@ use crate::domain::state_machine;
 use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{
     AgentEvent, AgentState, ConversationEntry, InboxMessage, InferenceInput, InferenceProvider,
-    MemoryFact, TurnRecord,
+    MemoryFact, ToolCallRecord, TurnRecord,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
@@ -11,6 +11,7 @@ use crate::features::{
 };
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
+use alloy_primitives::U256;
 use std::collections::BTreeSet;
 
 fn current_time_ns() -> u64 {
@@ -55,6 +56,91 @@ fn sanitize_preview(text: &str, max_chars: usize) -> String {
     let mut out = compact.chars().take(max_chars).collect::<String>();
     out.push_str("...");
     out
+}
+
+fn parse_hex_quantity_u256(raw: &str) -> Option<U256> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("0x") {
+        return None;
+    }
+    let digits = trimmed.trim_start_matches("0x");
+    if digits.is_empty() {
+        return Some(U256::ZERO);
+    }
+    U256::from_str_radix(digits, 16).ok()
+}
+
+fn format_wei_as_eth(wei: U256) -> String {
+    let one_eth = U256::from(1_000_000_000_000_000_000u128);
+    let whole = wei / one_eth;
+    let remainder = wei % one_eth;
+    if remainder.is_zero() {
+        return whole.to_string();
+    }
+
+    let mut frac = format!("{:018}", remainder);
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    format!("{whole}.{frac}")
+}
+
+fn summarize_eth_balance_call(call: &ToolCallRecord) -> Option<String> {
+    if !call.success || call.tool != "evm_read" {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(&call.args_json).ok()?;
+    let method = args.get("method")?.as_str()?;
+    if method != "eth_getBalance" {
+        return None;
+    }
+
+    let address = args
+        .get("address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let balance_hex = call.output.trim();
+    let balance_wei = parse_hex_quantity_u256(balance_hex)?;
+    let balance_eth = format_wei_as_eth(balance_wei);
+    Some(format!(
+        "balance `{address}` = `{balance_hex}` wei ({balance_eth} ETH)"
+    ))
+}
+
+fn summarize_tool_call(call: &ToolCallRecord) -> String {
+    if call.success {
+        if let Some(balance_summary) = summarize_eth_balance_call(call) {
+            return balance_summary;
+        }
+        let output = sanitize_preview(call.output.trim(), 220);
+        if output.is_empty() {
+            return format!("`{}`: ok", call.tool);
+        }
+        return format!("`{}`: {}", call.tool, output);
+    }
+
+    let reason = call
+        .error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(call.output.as_str());
+    format!("`{}` failed: {}", call.tool, sanitize_preview(reason, 220))
+}
+
+fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    let succeeded = tool_calls.iter().filter(|call| call.success).count();
+    let failed = tool_calls.len().saturating_sub(succeeded);
+    let mut lines = vec![format!(
+        "Tool results: {succeeded} succeeded, {failed} failed."
+    )];
+    for call in tool_calls {
+        lines.push(format!("- {}", summarize_tool_call(call)));
+    }
+    Some(lines.join("\n"))
 }
 
 fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String {
@@ -410,6 +496,9 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
                     tool_calls = manager
                         .execute_actions(&state, &inference.tool_calls, signer.as_ref(), &turn_id)
                         .await;
+                    if let Some(tool_results_reply) = render_tool_results_reply(&tool_calls) {
+                        assistant_reply = Some(tool_results_reply);
+                    }
 
                     if tool_calls.iter().any(|record| !record.success) {
                         last_error = Some("tool execution reported failures".to_string());
@@ -586,6 +675,53 @@ mod tests {
             staged_at_ns: Some(1),
             consumed_at_ns: None,
         }
+    }
+
+    #[test]
+    fn render_tool_results_reply_formats_eth_get_balance_result() {
+        let calls = vec![ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "evm_read".to_string(),
+            args_json:
+                r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
+                    .to_string(),
+            output: "0xde0b6b3a7640000".to_string(),
+            success: true,
+            error: None,
+        }];
+
+        let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
+        assert!(reply.contains("Tool results: 1 succeeded, 0 failed."));
+        assert!(reply.contains("balance `0x1111111111111111111111111111111111111111`"));
+        assert!(reply.contains("0xde0b6b3a7640000"));
+        assert!(reply.contains("1 ETH"));
+    }
+
+    #[test]
+    fn render_tool_results_reply_summarizes_generic_success_and_failures() {
+        let calls = vec![
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "remember".to_string(),
+                args_json: r#"{"key":"k","value":"v"}"#.to_string(),
+                output: "stored".to_string(),
+                success: true,
+                error: None,
+            },
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "evm_read".to_string(),
+                args_json: r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111","calldata":"0x1234"}"#.to_string(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                error: Some("rpc timeout".to_string()),
+            },
+        ];
+
+        let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
+        assert!(reply.contains("Tool results: 1 succeeded, 1 failed."));
+        assert!(reply.contains("`remember`: stored"));
+        assert!(reply.contains("`evm_read` failed: rpc timeout"));
     }
 
     #[test]
