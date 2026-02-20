@@ -175,7 +175,7 @@ Required impact response:
       - Validation: new unit test asserting suppressed autonomy calls still generate tool outputs consumable by continuation
       - Notes: Use synthetic “skipped due to freshness dedupe” tool records when suppression applies.
 
-- [ ] **Task 5: Apply scheduler safeguards for longer AgentTurn jobs**
+- [x] **Task 5: Apply scheduler safeguards for longer AgentTurn jobs**
       - Files: `src/scheduler.rs`, `tests/pocketic_scheduler_queue.rs`
       - Validation: `cargo test -q refresh_due_jobs_advances_single_interval_once` and new lease-duration regression coverage
       - Notes: Increase `AgentTurn` lease TTL to 240s; keep serial dispatch model unchanged.

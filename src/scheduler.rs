@@ -310,7 +310,7 @@ fn operation_class_for_task(kind: &TaskKind) -> Option<SurvivalOperationClass> {
 
 fn lease_ttl_ns(kind: &TaskKind) -> u64 {
     match kind {
-        TaskKind::AgentTurn => 120_000_000_000,
+        TaskKind::AgentTurn => 240_000_000_000,
         TaskKind::PollInbox => 60_000_000_000,
         TaskKind::CheckCycles => 60_000_000_000,
         TaskKind::Reconcile => 60_000_000_000,
@@ -557,6 +557,14 @@ mod tests {
         );
         assert_eq!(operation_class_for_task(&TaskKind::CheckCycles), None);
         assert_eq!(operation_class_for_task(&TaskKind::Reconcile), None);
+    }
+
+    #[test]
+    fn lease_ttl_for_agent_turn_is_extended_for_continuation_rounds() {
+        assert_eq!(lease_ttl_ns(&TaskKind::AgentTurn), 240_000_000_000);
+        assert_eq!(lease_ttl_ns(&TaskKind::PollInbox), 60_000_000_000);
+        assert_eq!(lease_ttl_ns(&TaskKind::CheckCycles), 60_000_000_000);
+        assert_eq!(lease_ttl_ns(&TaskKind::Reconcile), 60_000_000_000);
     }
 
     #[test]
