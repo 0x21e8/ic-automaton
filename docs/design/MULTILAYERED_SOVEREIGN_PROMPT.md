@@ -412,13 +412,13 @@ The inference adapter selects compact vs. full based on the provider:
 
 ### Phase 2: Conversation History Storage
 
-- [ ] **2.1** Add `ConversationEntry` and `ConversationLog` types to `domain/types.rs`
-- [ ] **2.2** Add `CONVERSATION_MAP` (MemoryId 19) to `storage/stable.rs`
-- [ ] **2.3** Implement `append_conversation_entry(sender, entry)` with FIFO eviction (max 20 entries/sender)
-- [ ] **2.4** Implement `get_conversation_log(sender) -> Option<ConversationLog>`
-- [ ] **2.5** Implement sender eviction when `CONVERSATION_MAP` exceeds 200 entries (LRU by `last_activity_ns`)
-- [ ] **2.6** Wire post-turn conversation recording into `agent.rs` — after outbox message is posted, group consumed inbox messages by `posted_by` and append entries
-- [ ] **2.7** Unit tests: append, FIFO eviction, LRU sender eviction, truncation of long bodies
+- [x] **2.1** Add `ConversationEntry` and `ConversationLog` types to `domain/types.rs`
+- [x] **2.2** Add `CONVERSATION_MAP` (MemoryId 19) to `storage/stable.rs`
+- [x] **2.3** Implement `append_conversation_entry(sender, entry)` with FIFO eviction (max 20 entries/sender)
+- [x] **2.4** Implement `get_conversation_log(sender) -> Option<ConversationLog>`
+- [x] **2.5** Implement sender eviction when `CONVERSATION_MAP` exceeds 200 entries (LRU by `last_activity_ns`)
+- [x] **2.6** Wire post-turn conversation recording into `agent.rs` — after outbox message is posted, group consumed inbox messages by `posted_by` and append entries
+- [x] **2.7** Unit tests: append, FIFO eviction, LRU sender eviction, truncation of long bodies
 
 ### Phase 3: Dynamic Context (Layer 10)
 

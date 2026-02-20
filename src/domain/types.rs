@@ -188,6 +188,22 @@ pub struct PromptLayer {
     pub version: u32,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConversationEntry {
+    pub inbox_message_id: String,
+    pub sender_body: String,
+    pub agent_reply: String,
+    pub turn_id: String,
+    pub timestamp_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConversationLog {
+    pub sender: String,
+    pub entries: Vec<ConversationEntry>,
+    pub last_activity_ns: u64,
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeView {
     pub state: AgentState,
