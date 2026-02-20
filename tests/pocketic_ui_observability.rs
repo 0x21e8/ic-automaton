@@ -19,6 +19,7 @@ const WASM_PATHS: &[&str] = &[
 struct SnapshotEnvelope {
     runtime: Value,
     scheduler: Value,
+    cycles: Value,
     inbox_stats: Value,
     inbox_messages: Vec<Value>,
     outbox_stats: Value,
@@ -166,6 +167,20 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
         .get("total_messages")
         .and_then(Value::as_u64)
         .unwrap_or_default();
+    let cycle_total = snapshot
+        .cycles
+        .get("total_cycles")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let cycle_liquid = snapshot
+        .cycles
+        .get("liquid_cycles")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    assert!(
+        cycle_total >= cycle_liquid,
+        "cycle telemetry should include total and liquid balances"
+    );
     assert!(
         total_messages >= 1,
         "snapshot should include at least one inbox message after posting"

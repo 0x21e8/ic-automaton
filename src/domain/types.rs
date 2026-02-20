@@ -269,9 +269,28 @@ pub struct ObservabilitySnapshot {
     pub outbox_messages: Vec<OutboxMessage>,
     pub prompt_layers: Vec<PromptLayerView>,
     pub conversation_summaries: Vec<ConversationSummary>,
+    #[serde(default)]
+    pub cycles: CycleTelemetry,
     pub recent_turns: Vec<TurnRecord>,
     pub recent_transitions: Vec<TransitionLogRecord>,
     pub recent_jobs: Vec<ScheduledJob>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CycleTelemetry {
+    pub total_cycles: u128,
+    pub liquid_cycles: u128,
+    pub freezing_threshold_cycles: u128,
+    pub moving_window_seconds: u64,
+    pub window_duration_seconds: u64,
+    pub window_sample_count: u32,
+    pub burn_rate_cycles_per_hour: Option<u128>,
+    pub burn_rate_cycles_per_day: Option<u128>,
+    pub burn_rate_usd_per_hour: Option<f64>,
+    pub burn_rate_usd_per_day: Option<f64>,
+    pub estimated_seconds_until_freezing_threshold: Option<u64>,
+    pub estimated_freeze_time_ns: Option<u64>,
+    pub usd_per_trillion_cycles: f64,
 }
 
 #[derive(

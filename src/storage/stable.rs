@@ -1,10 +1,11 @@
 use crate::domain::types::{
-    AgentEvent, AgentState, ConversationEntry, ConversationLog, ConversationSummary, EvmPollCursor,
-    InboxMessage, InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider,
-    JobStatus, MemoryFact, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer,
-    PromptLayerView, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime,
-    SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
-    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    AgentEvent, AgentState, ConversationEntry, ConversationLog, ConversationSummary,
+    CycleTelemetry, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
+    InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
+    OutboxMessage, OutboxStats, PromptLayer, PromptLayerView, RuntimeSnapshot, RuntimeView,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
+    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    TransitionLogRecord, TurnRecord,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -34,13 +35,22 @@ const SCHEDULER_RUNTIME_KEY: &str = "scheduler.runtime";
 const INBOX_SEQ_KEY: &str = "inbox.seq";
 const OUTBOX_SEQ_KEY: &str = "outbox.seq";
 const HTTP_ALLOWLIST_INITIALIZED_KEY: &str = "http.allowlist.initialized";
+const CYCLE_BALANCE_SAMPLES_KEY: &str = "cycles.balance.samples";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
+const CYCLES_BURN_MOVING_WINDOW_SECONDS: u64 = 15 * 60;
+const CYCLES_BURN_MOVING_WINDOW_NS: u64 = CYCLES_BURN_MOVING_WINDOW_SECONDS * 1_000_000_000;
+const CYCLES_BURN_MAX_SAMPLES: usize = 450;
+const CYCLES_USD_PER_TRILLION_ESTIMATE: f64 = 1.35;
 const MAX_CONVERSATION_ENTRIES_PER_SENDER: usize = 20;
 const MAX_CONVERSATION_SENDERS: usize = 200;
 const MAX_CONVERSATION_BODY_CHARS: usize = 500;
 const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_LIQUID_CYCLES_OVERRIDE_KEY: &str = "host.liquid_cycles";
 pub const SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED: u32 = 3;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
@@ -75,6 +85,13 @@ impl GetLogFilter for SchedulerStorageLogPriority {
 struct SurvivalOperationRuntime {
     pub consecutive_failures: u32,
     pub backoff_until_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CycleBalanceSample {
+    captured_at_ns: u64,
+    total_cycles: u128,
+    liquid_cycles: u128,
 }
 
 fn survival_operation_runtime_key(operation: &SurvivalOperationClass) -> String {
@@ -1266,17 +1283,186 @@ pub fn inbox_stats() -> InboxStats {
     stats
 }
 
+fn current_total_cycle_balance() -> u128 {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::canister_cycle_balance();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        runtime_u128(HOST_TOTAL_CYCLES_OVERRIDE_KEY).unwrap_or_default()
+    }
+}
+
+fn current_liquid_cycle_balance(total_cycles: u128) -> u128 {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::canister_liquid_cycle_balance().min(total_cycles);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        runtime_u128(HOST_LIQUID_CYCLES_OVERRIDE_KEY)
+            .unwrap_or(total_cycles)
+            .min(total_cycles)
+    }
+}
+
+fn load_cycle_balance_samples() -> Vec<CycleBalanceSample> {
+    RUNTIME_MAP
+        .with(|map| map.borrow().get(&CYCLE_BALANCE_SAMPLES_KEY.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+        .unwrap_or_default()
+}
+
+fn save_cycle_balance_samples(samples: &[CycleBalanceSample]) {
+    RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(CYCLE_BALANCE_SAMPLES_KEY.to_string(), encode_json(samples));
+    });
+}
+
+fn push_cycle_balance_sample(
+    now_ns: u64,
+    total_cycles: u128,
+    liquid_cycles: u128,
+) -> Vec<CycleBalanceSample> {
+    let mut samples = load_cycle_balance_samples();
+    let sample = CycleBalanceSample {
+        captured_at_ns: now_ns,
+        total_cycles,
+        liquid_cycles,
+    };
+
+    if let Some(last) = samples.last_mut() {
+        if last.captured_at_ns == now_ns {
+            *last = sample;
+        } else {
+            samples.push(sample);
+        }
+    } else {
+        samples.push(sample);
+    }
+
+    let cutoff_ns = now_ns.saturating_sub(CYCLES_BURN_MOVING_WINDOW_NS);
+    samples.retain(|entry| entry.captured_at_ns >= cutoff_ns);
+    if samples.len() > CYCLES_BURN_MAX_SAMPLES {
+        let drop_count = samples.len() - CYCLES_BURN_MAX_SAMPLES;
+        samples.drain(0..drop_count);
+    }
+    save_cycle_balance_samples(&samples);
+    samples
+}
+
+fn round_f64_to_u128(value: f64) -> Option<u128> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    if value >= u128::MAX as f64 {
+        return Some(u128::MAX);
+    }
+    Some(value.round() as u128)
+}
+
+fn cycles_to_usd_estimate(cycles: u128) -> f64 {
+    (cycles as f64 / 1_000_000_000_000f64) * CYCLES_USD_PER_TRILLION_ESTIMATE
+}
+
+fn calculate_liquid_burn_cycles_per_sec(samples: &[CycleBalanceSample]) -> Option<f64> {
+    let first = samples.first()?;
+    let last = samples.last()?;
+    if last.captured_at_ns <= first.captured_at_ns {
+        return None;
+    }
+
+    let burned_cycles = samples.windows(2).fold(0u128, |acc, pair| {
+        let prev = &pair[0];
+        let next = &pair[1];
+        if next.captured_at_ns <= prev.captured_at_ns {
+            return acc;
+        }
+        acc.saturating_add(prev.liquid_cycles.saturating_sub(next.liquid_cycles))
+    });
+
+    if burned_cycles == 0 {
+        return None;
+    }
+
+    let elapsed_secs = (last.captured_at_ns.saturating_sub(first.captured_at_ns)) as f64 / 1e9f64;
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+    Some(burned_cycles as f64 / elapsed_secs)
+}
+
+fn derive_cycle_telemetry(
+    now_ns: u64,
+    total_cycles: u128,
+    liquid_cycles: u128,
+    samples: &[CycleBalanceSample],
+) -> CycleTelemetry {
+    let freezing_threshold_cycles = total_cycles.saturating_sub(liquid_cycles);
+    let window_duration_seconds = samples
+        .first()
+        .zip(samples.last())
+        .map(|(first, last)| {
+            last.captured_at_ns
+                .saturating_sub(first.captured_at_ns)
+                .saturating_div(1_000_000_000)
+        })
+        .unwrap_or_default();
+
+    let burn_per_sec = calculate_liquid_burn_cycles_per_sec(samples);
+    let burn_per_hour = burn_per_sec.and_then(|rate| round_f64_to_u128(rate * 3_600f64));
+    let burn_per_day = burn_per_sec.and_then(|rate| round_f64_to_u128(rate * 86_400f64));
+
+    let estimated_seconds_until_freezing_threshold = burn_per_sec.and_then(|rate| {
+        if rate <= 0.0 {
+            return None;
+        }
+        let estimate = (liquid_cycles as f64 / rate).floor();
+        if !estimate.is_finite() || estimate < 0.0 || estimate > u64::MAX as f64 {
+            return None;
+        }
+        Some(estimate as u64)
+    });
+    let estimated_freeze_time_ns = estimated_seconds_until_freezing_threshold.and_then(|seconds| {
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|delta_ns| now_ns.checked_add(delta_ns))
+    });
+
+    CycleTelemetry {
+        total_cycles,
+        liquid_cycles,
+        freezing_threshold_cycles,
+        moving_window_seconds: CYCLES_BURN_MOVING_WINDOW_SECONDS,
+        window_duration_seconds,
+        window_sample_count: u32::try_from(samples.len()).unwrap_or(u32::MAX),
+        burn_rate_cycles_per_hour: burn_per_hour,
+        burn_rate_cycles_per_day: burn_per_day,
+        burn_rate_usd_per_hour: burn_per_hour.map(cycles_to_usd_estimate),
+        burn_rate_usd_per_day: burn_per_day.map(cycles_to_usd_estimate),
+        estimated_seconds_until_freezing_threshold,
+        estimated_freeze_time_ns,
+        usd_per_trillion_cycles: CYCLES_USD_PER_TRILLION_ESTIMATE,
+    }
+}
+
 pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
     let bounded_limit = if limit == 0 {
         DEFAULT_OBSERVABILITY_LIMIT
     } else {
         limit.min(MAX_OBSERVABILITY_LIMIT)
     };
+    let captured_at_ns = now_ns();
+    let total_cycles = current_total_cycle_balance();
+    let liquid_cycles = current_liquid_cycle_balance(total_cycles);
+    let cycle_samples = push_cycle_balance_sample(captured_at_ns, total_cycles, liquid_cycles);
+    let cycles =
+        derive_cycle_telemetry(captured_at_ns, total_cycles, liquid_cycles, &cycle_samples);
     let mut conversation_summaries = list_conversation_summaries();
     conversation_summaries.truncate(bounded_limit);
 
     ObservabilitySnapshot {
-        captured_at_ns: now_ns(),
+        captured_at_ns,
         runtime: snapshot_to_view(),
         scheduler: scheduler_runtime_view(),
         inbox_stats: inbox_stats(),
@@ -1285,6 +1471,7 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
         outbox_messages: list_outbox_messages(bounded_limit),
         prompt_layers: list_prompt_layers(),
         conversation_summaries,
+        cycles,
         recent_turns: list_turns(bounded_limit),
         recent_transitions: list_recent_transitions(bounded_limit),
         recent_jobs: list_recent_jobs(bounded_limit),
@@ -1894,6 +2081,20 @@ fn save_runtime_u64(key: &str, value: u64) {
     });
 }
 
+fn runtime_u128(key: &str) -> Option<u128> {
+    RUNTIME_MAP
+        .with(|map| map.borrow().get(&key.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+#[cfg(test)]
+fn save_runtime_u128(key: &str, value: u128) {
+    RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(key.to_string(), encode_json(&value));
+    });
+}
+
 fn runtime_bool(key: &str) -> Option<bool> {
     RUNTIME_MAP
         .with(|map| map.borrow().get(&key.to_string()))
@@ -2186,6 +2387,17 @@ mod tests {
         assert_eq!(bounded.recent_jobs.len(), 0);
         assert_eq!(bounded.prompt_layers.len(), 10);
         assert_eq!(bounded.conversation_summaries.len(), 1);
+        assert!(
+            bounded.cycles.total_cycles >= bounded.cycles.liquid_cycles,
+            "total cycle balance should be at least liquid balance"
+        );
+        assert_eq!(
+            bounded.cycles.freezing_threshold_cycles,
+            bounded
+                .cycles
+                .total_cycles
+                .saturating_sub(bounded.cycles.liquid_cycles)
+        );
         assert_eq!(
             bounded.conversation_summaries[0].sender,
             "0xabcd00000000000000000000000000000000ef12"
@@ -2200,6 +2412,78 @@ mod tests {
             defaulted.inbox_messages.len() <= DEFAULT_OBSERVABILITY_LIMIT,
             "default limit should bound inbox messages"
         );
+    }
+
+    #[test]
+    fn derive_cycle_telemetry_uses_moving_window_and_ignores_topups() {
+        let samples = vec![
+            CycleBalanceSample {
+                captured_at_ns: 0,
+                total_cycles: 2_000,
+                liquid_cycles: 1_000,
+            },
+            CycleBalanceSample {
+                captured_at_ns: 10_000_000_000,
+                total_cycles: 1_980,
+                liquid_cycles: 980,
+            },
+            CycleBalanceSample {
+                captured_at_ns: 20_000_000_000,
+                total_cycles: 2_020,
+                liquid_cycles: 1_020,
+            },
+            CycleBalanceSample {
+                captured_at_ns: 30_000_000_000,
+                total_cycles: 1_980,
+                liquid_cycles: 980,
+            },
+        ];
+
+        let telemetry = derive_cycle_telemetry(30_000_000_000, 1_980, 980, &samples);
+        assert_eq!(telemetry.window_sample_count, 4);
+        assert_eq!(telemetry.window_duration_seconds, 30);
+        assert_eq!(telemetry.burn_rate_cycles_per_hour, Some(7_200));
+        assert_eq!(telemetry.burn_rate_cycles_per_day, Some(172_800));
+        assert_eq!(
+            telemetry.estimated_seconds_until_freezing_threshold,
+            Some(490)
+        );
+    }
+
+    #[test]
+    fn derive_cycle_telemetry_estimates_lifetime_to_freezing_threshold() {
+        let samples = vec![
+            CycleBalanceSample {
+                captured_at_ns: 0,
+                total_cycles: 3_000,
+                liquid_cycles: 2_000,
+            },
+            CycleBalanceSample {
+                captured_at_ns: 10_000_000_000,
+                total_cycles: 2_900,
+                liquid_cycles: 1_900,
+            },
+        ];
+
+        let telemetry = derive_cycle_telemetry(20_000_000_000, 2_500, 1_800, &samples);
+        assert_eq!(telemetry.freezing_threshold_cycles, 700);
+        assert_eq!(
+            telemetry.estimated_seconds_until_freezing_threshold,
+            Some(180)
+        );
+        assert_eq!(telemetry.estimated_freeze_time_ns, Some(200_000_000_000));
+    }
+
+    #[test]
+    fn observability_snapshot_uses_host_cycle_overrides() {
+        init_storage();
+        save_runtime_u128(HOST_TOTAL_CYCLES_OVERRIDE_KEY, 2_000_000_000_000);
+        save_runtime_u128(HOST_LIQUID_CYCLES_OVERRIDE_KEY, 1_500_000_000_000);
+
+        let snapshot = observability_snapshot(10);
+        assert_eq!(snapshot.cycles.total_cycles, 2_000_000_000_000);
+        assert_eq!(snapshot.cycles.liquid_cycles, 1_500_000_000_000);
+        assert_eq!(snapshot.cycles.freezing_threshold_cycles, 500_000_000_000);
     }
 
     #[test]
