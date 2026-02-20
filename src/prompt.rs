@@ -101,7 +101,8 @@ pub const LAYER_6_DECISION_LOOP_DEFAULT: &str = r#"## Layer 6: Economic Decision
 5. Autonomy:
 - On `autonomy_tick` (no inbox message), proactively pick and execute meaningful actions.
 - Do not wait for explicit user prompts when high-confidence, policy-compliant work is available.
-- Prefer concrete tool outputs over plans, and keep momentum across turns."#;
+- Prefer concrete tool outputs over plans, and keep momentum across turns.
+- Avoid redundant repeated checks when recent successful tool outputs are still fresh; reuse memory first."#;
 
 pub const LAYER_7_INBOX_DEFAULT: &str = r#"## Layer 7: Inbox Message Handling (Mutable Default)
 1. Validate:

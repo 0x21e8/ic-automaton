@@ -47,6 +47,7 @@ const MAX_CONVERSATION_ENTRIES_PER_SENDER: usize = 20;
 const MAX_CONVERSATION_SENDERS: usize = 200;
 const MAX_CONVERSATION_BODY_CHARS: usize = 500;
 const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
+const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
 #[cfg(not(target_arch = "wasm32"))]
@@ -867,6 +868,18 @@ pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact
             .collect::<Vec<_>>()
     });
     sort_memory_facts_desc_by_updated(facts, limit)
+}
+
+pub fn autonomy_tool_last_success_ns(fingerprint: &str) -> Option<u64> {
+    runtime_u64(&autonomy_tool_success_key(fingerprint))
+}
+
+pub fn record_autonomy_tool_success(fingerprint: &str, succeeded_at_ns: u64) {
+    save_runtime_u64(&autonomy_tool_success_key(fingerprint), succeeded_at_ns);
+}
+
+fn autonomy_tool_success_key(fingerprint: &str) -> String {
+    format!("{AUTONOMY_TOOL_SUCCESS_KEY_PREFIX}{fingerprint}")
 }
 
 fn sort_memory_facts_desc_by_updated(mut facts: Vec<MemoryFact>, limit: usize) -> Vec<MemoryFact> {

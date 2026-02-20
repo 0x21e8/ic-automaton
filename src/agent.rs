@@ -2,7 +2,7 @@ use crate::domain::state_machine;
 use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{
     AgentEvent, AgentState, ConversationEntry, InboxMessage, InferenceInput, InferenceProvider,
-    MemoryFact, ToolCallRecord, TurnRecord,
+    MemoryFact, ToolCall, ToolCallRecord, TurnRecord,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
@@ -12,7 +12,11 @@ use crate::features::{
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
 use alloy_primitives::U256;
+use sha3::{Digest, Keccak256};
 use std::collections::BTreeSet;
+
+const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60 * 60;
+const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -141,6 +145,120 @@ fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
         lines.push(format!("- {}", summarize_tool_call(call)));
     }
     Some(lines.join("\n"))
+}
+
+fn canonical_tool_args_json(args_json: &str) -> String {
+    let trimmed = args_json.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Ok(serialized) = serde_json::to_string(&value) {
+            return serialized;
+        }
+    }
+    trimmed.to_string()
+}
+
+fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
+    let canonical_args = canonical_tool_args_json(args_json);
+    let mut hasher = Keccak256::new();
+    hasher.update(tool.trim().as_bytes());
+    hasher.update(b":");
+    hasher.update(canonical_args.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn suppress_duplicate_autonomy_tool_calls(
+    calls: &[ToolCall],
+    now_ns: u64,
+) -> (Vec<ToolCall>, Vec<String>) {
+    let mut allowed = Vec::with_capacity(calls.len());
+    let mut suppressed = Vec::new();
+
+    for call in calls {
+        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        let Some(last_success_ns) = stable::autonomy_tool_last_success_ns(&fingerprint) else {
+            allowed.push(call.clone());
+            continue;
+        };
+
+        let elapsed_ns = now_ns.saturating_sub(last_success_ns);
+        if elapsed_ns < AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS {
+            suppressed.push(format!(
+                "{} args={} age_secs={}",
+                call.tool,
+                sanitize_preview(&call.args_json, 100),
+                elapsed_ns / 1_000_000_000,
+            ));
+            continue;
+        }
+
+        allowed.push(call.clone());
+    }
+
+    (allowed, suppressed)
+}
+
+fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeeded_at_ns: u64) {
+    for call in tool_calls.iter().filter(|call| call.success) {
+        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        stable::record_autonomy_tool_success(&fingerprint, succeeded_at_ns);
+    }
+}
+
+fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) {
+    let existing = stable::get_memory_fact(key);
+    stable::set_memory_fact(&MemoryFact {
+        key: key.to_string(),
+        value,
+        created_at_ns: existing
+            .as_ref()
+            .map(|fact| fact.created_at_ns)
+            .unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    });
+}
+
+fn successful_eth_balance_read(call: &ToolCallRecord) -> Option<(String, String)> {
+    if !call.success || call.tool != "evm_read" {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(&call.args_json).ok()?;
+    let method = args.get("method")?.as_str()?;
+    if method != "eth_getBalance" {
+        return None;
+    }
+
+    let address = args
+        .get("address")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())?;
+    let balance_hex = call.output.trim().to_ascii_lowercase();
+    let _ = parse_hex_quantity_u256(&balance_hex)?;
+    Some((address, balance_hex))
+}
+
+fn persist_eth_balance_from_tool_calls(tool_calls: &[ToolCallRecord], turn_id: &str, now_ns: u64) {
+    for call in tool_calls {
+        let Some((address, balance_hex)) = successful_eth_balance_read(call) else {
+            continue;
+        };
+        upsert_memory_fact("balance.eth", balance_hex.clone(), turn_id, now_ns);
+        upsert_memory_fact(
+            &format!("balance.eth.{address}"),
+            balance_hex,
+            turn_id,
+            now_ns,
+        );
+        upsert_memory_fact(
+            "balance.eth.last_checked_ns",
+            now_ns.to_string(),
+            turn_id,
+            now_ns,
+        );
+    }
 }
 
 fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
@@ -274,6 +392,7 @@ fn build_dynamic_context(
     turn_id: &str,
     conversation_history_limit: usize,
 ) -> String {
+    let now_ns = current_time_ns();
     let cycles_balance = current_cycle_balance()
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string());
@@ -282,10 +401,19 @@ fn build_dynamic_context(
         .unwrap_or_else(|| "unknown".to_string());
     let survival_tier = format!("{:?}", stable::scheduler_survival_tier());
     let recovery_checks = stable::scheduler_survival_tier_recovery_checks();
-    let eth_balance = stable::list_memory_facts_by_prefix("balance.eth", 1)
-        .first()
+    let eth_balance_fact = stable::get_memory_fact("balance.eth");
+    let eth_balance = eth_balance_fact
+        .as_ref()
         .map(|fact| fact.value.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    let eth_balance_last_checked_ns = stable::get_memory_fact("balance.eth.last_checked_ns")
+        .and_then(|fact| fact.value.parse::<u64>().ok())
+        .or_else(|| eth_balance_fact.as_ref().map(|fact| fact.updated_at_ns));
+    let eth_balance_last_checked_age_secs = eth_balance_last_checked_ns
+        .map(|last_checked_ns| now_ns.saturating_sub(last_checked_ns) / 1_000_000_000);
+    let eth_balance_is_stale = eth_balance_last_checked_age_secs
+        .map(|age_secs| age_secs > BALANCE_FRESHNESS_WINDOW_SECS)
+        .unwrap_or(true);
 
     let memory_section = if memory_facts.is_empty() {
         "### Recent Memory\n- none".to_string()
@@ -314,9 +442,23 @@ fn build_dynamic_context(
             snapshot.evm_address.as_deref().unwrap_or("unconfigured")
         ),
         format!("- eth_balance: {eth_balance}"),
+        format!(
+            "- eth_balance_last_checked_ns: {}",
+            eth_balance_last_checked_ns
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!(
+            "- eth_balance_last_checked_age_secs: {}",
+            eth_balance_last_checked_age_secs
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!("- eth_balance_freshness_window_secs: {BALANCE_FRESHNESS_WINDOW_SECS}"),
+        format!("- eth_balance_is_stale: {eth_balance_is_stale}"),
         format!("- turn_number: {}", snapshot.turn_counter),
         format!("- turn_id: {turn_id}"),
-        format!("- timestamp_ns: {}", current_time_ns()),
+        format!("- timestamp_ns: {now_ns}"),
         format!("- state: {:?}", snapshot.state),
         format!("- evm_events: {evm_events}"),
         build_pending_obligations_section(staged_messages),
@@ -502,6 +644,27 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
                 {
                     last_error = Some(error);
                 } else {
+                    let mut planned_tool_calls = inference.tool_calls;
+                    if !has_external_input {
+                        let (filtered_calls, suppressed_calls) =
+                            suppress_duplicate_autonomy_tool_calls(
+                                &planned_tool_calls,
+                                started_at_ns,
+                            );
+                        planned_tool_calls = filtered_calls;
+                        if !suppressed_calls.is_empty() {
+                            append_inner_dialogue(
+                                &mut inner_dialogue,
+                                &format!(
+                                    "autonomy dedupe suppressed {} repeated successful tool call(s) within {} seconds:\n- {}",
+                                    suppressed_calls.len(),
+                                    BALANCE_FRESHNESS_WINDOW_SECS,
+                                    suppressed_calls.join("\n- "),
+                                ),
+                            );
+                        }
+                    }
+
                     #[cfg(target_arch = "wasm32")]
                     let signer: Box<dyn SignerPort> = if snapshot.ecdsa_key_name.trim().is_empty() {
                         Box::new(MockSignerAdapter::new())
@@ -514,8 +677,17 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
 
                     let mut manager = ToolManager::new();
                     tool_calls = manager
-                        .execute_actions(&state, &inference.tool_calls, signer.as_ref(), &turn_id)
+                        .execute_actions(&state, &planned_tool_calls, signer.as_ref(), &turn_id)
                         .await;
+                    let execution_completed_ns = current_time_ns();
+                    if !has_external_input {
+                        record_successful_autonomy_tool_calls(&tool_calls, execution_completed_ns);
+                    }
+                    persist_eth_balance_from_tool_calls(
+                        &tool_calls,
+                        &turn_id,
+                        execution_completed_ns,
+                    );
                     if let Some(tool_results_reply) = render_tool_results_reply(&tool_calls) {
                         append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
                         assistant_reply = Some(tool_results_reply);
@@ -656,7 +828,7 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        InboxMessageStatus, MemoryFact, RuntimeSnapshot, SurvivalTier, ToolCallRecord,
+        InboxMessageStatus, MemoryFact, RuntimeSnapshot, SurvivalTier, ToolCall, ToolCallRecord,
     };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -764,6 +936,74 @@ mod tests {
         assert!(reply.contains("Tool results: 1 succeeded, 1 failed."));
         assert!(reply.contains("`remember`: stored"));
         assert!(reply.contains("`evm_read` failed: rpc timeout"));
+    }
+
+    #[test]
+    fn persist_eth_balance_from_tool_calls_stores_balance_and_last_checked() {
+        reset_runtime(AgentState::Sleeping, true, false, 8);
+        let calls = vec![ToolCallRecord {
+            turn_id: "turn-9".to_string(),
+            tool: "evm_read".to_string(),
+            args_json:
+                r#"{"method":"eth_getBalance","address":"0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"}"#
+                    .to_string(),
+            output: "0x1".to_string(),
+            success: true,
+            error: None,
+        }];
+
+        persist_eth_balance_from_tool_calls(&calls, "turn-9", 100);
+
+        let global = stable::get_memory_fact("balance.eth").expect("global balance should exist");
+        assert_eq!(global.value, "0x1");
+        assert_eq!(global.created_at_ns, 100);
+        assert_eq!(global.updated_at_ns, 100);
+
+        let by_address =
+            stable::get_memory_fact("balance.eth.0xabcdefabcdefabcdefabcdefabcdefabcdefabcd")
+                .expect("address balance should exist");
+        assert_eq!(by_address.value, "0x1");
+
+        let checked = stable::get_memory_fact("balance.eth.last_checked_ns")
+            .expect("last checked fact should exist");
+        assert_eq!(checked.value, "100");
+
+        let second_calls = vec![ToolCallRecord {
+            output: "0x2".to_string(),
+            ..calls[0].clone()
+        }];
+        persist_eth_balance_from_tool_calls(&second_calls, "turn-10", 200);
+        let updated_global = stable::get_memory_fact("balance.eth").expect("updated balance");
+        assert_eq!(updated_global.value, "0x2");
+        assert_eq!(updated_global.created_at_ns, 100);
+        assert_eq!(updated_global.updated_at_ns, 200);
+    }
+
+    #[test]
+    fn suppress_duplicate_autonomy_tool_calls_respects_60m_window() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let call = ToolCall {
+            tool: "evm_read".to_string(),
+            args_json:
+                r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
+                    .to_string(),
+        };
+        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        stable::record_autonomy_tool_success(&fingerprint, 1_000);
+
+        let (allowed_early, suppressed_early) = suppress_duplicate_autonomy_tool_calls(
+            std::slice::from_ref(&call),
+            1_000 + AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS - 1,
+        );
+        assert!(allowed_early.is_empty());
+        assert_eq!(suppressed_early.len(), 1);
+
+        let (allowed_late, suppressed_late) = suppress_duplicate_autonomy_tool_calls(
+            &[call],
+            1_000 + AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS,
+        );
+        assert_eq!(allowed_late.len(), 1);
+        assert!(suppressed_late.is_empty());
     }
 
     #[test]
@@ -880,11 +1120,38 @@ mod tests {
         assert!(context.contains("- survival_tier: LowCycles"));
         assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("- eth_balance: 0.42"));
+        assert!(context.contains("- eth_balance_last_checked_ns: 10"));
+        assert!(context.contains("- eth_balance_freshness_window_secs: 3600"));
+        assert!(context.contains("- eth_balance_is_stale: true"));
         assert!(context.contains("### Pending Obligations"));
         assert!(context.contains("- staged_count: 2"));
         assert!(context.contains("### Recent Memory"));
         assert!(context.contains("- strategy=buy dips"));
         assert!(context.contains("### Available Tools"));
+    }
+
+    #[test]
+    fn dynamic_context_marks_eth_balance_fresh_with_recent_check() {
+        reset_runtime(AgentState::Sleeping, true, false, 12);
+        let now_ns = current_time_ns();
+        stable::set_memory_fact(&MemoryFact {
+            key: "balance.eth".to_string(),
+            value: "0x10".to_string(),
+            created_at_ns: now_ns,
+            updated_at_ns: now_ns,
+            source_turn_id: "turn-11".to_string(),
+        });
+        stable::set_memory_fact(&MemoryFact {
+            key: "balance.eth.last_checked_ns".to_string(),
+            value: now_ns.to_string(),
+            created_at_ns: now_ns,
+            updated_at_ns: now_ns,
+            source_turn_id: "turn-11".to_string(),
+        });
+
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], "turn-12", 5);
+        assert!(context.contains("- eth_balance_is_stale: false"));
     }
 
     #[test]
@@ -1021,6 +1288,37 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Tool results"),
             "inner dialogue should include tool execution summary"
+        );
+    }
+
+    #[test]
+    fn no_input_turn_suppresses_repeated_successful_autonomy_calls_within_window() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be set");
+
+        let first = block_on_with_spin(run_scheduled_turn_job());
+        assert!(first.is_ok(), "first no-input turn should succeed");
+        let second = block_on_with_spin(run_scheduled_turn_job());
+        assert!(second.is_ok(), "second no-input turn should succeed");
+
+        let turns = stable::list_turns(2);
+        assert_eq!(turns.len(), 2);
+        assert!(
+            turns[1].tool_call_count >= 1,
+            "first turn should execute at least one autonomous tool"
+        );
+        assert_eq!(
+            turns[0].tool_call_count, 0,
+            "second turn should suppress duplicate autonomous call within freshness window"
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("autonomy dedupe suppressed"),
+            "inner dialogue should explain autonomous dedupe suppression"
         );
     }
 
