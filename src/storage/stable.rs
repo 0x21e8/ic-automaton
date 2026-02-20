@@ -1272,6 +1272,8 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
     } else {
         limit.min(MAX_OBSERVABILITY_LIMIT)
     };
+    let mut conversation_summaries = list_conversation_summaries();
+    conversation_summaries.truncate(bounded_limit);
 
     ObservabilitySnapshot {
         captured_at_ns: now_ns(),
@@ -1281,6 +1283,8 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
         inbox_messages: list_inbox_messages(bounded_limit),
         outbox_stats: outbox_stats(),
         outbox_messages: list_outbox_messages(bounded_limit),
+        prompt_layers: list_prompt_layers(),
+        conversation_summaries,
         recent_turns: list_turns(bounded_limit),
         recent_transitions: list_recent_transitions(bounded_limit),
         recent_jobs: list_recent_jobs(bounded_limit),
@@ -2166,10 +2170,26 @@ mod tests {
         init_storage();
         post_inbox_message("snapshot message one".to_string(), "2vxsx-fae".to_string()).unwrap();
         post_inbox_message("snapshot message two".to_string(), "2vxsx-fae".to_string()).unwrap();
+        append_conversation_entry(
+            "0xAbCd00000000000000000000000000000000Ef12",
+            ConversationEntry {
+                inbox_message_id: "inbox:1".to_string(),
+                sender_body: "hello".to_string(),
+                agent_reply: "hi".to_string(),
+                turn_id: "turn-1".to_string(),
+                timestamp_ns: 1,
+            },
+        );
 
         let bounded = observability_snapshot(1);
         assert_eq!(bounded.inbox_messages.len(), 1);
         assert_eq!(bounded.recent_jobs.len(), 0);
+        assert_eq!(bounded.prompt_layers.len(), 10);
+        assert_eq!(bounded.conversation_summaries.len(), 1);
+        assert_eq!(
+            bounded.conversation_summaries[0].sender,
+            "0xabcd00000000000000000000000000000000ef12"
+        );
         assert!(
             bounded.captured_at_ns > 0,
             "captured timestamp should be populated"

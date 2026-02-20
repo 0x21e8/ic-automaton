@@ -23,6 +23,8 @@ struct SnapshotEnvelope {
     inbox_messages: Vec<Value>,
     outbox_stats: Value,
     outbox_messages: Vec<Value>,
+    prompt_layers: Vec<Value>,
+    conversation_summaries: Vec<Value>,
     recent_turns: Vec<Value>,
     recent_transitions: Vec<Value>,
     recent_jobs: Vec<Value>,
@@ -113,6 +115,14 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
         "root html should contain the UI title"
     );
     assert!(
+        root_body.contains("Prompt Layers"),
+        "root html should expose prompt layer panel"
+    );
+    assert!(
+        root_body.contains("Conversations"),
+        "root html should expose conversation panel"
+    );
+    assert!(
         root_response
             .headers()
             .iter()
@@ -167,6 +177,11 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
             .any(|msg| msg.get("id").and_then(Value::as_str) == Some(posted_id)),
         "snapshot should include the posted message id"
     );
+    assert_eq!(
+        snapshot.prompt_layers.len(),
+        10,
+        "snapshot should include all prompt layers"
+    );
 
     for _ in 0..3 {
         pic.advance_time(Duration::from_secs(31));
@@ -194,6 +209,48 @@ fn serves_certified_root_and_supports_ui_observability_flow() {
             .unwrap_or_default()
             .starts_with("outbox:")),
         "snapshot should include at least one outbox record id"
+    );
+    assert!(
+        !after_turn_snapshot.conversation_summaries.is_empty(),
+        "snapshot should include conversation summaries after agent replies"
+    );
+
+    let sender = after_turn_snapshot
+        .conversation_summaries
+        .first()
+        .and_then(|entry| entry.get("sender"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        sender.starts_with("2vxsx-fae") || sender.starts_with("0x"),
+        "conversation sender should be present"
+    );
+
+    let conversation_request: HttpUpdateRequest = HttpRequest::post("/api/conversation")
+        .with_headers(vec![(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )])
+        .with_body(
+            serde_json::json!({
+                "sender": sender,
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .build_update();
+    let conversation_response = call_http_update(&pic, canister_id, conversation_request);
+    assert_eq!(conversation_response.status_code().as_u16(), 200);
+    let conversation_json: Value = serde_json::from_slice(conversation_response.body())
+        .expect("conversation endpoint should return json");
+    assert_eq!(
+        conversation_json
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(|entries| !entries.is_empty()),
+        Some(true),
+        "conversation endpoint should return at least one exchange"
     );
 }
 

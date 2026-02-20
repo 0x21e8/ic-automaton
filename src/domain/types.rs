@@ -267,6 +267,8 @@ pub struct ObservabilitySnapshot {
     pub inbox_messages: Vec<InboxMessage>,
     pub outbox_stats: OutboxStats,
     pub outbox_messages: Vec<OutboxMessage>,
+    pub prompt_layers: Vec<PromptLayerView>,
+    pub conversation_summaries: Vec<ConversationSummary>,
     pub recent_turns: Vec<TurnRecord>,
     pub recent_transitions: Vec<TransitionLogRecord>,
     pub recent_jobs: Vec<ScheduledJob>,

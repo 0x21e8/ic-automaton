@@ -138,6 +138,14 @@ h2 {
   grid-column: span 4;
 }
 
+.grid.grid-dual .panel:nth-child(1) {
+  grid-column: span 6;
+}
+
+.grid.grid-dual .panel:nth-child(2) {
+  grid-column: span 6;
+}
+
 .composer-form {
   display: grid;
   gap: var(--space-3);
@@ -292,6 +300,21 @@ textarea:focus-visible,
   font-size: 0.82rem;
 }
 
+.conversation-row {
+  appearance: none;
+  display: block;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  font-family: var(--font-sans);
+}
+
+.conversation-row.selected {
+  border-color: rgba(82, 240, 189, 0.45);
+  box-shadow: 0 0 0 1px rgba(82, 240, 189, 0.2) inset;
+}
+
 .timeline-row code {
   font-family: var(--font-mono);
   font-size: 0.74rem;
@@ -350,6 +373,43 @@ textarea:focus-visible,
   font-size: 0.74rem;
   color: #bddfff;
   overflow-wrap: anywhere;
+}
+
+.layers {
+  display: grid;
+  gap: var(--space-3);
+  max-height: 420px;
+  overflow: auto;
+}
+
+.layer-row {
+  border: 1px solid rgba(119, 165, 205, 0.22);
+  border-radius: 12px;
+  background: rgba(8, 16, 22, 0.55);
+  padding: var(--space-3);
+}
+
+.layer-head {
+  margin: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.layer-meta {
+  margin: var(--space-2) 0;
+  font-size: 0.76rem;
+  color: var(--color-muted);
+}
+
+.layer-body {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: #cae7ff;
 }
 
 .sr-only {
