@@ -1,4 +1,5 @@
 use crate::domain::types::{AgentState, SurvivalOperationClass, ToolCall, ToolCallRecord};
+use crate::features::evm::evm_read_tool;
 use crate::storage::stable;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -83,6 +84,14 @@ impl ToolManager {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
                 max_calls_per_turn: 5,
+            },
+        );
+        policies.insert(
+            "evm_read".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+                max_calls_per_turn: 3,
             },
         );
 
@@ -240,6 +249,27 @@ impl ToolManager {
                     }
                 }
                 "record_signal" => Ok("recorded".to_string()),
+                "evm_read" => {
+                    let now_ns = current_time_ns();
+                    if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns)
+                    {
+                        Err("evm_read skipped due to survival policy".to_string())
+                    } else {
+                        let result = evm_read_tool(&call.args_json).await;
+                        if result.is_ok() {
+                            stable::record_survival_operation_success(
+                                &SurvivalOperationClass::EvmPoll,
+                            );
+                        } else {
+                            stable::record_survival_operation_failure(
+                                &SurvivalOperationClass::EvmPoll,
+                                now_ns,
+                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+                            );
+                        }
+                        result
+                    }
+                }
                 _ => Err("unknown tool".to_string()),
             };
 
@@ -462,5 +492,25 @@ mod tests {
             "missing required field: message_hash"
         );
         assert_eq!(signer.calls.get(), 0);
+    }
+
+    #[test]
+    fn evm_read_tool_runs_for_supported_method() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool: "evm_read".to_string(),
+            args_json: r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        assert!(records[0].output.contains("0x"));
     }
 }

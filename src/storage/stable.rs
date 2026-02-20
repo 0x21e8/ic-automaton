@@ -39,6 +39,7 @@ pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
+const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
@@ -552,6 +553,17 @@ pub fn get_soul() -> String {
     runtime_snapshot().soul
 }
 
+fn normalize_https_url(raw: &str, field: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(format!("{field} cannot be empty"));
+    }
+    if !trimmed.starts_with("https://") {
+        return Err(format!("{field} must be an https:// URL"));
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn set_ecdsa_key_name(key_name: String) -> Result<String, String> {
     let trimmed = key_name.trim();
     if trimmed.is_empty() {
@@ -599,6 +611,51 @@ pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String
 
 pub fn get_evm_address() -> Option<String> {
     runtime_snapshot().evm_address
+}
+
+pub fn set_evm_rpc_url(url: String) -> Result<String, String> {
+    let normalized = normalize_https_url(&url, "evm rpc url")?;
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_rpc_url = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
+}
+
+pub fn set_evm_rpc_fallback_url(url: Option<String>) -> Result<Option<String>, String> {
+    let normalized = match url {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(normalize_https_url(trimmed, "evm rpc fallback url")?)
+            }
+        }
+        None => None,
+    };
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_rpc_fallback_url = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
+}
+
+pub fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, String> {
+    if max_response_bytes == 0 {
+        return Err("evm rpc max_response_bytes must be greater than 0".to_string());
+    }
+    if max_response_bytes > MAX_EVM_RPC_RESPONSE_BYTES {
+        return Err(format!(
+            "evm rpc max_response_bytes must be <= {MAX_EVM_RPC_RESPONSE_BYTES}"
+        ));
+    }
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_rpc_max_response_bytes = max_response_bytes;
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(max_response_bytes)
 }
 
 pub fn set_last_error(error: Option<String>) {
@@ -1667,5 +1724,36 @@ mod tests {
             get_evm_address().as_deref().unwrap_or_default(),
             "0x1111111111111111111111111111111111111111"
         );
+    }
+
+    #[test]
+    fn evm_rpc_config_validates_and_persists() {
+        init_storage();
+
+        assert!(set_evm_rpc_url("".to_string()).is_err());
+        assert!(set_evm_rpc_url("http://example.com".to_string()).is_err());
+        assert!(set_evm_rpc_max_response_bytes(0).is_err());
+
+        let primary = set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("primary rpc should accept https");
+        let fallback = set_evm_rpc_fallback_url(Some("https://base.publicnode.com".to_string()))
+            .expect("fallback should accept https");
+        let max_response =
+            set_evm_rpc_max_response_bytes(65_536).expect("max response bytes should persist");
+
+        assert_eq!(primary, "https://mainnet.base.org");
+        assert_eq!(
+            fallback.as_deref().unwrap_or_default(),
+            "https://base.publicnode.com"
+        );
+        assert_eq!(max_response, 65_536);
+
+        let snapshot = runtime_snapshot();
+        assert_eq!(snapshot.evm_rpc_url, "https://mainnet.base.org");
+        assert_eq!(
+            snapshot.evm_rpc_fallback_url.as_deref().unwrap_or_default(),
+            "https://base.publicnode.com"
+        );
+        assert_eq!(snapshot.evm_rpc_max_response_bytes, 65_536);
     }
 }

@@ -71,6 +71,21 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
     "openrouter_api_key_updated".to_string()
 }
 
+#[ic_cdk::update]
+fn set_evm_rpc_url(url: String) -> Result<String, String> {
+    stable::set_evm_rpc_url(url)
+}
+
+#[ic_cdk::update]
+fn set_evm_rpc_fallback_url(url: Option<String>) -> Result<Option<String>, String> {
+    stable::set_evm_rpc_fallback_url(url)
+}
+
+#[ic_cdk::update]
+fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, String> {
+    stable::set_evm_rpc_max_response_bytes(max_response_bytes)
+}
+
 #[ic_cdk::query]
 fn get_runtime_view() -> RuntimeView {
     stable::snapshot_to_view()

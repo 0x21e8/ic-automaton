@@ -218,6 +218,36 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["signal".to_string()]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "evm_read".to_string(),
+            description: Some(
+                "Read on-chain state on EVM. Supported methods: eth_getBalance and eth_call."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "method".to_string(),
+                        description: Some("Either eth_getBalance or eth_call.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "address".to_string(),
+                        description: Some("0x-prefixed 20-byte address target.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "calldata".to_string(),
+                        description: Some(
+                            "For eth_call only: 0x-prefixed ABI-encoded calldata.".to_string(),
+                        ),
+                    },
+                ]),
+                required: Some(vec!["method".to_string(), "address".to_string()]),
+            }),
+        }),
     ]
 }
 
@@ -573,6 +603,22 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
                         "required": ["signal"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "evm_read",
+                    "description": "Read on-chain state on EVM. Supports eth_getBalance and eth_call.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "method": { "type": "string", "enum": ["eth_getBalance", "eth_call"] },
+                            "address": { "type": "string" },
+                            "calldata": { "type": "string" }
+                        },
+                        "required": ["method", "address"]
+                    }
+                }
             }
         ]
     })
@@ -804,5 +850,40 @@ mod tests {
     fn request_size_is_truncated_to_u64() {
         let size = OpenRouterInferenceAdapter::estimate_request_size_bytes(&[]);
         assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn ic_llm_tools_include_evm_read() {
+        let names = ic_llm_tools()
+            .into_iter()
+            .map(|tool| match tool {
+                IcLlmTool::Function(function) => function.name,
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"evm_read".to_string()));
+    }
+
+    #[test]
+    fn openrouter_request_body_includes_evm_read_tool() {
+        let body = build_openrouter_request_body(
+            &InferenceInput {
+                input: "hello".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+            "openai/gpt-4o-mini",
+        );
+
+        let tools = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .expect("tools array must exist");
+        let names = tools
+            .iter()
+            .filter_map(|entry| entry.get("function"))
+            .filter_map(|function| function.get("name"))
+            .filter_map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"evm_read"));
     }
 }

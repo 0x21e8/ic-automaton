@@ -3,7 +3,9 @@ use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{AgentEvent, AgentState, InferenceInput, TurnRecord};
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
-use crate::features::{infer_with_provider, EvmPoller, MockEvmPoller, MockSignerAdapter};
+use crate::features::{
+    infer_with_provider, EvmPoller, HttpEvmPoller, MockEvmPoller, MockSignerAdapter,
+};
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
 
@@ -69,7 +71,14 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
     let can_poll =
         stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, started_at_ns);
     let poll = if can_poll {
-        Some(MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor).await)
+        if snapshot.evm_rpc_url.trim().is_empty() {
+            Some(MockEvmPoller::poll(&MockEvmPoller, &snapshot.evm_cursor).await)
+        } else {
+            Some(match HttpEvmPoller::from_snapshot(&snapshot) {
+                Ok(poller) => poller.poll(&snapshot.evm_cursor).await,
+                Err(error) => Err(error),
+            })
+        }
     } else {
         None
     };
