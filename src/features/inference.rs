@@ -56,6 +56,18 @@ pub struct InferenceOutput {
     pub explanation: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum InferenceTranscriptMessage {
+    Assistant {
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
 #[async_trait(?Send)]
 pub trait InferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String>;
@@ -210,18 +222,96 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
 }
 
 fn build_ic_llm_request(input: &InferenceInput, model: IcLlmModel) -> IcLlmRequest {
+    build_ic_llm_request_with_transcript(input, model, &[])
+}
+
+fn build_ic_llm_request_with_transcript(
+    input: &InferenceInput,
+    model: IcLlmModel,
+    transcript: &[InferenceTranscriptMessage],
+) -> IcLlmRequest {
+    let mut messages = vec![
+        IcLlmChatMessage::System {
+            content: prompt::assemble_system_prompt_compact(&input.context_snippet),
+        },
+        IcLlmChatMessage::User {
+            content: input.input.clone(),
+        },
+    ];
+    messages.extend(build_ic_llm_transcript_messages(transcript));
+
     IcLlmRequest {
         model: model.to_string(),
-        messages: vec![
-            IcLlmChatMessage::System {
-                content: prompt::assemble_system_prompt_compact(&input.context_snippet),
-            },
-            IcLlmChatMessage::User {
-                content: input.input.clone(),
-            },
-        ],
+        messages,
         tools: Some(ic_llm_tools()),
     }
+}
+
+fn build_ic_llm_transcript_messages(
+    transcript: &[InferenceTranscriptMessage],
+) -> Vec<IcLlmChatMessage> {
+    let mut messages = Vec::new();
+    for (transcript_index, entry) in transcript.iter().enumerate() {
+        match entry {
+            InferenceTranscriptMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let mapped_tool_calls = tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(tool_index, call)| IcLlmToolCall {
+                        id: inferred_tool_call_id(call, transcript_index, tool_index),
+                        function: IcLlmFunctionCall {
+                            name: call.tool.clone(),
+                            arguments: parse_ic_llm_tool_call_arguments(&call.args_json),
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                messages.push(IcLlmChatMessage::Assistant(IcLlmAssistantMessage {
+                    content: content.clone(),
+                    tool_calls: mapped_tool_calls,
+                }));
+            }
+            InferenceTranscriptMessage::Tool {
+                tool_call_id,
+                content,
+            } => messages.push(IcLlmChatMessage::Tool {
+                content: content.clone(),
+                tool_call_id: tool_call_id.clone(),
+            }),
+        }
+    }
+    messages
+}
+
+fn parse_ic_llm_tool_call_arguments(args_json: &str) -> Vec<IcLlmToolCallArgument> {
+    let value = match serde_json::from_str::<Value>(args_json) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let Value::Object(args) = value else {
+        return Vec::new();
+    };
+
+    args.into_iter()
+        .map(|(name, value)| IcLlmToolCallArgument {
+            name,
+            value: match value {
+                Value::String(raw) => raw,
+                other => other.to_string(),
+            },
+        })
+        .collect()
+}
+
+fn inferred_tool_call_id(call: &ToolCall, transcript_index: usize, tool_index: usize) -> String {
+    call.tool_call_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("generated-call-{transcript_index}-{tool_index}"))
 }
 
 fn ic_llm_tools() -> Vec<IcLlmTool> {
@@ -726,13 +816,24 @@ fn parse_openrouter_http_response(response: HttpRequestResult) -> Result<Inferen
 }
 
 fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
+    build_openrouter_request_body_with_transcript(input, model, &[])
+}
+
+fn build_openrouter_request_body_with_transcript(
+    input: &InferenceInput,
+    model: &str,
+    transcript: &[InferenceTranscriptMessage],
+) -> Value {
     let system_prompt = prompt::assemble_system_prompt(&input.context_snippet);
+    let mut messages = vec![
+        json!({ "role": "system", "content": system_prompt }),
+        json!({ "role": "user", "content": input.input }),
+    ];
+    messages.extend(build_openrouter_transcript_messages(transcript));
+
     json!({
         "model": model,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": input.input }
-        ],
+        "messages": messages,
         "tool_choice": "auto",
         "tools": [
             {
@@ -864,6 +965,48 @@ fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
             }
         ]
     })
+}
+
+fn build_openrouter_transcript_messages(transcript: &[InferenceTranscriptMessage]) -> Vec<Value> {
+    let mut messages = Vec::new();
+    for (transcript_index, entry) in transcript.iter().enumerate() {
+        match entry {
+            InferenceTranscriptMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let openrouter_tool_calls = tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(tool_index, call)| {
+                        json!({
+                            "id": inferred_tool_call_id(call, transcript_index, tool_index),
+                            "type": "function",
+                            "function": {
+                                "name": call.tool,
+                                "arguments": call.args_json,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": openrouter_tool_calls,
+                }));
+            }
+            InferenceTranscriptMessage::Tool {
+                tool_call_id,
+                content,
+            } => messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            })),
+        }
+    }
+    messages
 }
 
 #[derive(Deserialize)]
@@ -1318,6 +1461,160 @@ mod tests {
         assert!(system_prompt.contains("## Layer 10: Dynamic Context"));
         assert!(system_prompt.contains("### Conversation with 0xdef"));
         assert!(system_prompt.contains("## Layer 6: Economic Decision Loop"));
+    }
+
+    #[test]
+    fn ic_llm_request_appends_continuation_transcript_messages() {
+        let input = InferenceInput {
+            input: "inbox:ping".to_string(),
+            context_snippet: "ctx".to_string(),
+            turn_id: "turn-continue-ic-llm".to_string(),
+        };
+        let transcript = vec![
+            InferenceTranscriptMessage::Assistant {
+                content: Some("calling tool".to_string()),
+                tool_calls: vec![ToolCall {
+                    tool_call_id: Some("call-1".to_string()),
+                    tool: "record_signal".to_string(),
+                    args_json: r#"{"signal":"tick"}"#.to_string(),
+                }],
+            },
+            InferenceTranscriptMessage::Tool {
+                tool_call_id: "call-1".to_string(),
+                content: r#"{"ok":true}"#.to_string(),
+            },
+        ];
+
+        let request =
+            build_ic_llm_request_with_transcript(&input, IcLlmModel::Llama3_1_8B, &transcript);
+        assert_eq!(request.messages.len(), 4);
+        assert!(matches!(
+            request.messages[0],
+            IcLlmChatMessage::System { .. }
+        ));
+        assert!(matches!(request.messages[1], IcLlmChatMessage::User { .. }));
+
+        let IcLlmChatMessage::Assistant(message) = &request.messages[2] else {
+            panic!("third message must be assistant continuation");
+        };
+        assert_eq!(message.content.as_deref(), Some("calling tool"));
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].id, "call-1");
+        assert_eq!(message.tool_calls[0].function.name, "record_signal");
+        assert_eq!(
+            message.tool_calls[0].function.arguments,
+            vec![IcLlmToolCallArgument {
+                name: "signal".to_string(),
+                value: "tick".to_string(),
+            }]
+        );
+
+        let IcLlmChatMessage::Tool {
+            content,
+            tool_call_id,
+        } = &request.messages[3]
+        else {
+            panic!("fourth message must be tool continuation");
+        };
+        assert_eq!(tool_call_id, "call-1");
+        assert_eq!(content, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn openrouter_request_body_appends_continuation_transcript_messages() {
+        let input = InferenceInput {
+            input: "inbox:ping".to_string(),
+            context_snippet: "ctx".to_string(),
+            turn_id: "turn-continue-openrouter".to_string(),
+        };
+        let transcript = vec![
+            InferenceTranscriptMessage::Assistant {
+                content: Some("calling tool".to_string()),
+                tool_calls: vec![ToolCall {
+                    tool_call_id: Some("call-1".to_string()),
+                    tool: "record_signal".to_string(),
+                    args_json: r#"{"signal":"tick"}"#.to_string(),
+                }],
+            },
+            InferenceTranscriptMessage::Tool {
+                tool_call_id: "call-1".to_string(),
+                content: r#"{"ok":true}"#.to_string(),
+            },
+        ];
+
+        let body = build_openrouter_request_body_with_transcript(
+            &input,
+            "openai/gpt-4o-mini",
+            &transcript,
+        );
+        let messages = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .expect("messages array must exist");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages[2]
+                .get("role")
+                .and_then(|value| value.as_str())
+                .expect("assistant role must exist"),
+            "assistant"
+        );
+        assert_eq!(
+            messages[2]
+                .get("content")
+                .and_then(|value| value.as_str())
+                .expect("assistant content must exist"),
+            "calling tool"
+        );
+        let tool_calls = messages[2]
+            .get("tool_calls")
+            .and_then(|value| value.as_array())
+            .expect("assistant tool_calls must exist");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0]
+                .get("id")
+                .and_then(|value| value.as_str())
+                .expect("tool call id must exist"),
+            "call-1"
+        );
+        assert_eq!(
+            tool_calls[0]
+                .get("function")
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+                .expect("tool call name must exist"),
+            "record_signal"
+        );
+        assert_eq!(
+            tool_calls[0]
+                .get("function")
+                .and_then(|value| value.get("arguments"))
+                .and_then(|value| value.as_str())
+                .expect("tool call arguments must exist"),
+            r#"{"signal":"tick"}"#
+        );
+        assert_eq!(
+            messages[3]
+                .get("role")
+                .and_then(|value| value.as_str())
+                .expect("tool role must exist"),
+            "tool"
+        );
+        assert_eq!(
+            messages[3]
+                .get("tool_call_id")
+                .and_then(|value| value.as_str())
+                .expect("tool message tool_call_id must exist"),
+            "call-1"
+        );
+        assert_eq!(
+            messages[3]
+                .get("content")
+                .and_then(|value| value.as_str())
+                .expect("tool message content must exist"),
+            r#"{"ok":true}"#
+        );
     }
 
     #[test]
