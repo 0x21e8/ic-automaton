@@ -1,10 +1,12 @@
 use crate::domain::types::{
     AgentEvent, AgentState, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
     InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
-    OutboxMessage, OutboxStats, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
-    SchedulerRuntime, SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    OutboxMessage, OutboxStats, PromptLayer, RuntimeSnapshot, RuntimeView, ScheduledJob,
+    SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass, SurvivalTier, TaskKind,
+    TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord,
+    TurnRecord,
 };
+use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
     memory_manager::{MemoryId, MemoryManager, VirtualMemory},
@@ -261,10 +263,16 @@ thread_local! {
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(17)))
     ));
+    static PROMPT_LAYER_MAP: RefCell<
+        StableBTreeMap<u8, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(18)))
+    ));
 }
 
 pub fn init_storage() {
     let _ = runtime_snapshot();
+    seed_default_prompt_layers();
     if runtime_u64(INBOX_SEQ_KEY).is_none() {
         save_runtime_u64(INBOX_SEQ_KEY, 0);
     }
@@ -310,6 +318,44 @@ pub fn init_scheduler_defaults(now_ns: u64) {
             );
         }
     }
+}
+
+fn seed_default_prompt_layers() {
+    for layer_id in prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID {
+        if get_prompt_layer(layer_id).is_some() {
+            continue;
+        }
+        if let Some(content) = prompt::default_layer_content(layer_id) {
+            let _ = save_prompt_layer(&PromptLayer {
+                layer_id,
+                content: content.to_string(),
+                updated_at_ns: now_ns(),
+                updated_by_turn: "init".to_string(),
+                version: 1,
+            });
+        }
+    }
+}
+
+pub fn get_prompt_layer(layer_id: u8) -> Option<PromptLayer> {
+    PROMPT_LAYER_MAP
+        .with(|map| map.borrow().get(&layer_id))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn save_prompt_layer(layer: &PromptLayer) -> Result<(), String> {
+    if !(prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID).contains(&layer.layer_id) {
+        return Err(format!(
+            "mutable prompt layer id must be in range {}..={}",
+            prompt::MUTABLE_LAYER_MIN_ID,
+            prompt::MUTABLE_LAYER_MAX_ID
+        ));
+    }
+
+    PROMPT_LAYER_MAP.with(|map| {
+        map.borrow_mut().insert(layer.layer_id, encode_json(layer));
+    });
+    Ok(())
 }
 
 pub fn runtime_snapshot() -> RuntimeSnapshot {
@@ -1713,7 +1759,7 @@ fn read_json<T: DeserializeOwned>(value: Option<&[u8]>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{InboxMessageStatus, MemoryFact, TaskKind, TaskLane};
+    use crate::domain::types::{InboxMessageStatus, MemoryFact, PromptLayer, TaskKind, TaskLane};
 
     fn sample_job(id: &str, kind: TaskKind, when: u64, priority: u8) -> ScheduledJob {
         ScheduledJob {
@@ -1748,6 +1794,58 @@ mod tests {
                 last_error: None,
             },
         );
+    }
+
+    #[test]
+    fn init_storage_seeds_default_prompt_layers() {
+        for layer_id in prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID {
+            PROMPT_LAYER_MAP.with(|map| {
+                map.borrow_mut().remove(&layer_id);
+            });
+        }
+
+        init_storage();
+
+        for layer_id in prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID {
+            let layer = get_prompt_layer(layer_id).expect("default prompt layer should be seeded");
+            assert_eq!(layer.layer_id, layer_id);
+            assert_eq!(
+                layer.content,
+                prompt::default_layer_content(layer_id)
+                    .expect("default content should be available")
+                    .to_string()
+            );
+            assert_eq!(layer.updated_by_turn, "init");
+            assert_eq!(layer.version, 1);
+        }
+    }
+
+    #[test]
+    fn save_prompt_layer_validates_mutable_range() {
+        let result = save_prompt_layer(&PromptLayer {
+            layer_id: 5,
+            content: "invalid".to_string(),
+            updated_at_ns: 1,
+            updated_by_turn: "turn-1".to_string(),
+            version: 1,
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_prompt_layer_persists_content() {
+        let layer = PromptLayer {
+            layer_id: 8,
+            content: "## Layer 8: Custom".to_string(),
+            updated_at_ns: 77,
+            updated_by_turn: "turn-77".to_string(),
+            version: 3,
+        };
+
+        save_prompt_layer(&layer).expect("save should succeed");
+        let stored = get_prompt_layer(8).expect("layer must be persisted");
+        assert_eq!(stored, layer);
     }
 
     #[test]
