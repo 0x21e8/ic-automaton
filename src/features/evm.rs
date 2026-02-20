@@ -23,6 +23,7 @@ const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
+const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
 
 pub struct EvmPollResult {
     pub cursor: EvmPollCursor,
@@ -177,9 +178,17 @@ impl HttpEvmRpcClient {
         })
     }
 
+    fn control_plane_max_response_bytes(&self) -> u64 {
+        CONTROL_PLANE_MAX_RESPONSE_BYTES
+    }
+
     async fn eth_block_number(&self) -> Result<u64, String> {
         let response = self
-            .rpc_call("eth_blockNumber", json!([]), 256)
+            .rpc_call(
+                "eth_blockNumber",
+                json!([]),
+                self.control_plane_max_response_bytes(),
+            )
             .await
             .map_err(|error| format!("eth_blockNumber failed: {error}"))?;
         let raw = response
@@ -228,7 +237,11 @@ impl HttpEvmRpcClient {
 
     pub async fn eth_get_balance(&self, address: &str) -> Result<String, String> {
         let response = self
-            .rpc_call("eth_getBalance", json!([address, "latest"]), 256)
+            .rpc_call(
+                "eth_getBalance",
+                json!([address, "latest"]),
+                self.control_plane_max_response_bytes(),
+            )
             .await
             .map_err(|error| format!("eth_getBalance failed: {error}"))?;
         let raw = response
@@ -243,7 +256,7 @@ impl HttpEvmRpcClient {
             .rpc_call(
                 "eth_call",
                 json!([{"to": address, "data": calldata}, "latest"]),
-                4096,
+                self.control_plane_max_response_bytes(),
             )
             .await
             .map_err(|error| format!("eth_call failed: {error}"))?;
@@ -256,7 +269,11 @@ impl HttpEvmRpcClient {
 
     pub async fn eth_get_transaction_count(&self, address: &str) -> Result<u64, String> {
         let response = self
-            .rpc_call("eth_getTransactionCount", json!([address, "pending"]), 256)
+            .rpc_call(
+                "eth_getTransactionCount",
+                json!([address, "pending"]),
+                self.control_plane_max_response_bytes(),
+            )
             .await
             .map_err(|error| format!("eth_getTransactionCount failed: {error}"))?;
         let raw = response
@@ -268,7 +285,11 @@ impl HttpEvmRpcClient {
 
     pub async fn eth_gas_price(&self) -> Result<U256, String> {
         let response = self
-            .rpc_call("eth_gasPrice", json!([]), 256)
+            .rpc_call(
+                "eth_gasPrice",
+                json!([]),
+                self.control_plane_max_response_bytes(),
+            )
             .await
             .map_err(|error| format!("eth_gasPrice failed: {error}"))?;
         let raw = response
@@ -295,7 +316,7 @@ impl HttpEvmRpcClient {
                     "value": value_hex,
                     "data": data_hex
                 }]),
-                256,
+                self.control_plane_max_response_bytes(),
             )
             .await
             .map_err(|error| format!("eth_estimateGas failed: {error}"))?;
@@ -309,7 +330,11 @@ impl HttpEvmRpcClient {
     pub async fn eth_send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String, String> {
         let payload = format!("0x{}", hex::encode(raw_tx));
         let response = self
-            .rpc_call("eth_sendRawTransaction", json!([payload]), 256)
+            .rpc_call(
+                "eth_sendRawTransaction",
+                json!([payload]),
+                self.control_plane_max_response_bytes(),
+            )
             .await
             .map_err(|error| format!("eth_sendRawTransaction failed: {error}"))?;
         let raw = response
@@ -1034,6 +1059,17 @@ mod tests {
         .expect("evm_read should succeed in host-mode stub");
 
         assert_eq!(out, "0x1");
+    }
+
+    #[test]
+    fn control_plane_outcalls_use_safe_response_cap() {
+        let snapshot = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            evm_rpc_max_response_bytes: 256,
+            ..RuntimeSnapshot::default()
+        };
+        let rpc = HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should build");
+        assert_eq!(rpc.control_plane_max_response_bytes(), 4_096);
     }
 
     struct FixedSignatureSigner;
