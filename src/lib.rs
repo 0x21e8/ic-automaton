@@ -86,6 +86,11 @@ fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, String
     stable::set_evm_rpc_max_response_bytes(max_response_bytes)
 }
 
+#[ic_cdk::update]
+fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
+    stable::set_http_allowed_domains(domains)
+}
+
 #[ic_cdk::query]
 fn get_runtime_view() -> RuntimeView {
     stable::snapshot_to_view()

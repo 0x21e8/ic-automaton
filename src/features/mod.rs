@@ -1,4 +1,5 @@
 pub mod evm;
+pub mod http_fetch;
 pub mod inference;
 pub mod signer;
 pub mod skills;

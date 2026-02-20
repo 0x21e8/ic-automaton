@@ -31,6 +31,7 @@ const RUNTIME_KEY: &str = "runtime.snapshot";
 const SCHEDULER_RUNTIME_KEY: &str = "scheduler.runtime";
 const INBOX_SEQ_KEY: &str = "inbox.seq";
 const OUTBOX_SEQ_KEY: &str = "outbox.seq";
+const HTTP_ALLOWLIST_INITIALIZED_KEY: &str = "http.allowlist.initialized";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
@@ -40,6 +41,13 @@ pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const DEFAULT_HTTP_ALLOWED_DOMAINS: &[&str] = &[
+    "api.coingecko.com",
+    "api.coinbase.com",
+    "min-api.cryptocompare.com",
+    "base.blockscout.com",
+    "basescan.org",
+];
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
@@ -248,6 +256,11 @@ thread_local! {
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(16)))
     ));
+    static HTTP_DOMAIN_ALLOWLIST_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(17)))
+    ));
 }
 
 pub fn init_storage() {
@@ -257,6 +270,10 @@ pub fn init_storage() {
     }
     if runtime_u64(OUTBOX_SEQ_KEY).is_none() {
         save_runtime_u64(OUTBOX_SEQ_KEY, 0);
+    }
+    if !runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY).unwrap_or(false) {
+        seed_default_http_allowed_domains();
+        save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, true);
     }
     init_scheduler_defaults(now_ns());
 }
@@ -681,6 +698,125 @@ fn sort_memory_facts_desc_by_updated(mut facts: Vec<MemoryFact>, limit: usize) -
         facts.truncate(limit);
     }
     facts
+}
+
+pub fn list_allowed_http_domains() -> Vec<String> {
+    HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>()
+    })
+}
+
+pub fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
+    let mut normalized = domains
+        .into_iter()
+        .map(|domain| normalize_http_allowed_domain(&domain))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    normalized.dedup();
+
+    HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
+        let keys = map
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut map_ref = map.borrow_mut();
+        for key in keys {
+            map_ref.remove(&key);
+        }
+        for domain in normalized {
+            map_ref.insert(domain, vec![1]);
+        }
+    });
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, true);
+    Ok(list_allowed_http_domains())
+}
+
+#[allow(dead_code)]
+pub fn add_http_allowed_domain(domain: String) -> Result<String, String> {
+    let normalized = normalize_http_allowed_domain(&domain)?;
+    HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
+        map.borrow_mut().insert(normalized.clone(), vec![1]);
+    });
+    save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, true);
+    Ok(normalized)
+}
+
+#[allow(dead_code)]
+pub fn remove_http_allowed_domain(domain: String) -> Result<bool, String> {
+    let normalized = normalize_http_allowed_domain(&domain)?;
+    let removed = HTTP_DOMAIN_ALLOWLIST_MAP
+        .with(|map| map.borrow_mut().remove(&normalized))
+        .is_some();
+    save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, true);
+    Ok(removed)
+}
+
+fn normalize_http_allowed_domain(raw: &str) -> Result<String, String> {
+    let domain = raw.trim().to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err("http allowed domain cannot be empty".to_string());
+    }
+    if domain.contains("://")
+        || domain.contains('/')
+        || domain.contains('?')
+        || domain.contains('#')
+        || domain.contains('@')
+        || domain.contains(':')
+    {
+        return Err("http allowed domain must be a bare host without scheme/path/port".to_string());
+    }
+    if domain.starts_with('.') || domain.ends_with('.') {
+        return Err("http allowed domain must not start or end with '.'".to_string());
+    }
+
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err("http allowed domain labels must not be empty".to_string());
+        }
+        let bytes = label.as_bytes();
+        let starts_ok = bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        let ends_ok = bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        if !starts_ok || !ends_ok {
+            return Err(
+                "http allowed domain labels must start and end with alphanumeric characters"
+                    .to_string(),
+            );
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err("http allowed domain labels may only contain [a-z0-9-]".to_string());
+        }
+    }
+
+    Ok(domain)
+}
+
+fn seed_default_http_allowed_domains() {
+    let defaults = DEFAULT_HTTP_ALLOWED_DOMAINS
+        .iter()
+        .map(|domain| normalize_http_allowed_domain(domain))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default();
+    HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
+        let mut map_ref = map.borrow_mut();
+        for domain in defaults {
+            map_ref.insert(domain, vec![1]);
+        }
+    });
 }
 
 pub fn set_evm_rpc_url(url: String) -> Result<String, String> {
@@ -1553,6 +1689,19 @@ fn save_runtime_u64(key: &str, value: u64) {
     });
 }
 
+fn runtime_bool(key: &str) -> Option<bool> {
+    RUNTIME_MAP
+        .with(|map| map.borrow().get(&key.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+fn save_runtime_bool(key: &str, value: bool) {
+    RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(key.to_string(), encode_json(&value));
+    });
+}
+
 fn encode_json<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_default()
 }
@@ -1871,5 +2020,28 @@ mod tests {
         assert!(remove_memory_fact("strategy.primary"));
         assert!(!remove_memory_fact("strategy.primary"));
         assert_eq!(memory_fact_count(), 1);
+    }
+
+    #[test]
+    fn http_domain_allowlist_set_add_remove_and_list() {
+        init_storage();
+
+        let stored = set_http_allowed_domains(vec![
+            "api.coingecko.com".to_string(),
+            " API.COINBASE.COM ".to_string(),
+        ])
+        .expect("allowlist should be configurable");
+        assert_eq!(stored, vec!["api.coinbase.com", "api.coingecko.com"]);
+
+        let added =
+            add_http_allowed_domain("basescan.org".to_string()).expect("single add should succeed");
+        assert_eq!(added, "basescan.org");
+        assert!(list_allowed_http_domains().contains(&"basescan.org".to_string()));
+
+        let removed = remove_http_allowed_domain("basescan.org".to_string())
+            .expect("single remove should succeed");
+        assert!(removed);
+
+        assert!(set_http_allowed_domains(vec!["https://example.com".to_string()]).is_err());
     }
 }
