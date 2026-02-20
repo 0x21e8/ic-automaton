@@ -57,7 +57,6 @@ impl EvmBroadcastPort for MockEvmBroadcastAdapter {
 pub struct ToolPolicy {
     pub enabled: bool,
     pub allowed_states: Vec<AgentState>,
-    pub max_calls_per_turn: u8,
 }
 
 impl Default for ToolPolicy {
@@ -69,14 +68,12 @@ impl Default for ToolPolicy {
                 AgentState::Inferring,
                 AgentState::Persisting,
             ],
-            max_calls_per_turn: 10,
         }
     }
 }
 
 pub struct ToolManager {
     policies: HashMap<String, ToolPolicy>,
-    executed_per_tool: HashMap<String, u8>,
 }
 
 impl ToolManager {
@@ -87,7 +84,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
-                max_calls_per_turn: 3,
             },
         );
         policies.insert(
@@ -95,7 +91,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
-                max_calls_per_turn: 1,
             },
         );
         policies.insert(
@@ -103,7 +98,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
-                max_calls_per_turn: 5,
             },
         );
         policies.insert(
@@ -111,7 +105,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
-                max_calls_per_turn: 3,
             },
         );
         policies.insert(
@@ -119,7 +112,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
-                max_calls_per_turn: 1,
             },
         );
         policies.insert(
@@ -127,7 +119,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
-                max_calls_per_turn: 5,
             },
         );
         policies.insert(
@@ -135,7 +126,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
-                max_calls_per_turn: 3,
             },
         );
         policies.insert(
@@ -143,7 +133,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
-                max_calls_per_turn: 5,
             },
         );
         policies.insert(
@@ -151,7 +140,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
-                max_calls_per_turn: 2,
             },
         );
         policies.insert(
@@ -159,14 +147,10 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
-                max_calls_per_turn: 1,
             },
         );
 
-        Self {
-            policies,
-            executed_per_tool: HashMap::new(),
-        }
+        Self { policies }
     }
 
     #[allow(dead_code)]
@@ -237,19 +221,6 @@ impl ToolManager {
                 continue;
             }
 
-            let used = self.executed_per_tool.get(&call.tool).copied().unwrap_or(0);
-            if used >= policy.max_calls_per_turn {
-                records.push(ToolCallRecord {
-                    turn_id: turn_id.to_string(),
-                    tool: call.tool.clone(),
-                    args_json: call.args_json.clone(),
-                    output: "tool budget exceeded".to_string(),
-                    success: false,
-                    error: Some("tool budget exceeded".to_string()),
-                });
-                continue;
-            }
-
             let result = match call.tool.as_str() {
                 "sign_message" => {
                     let now_ns = current_time_ns();
@@ -270,8 +241,6 @@ impl ToolManager {
                                     success: false,
                                     error: Some(error),
                                 });
-                                self.executed_per_tool
-                                    .insert(call.tool.clone(), used.saturating_add(1));
                                 continue;
                             }
                         };
@@ -390,9 +359,6 @@ impl ToolManager {
                 }
                 _ => Err("unknown tool".to_string()),
             };
-
-            self.executed_per_tool
-                .insert(call.tool.clone(), used.saturating_add(1));
 
             records.push(match result {
                 Ok(output) => ToolCallRecord {
@@ -1015,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn update_prompt_layer_tool_budget_is_limited_to_one_call_per_turn() {
+    fn update_prompt_layer_supports_multiple_calls_per_turn() {
         stable::init_storage();
         let state = AgentState::ExecutingActions;
         let signer = CountingSigner::new();
@@ -1043,10 +1009,6 @@ mod tests {
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-budget"));
         assert_eq!(records.len(), 2);
         assert!(records[0].success);
-        assert!(!records[1].success);
-        assert_eq!(
-            records[1].error.as_deref().unwrap_or_default(),
-            "tool budget exceeded"
-        );
+        assert!(records[1].success);
     }
 }

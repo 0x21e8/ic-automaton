@@ -167,6 +167,8 @@ pub struct TurnRecord {
     pub source_events: u32,
     pub tool_call_count: u32,
     pub input_summary: String,
+    #[serde(default)]
+    pub inner_dialogue: Option<String>,
     pub error: Option<String>,
 }
 
