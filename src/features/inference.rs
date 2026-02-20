@@ -911,8 +911,7 @@ fn parse_relaxed_json_value(raw: &str) -> Result<Value, String> {
 }
 
 fn parse_openrouter_tool_args_candidate(raw: &str) -> Result<Value, OpenRouterToolArgsError> {
-    let parsed =
-        parse_relaxed_json_value(raw).map_err(OpenRouterToolArgsError::JsonParse)?;
+    let parsed = parse_relaxed_json_value(raw).map_err(OpenRouterToolArgsError::JsonParse)?;
     match parsed {
         Value::Object(_) => Ok(parsed),
         Value::String(nested) => {

@@ -281,7 +281,10 @@ fn http_request_update(request: HttpUpdateRequest) -> HttpUpdateResponse {
 }
 
 fn arm_timer() {
-    set_timer_interval_serial(Duration::from_secs(SCHEDULER_TICK_INTERVAL_SECS), scheduler_tick);
+    set_timer_interval_serial(
+        Duration::from_secs(SCHEDULER_TICK_INTERVAL_SECS),
+        scheduler_tick,
+    );
 }
 
 ic_cdk::export_candid!();
