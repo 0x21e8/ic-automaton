@@ -2,6 +2,7 @@ mod agent;
 mod domain;
 mod features;
 mod http;
+pub mod prompt;
 mod scheduler;
 mod storage;
 mod tools;

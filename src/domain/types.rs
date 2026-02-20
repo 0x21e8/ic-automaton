@@ -179,6 +179,15 @@ pub struct SkillRecord {
     pub mutable: bool,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PromptLayer {
+    pub layer_id: u8,
+    pub content: String,
+    pub updated_at_ns: u64,
+    pub updated_by_turn: String,
+    pub version: u32,
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeView {
     pub state: AgentState,
