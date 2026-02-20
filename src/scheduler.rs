@@ -13,6 +13,7 @@ use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
 const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
 const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 4;
+const MAX_MUTATING_JOBS_PER_TICK: u8 = 4;
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -64,13 +65,35 @@ pub async fn scheduler_tick() {
 
     refresh_due_jobs(now_ns);
 
+    let mut processed_jobs = 0u8;
+    let mut terminal_error: Option<String> = None;
+    while processed_jobs < MAX_MUTATING_JOBS_PER_TICK {
+        match run_one_pending_mutating_job(current_time_ns()).await {
+            Ok(true) => processed_jobs = processed_jobs.saturating_add(1),
+            Ok(false) => break,
+            Err(error) => {
+                terminal_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_tick_end processed_jobs={} now={}",
+        processed_jobs,
+        current_time_ns()
+    );
+    stable::record_scheduler_tick_end(current_time_ns(), terminal_error);
+}
+
+async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
     if stable::mutating_lease_active(now_ns) {
         log!(
             SchedulerLogPriority::Info,
-            "scheduler_tick_end mutating lease active now={now_ns}",
+            "scheduler_tick mutating lease active now={now_ns}",
         );
-        stable::record_scheduler_tick_end(now_ns, None);
-        return;
+        return Ok(false);
     }
 
     let job = match stable::pop_next_pending_job(TaskLane::Mutating, now_ns) {
@@ -84,14 +107,7 @@ pub async fn scheduler_tick() {
             );
             job
         }
-        None => {
-            log!(
-                SchedulerLogPriority::Info,
-                "scheduler_tick_end no_job now={now_ns}"
-            );
-            stable::record_scheduler_tick_end(now_ns, None);
-            return;
-        }
+        None => return Ok(false),
     };
 
     if let Err(error) = stable::acquire_mutating_lease(&job.id, now_ns, lease_ttl_ns(&job.kind)) {
@@ -107,8 +123,7 @@ pub async fn scheduler_tick() {
             Some(format!("lease acquire failed: {error}")),
             current_time_ns(),
         );
-        stable::record_scheduler_tick_end(current_time_ns(), Some(error));
-        return;
+        return Err(error);
     }
 
     if let Some(operation_class) = operation_class_for_task(&job.kind) {
@@ -127,8 +142,7 @@ pub async fn scheduler_tick() {
                 job.kind,
                 operation_class
             );
-            stable::record_scheduler_tick_end(current_time_ns(), None);
-            return;
+            return Ok(true);
         }
     }
 
@@ -143,13 +157,7 @@ pub async fn scheduler_tick() {
         ),
     }
 
-    log!(
-        SchedulerLogPriority::Info,
-        "scheduler_tick_end result job_id={} kind={:?}",
-        job.id,
-        job.kind
-    );
-    stable::record_scheduler_tick_end(current_time_ns(), None);
+    Ok(true)
 }
 
 async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
@@ -283,7 +291,11 @@ pub fn refresh_due_jobs(now_ns: u64) {
             );
         }
 
-        runtime.next_due_ns = runtime.next_due_ns.saturating_add(interval_ns);
+        // Prevent bursty "catch-up" scheduling when runtime is far behind wall-clock.
+        // We advance by one interval, but never leave next_due_ns behind the current slot.
+        let advanced_due_ns = runtime.next_due_ns.saturating_add(interval_ns);
+        let aligned_due_ns = slot_start_ns.saturating_add(interval_ns);
+        runtime.next_due_ns = advanced_due_ns.max(aligned_due_ns);
         stable::save_task_runtime(&kind, &runtime);
     }
 }
@@ -310,6 +322,35 @@ mod tests {
     use super::*;
     use crate::domain::types::{SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime};
     use crate::storage::stable;
+    use std::future::Future;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
+        unsafe fn clone(_ptr: *const ()) -> RawWaker {
+            dummy_raw_waker()
+        }
+        unsafe fn wake(_ptr: *const ()) {}
+        unsafe fn wake_by_ref(_ptr: *const ()) {}
+        unsafe fn drop(_ptr: *const ()) {}
+
+        fn dummy_raw_waker() -> RawWaker {
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+
+        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+
+        for _ in 0..10_000 {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::hint::spin_loop(),
+            }
+        }
+
+        panic!("future did not complete in test polling loop");
+    }
 
     fn init_scheduler_scope() {
         stable::init_scheduler_defaults(0);
@@ -396,7 +437,7 @@ mod tests {
         let runtime_after_second = stable::get_task_runtime(&TaskKind::PollInbox);
         assert_eq!(
             runtime_after_second.next_due_ns,
-            now_ns.saturating_add(2 * interval_ns)
+            second_slot_start_ns.saturating_add(interval_ns)
         );
     }
 
@@ -599,5 +640,45 @@ mod tests {
             stable::can_run_survival_operation(&SurvivalOperationClass::Inference, after_backoff),
             "operation should be runnable after backoff window"
         );
+    }
+
+    #[test]
+    fn scheduler_tick_drains_multiple_pending_jobs_in_one_tick() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        let poll_job = stable::enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "PollInbox:manual-1".to_string(),
+            0,
+            0,
+        );
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:manual-1".to_string(),
+            0,
+            1,
+        );
+        assert!(poll_job.is_some(), "poll job should enqueue");
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+
+        block_on_with_spin(scheduler_tick());
+
+        let jobs = stable::list_recent_jobs(10);
+        let poll = jobs
+            .iter()
+            .find(|job| job.dedupe_key == "PollInbox:manual-1")
+            .expect("poll job should be present");
+        let reconcile = jobs
+            .iter()
+            .find(|job| job.dedupe_key == "Reconcile:manual-1")
+            .expect("reconcile job should be present");
+        assert_eq!(poll.status, JobStatus::Succeeded);
+        assert_eq!(reconcile.status, JobStatus::Succeeded);
     }
 }
