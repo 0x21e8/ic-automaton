@@ -22,6 +22,13 @@ enum TaskKind {
 }
 
 #[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+enum InferenceProvider {
+    Mock,
+    IcLlm,
+    OpenRouter,
+}
+
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 enum JobStatus {
     Pending,
     InFlight,
@@ -168,6 +175,20 @@ fn set_scheduler_low_cycles_mode(pic: &PocketIc, canister_id: Principal, enabled
     let _: String = call_update(pic, canister_id, "set_scheduler_low_cycles_mode", payload);
 }
 
+fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: InferenceProvider) {
+    let payload = encode_args((provider,)).unwrap_or_else(|error| {
+        panic!("failed to encode set_inference_provider args: {error}");
+    });
+    let _: String = call_update(pic, canister_id, "set_inference_provider", payload);
+}
+
+fn set_openrouter_api_key(pic: &PocketIc, canister_id: Principal, api_key: Option<String>) {
+    let payload = encode_args((api_key,)).unwrap_or_else(|error| {
+        panic!("failed to encode set_openrouter_api_key args: {error}");
+    });
+    let _: String = call_update(pic, canister_id, "set_openrouter_api_key", payload);
+}
+
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
     let payload = encode_args((200u32,)).unwrap_or_else(|error| {
         panic!("failed to encode list_scheduler_jobs args: {error}");
@@ -195,6 +216,19 @@ fn configure_only_poll_inbox(pic: &PocketIc, canister_id: Principal, interval_se
         set_task_interval_secs(pic, canister_id, kind, interval_secs);
     }
     set_task_enabled(pic, canister_id, TaskKind::PollInbox, true);
+}
+
+fn configure_only_agent_turn(pic: &PocketIc, canister_id: Principal, interval_secs: u64) {
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(pic, canister_id, kind, false);
+        set_task_interval_secs(pic, canister_id, kind, interval_secs);
+    }
+    set_task_enabled(pic, canister_id, TaskKind::AgentTurn, true);
 }
 
 fn assert_single_slot_poll_inbox_job(counted_jobs: &[ObservedJob]) -> String {
@@ -241,6 +275,13 @@ fn placeholder_post_upgrade_rearms_timer() {
 #[test]
 #[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
 fn placeholder_low_cycles_mode_suppresses_non_essential_jobs() {
+    let _wasm = assert_wasm_artifact_present();
+}
+
+#[cfg(not(feature = "pocketic_tests"))]
+#[test]
+#[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
+fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
     let _wasm = assert_wasm_artifact_present();
 }
 
@@ -389,4 +430,27 @@ fn placeholder_low_cycles_mode_suppresses_non_essential_jobs() {
         reconcile_jobs, 0,
         "low cycles mode should skip non-essential tasks"
     );
+}
+
+#[cfg(feature = "pocketic_tests")]
+#[test]
+fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_only_agent_turn(&pic, canister_id, 60);
+    set_inference_provider(&pic, canister_id, InferenceProvider::OpenRouter);
+    set_openrouter_api_key(&pic, canister_id, Some("test-api-key".to_string()));
+    pic.advance_time(Duration::from_secs(61));
+
+    pic.tick();
+
+    let runtime = get_scheduler_view(&pic, canister_id);
+    let lease = runtime
+        .active_mutating_lease
+        .expect("agent turn should keep a mutating lease while awaiting async work");
+    let ttl_ns = lease.expires_at_ns.saturating_sub(lease.acquired_at_ns);
+    assert_eq!(
+        ttl_ns, 240_000_000_000,
+        "agent-turn lease ttl regression: expected 240 seconds"
+    );
+    assert_eq!(lease.lane, TaskLane::Mutating);
 }
