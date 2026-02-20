@@ -20,6 +20,7 @@ const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60 * 60;
 const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
 const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 3;
 const MAX_AGENT_TURN_DURATION_NS: u64 = 90 * 1_000_000_000;
+const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -175,11 +176,11 @@ fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
 fn suppress_duplicate_autonomy_tool_calls(
     calls: &[ToolCall],
     now_ns: u64,
-) -> (Vec<ToolCall>, Vec<String>) {
+) -> (Vec<ToolCall>, Vec<SuppressedAutonomyToolCall>) {
     let mut allowed = Vec::with_capacity(calls.len());
     let mut suppressed = Vec::new();
 
-    for call in calls {
+    for (index, call) in calls.iter().enumerate() {
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
         let Some(last_success_ns) = stable::autonomy_tool_last_success_ns(&fingerprint) else {
             allowed.push(call.clone());
@@ -188,12 +189,11 @@ fn suppress_duplicate_autonomy_tool_calls(
 
         let elapsed_ns = now_ns.saturating_sub(last_success_ns);
         if elapsed_ns < AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS {
-            suppressed.push(format!(
-                "{} args={} age_secs={}",
-                call.tool,
-                sanitize_preview(&call.args_json, 100),
-                elapsed_ns / 1_000_000_000,
-            ));
+            suppressed.push(SuppressedAutonomyToolCall {
+                index,
+                call: call.clone(),
+                age_secs: elapsed_ns / 1_000_000_000,
+            });
             continue;
         }
 
@@ -201,6 +201,31 @@ fn suppress_duplicate_autonomy_tool_calls(
     }
 
     (allowed, suppressed)
+}
+
+#[derive(Clone, Debug)]
+struct SuppressedAutonomyToolCall {
+    index: usize,
+    call: ToolCall,
+    age_secs: u64,
+}
+
+fn synthetic_suppressed_autonomy_tool_record(
+    turn_id: &str,
+    call: &ToolCall,
+    age_secs: u64,
+) -> ToolCallRecord {
+    ToolCallRecord {
+        turn_id: turn_id.to_string(),
+        tool: call.tool.clone(),
+        args_json: call.args_json.clone(),
+        output: format!(
+            "{AUTONOMY_DEDUPE_SKIP_REASON}: last success {} seconds ago within {} second window",
+            age_secs, BALANCE_FRESHNESS_WINDOW_SECS
+        ),
+        success: true,
+        error: None,
+    }
 }
 
 fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeeded_at_ns: u64) {
@@ -765,23 +790,38 @@ async fn run_scheduled_turn_job_with_limits(
                 inference_completed = true;
             }
 
-            let mut planned_tool_calls =
+            let planned_tool_calls =
                 normalize_tool_call_ids(inference.tool_calls, inference_round_count - 1);
+            let mut executable_tool_calls = planned_tool_calls.clone();
+            let mut suppressed_autonomy_calls = Vec::new();
             if inference_round_count == 1 && !has_external_input {
                 let (filtered_calls, suppressed_calls) =
                     suppress_duplicate_autonomy_tool_calls(&planned_tool_calls, started_at_ns);
-                planned_tool_calls = filtered_calls;
+                executable_tool_calls = filtered_calls;
                 if !suppressed_calls.is_empty() {
+                    let details = suppressed_calls
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{} args={} age_secs={}",
+                                entry.call.tool,
+                                sanitize_preview(&entry.call.args_json, 100),
+                                entry.age_secs
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n- ");
                     append_inner_dialogue(
                         &mut inner_dialogue,
                         &format!(
                             "autonomy dedupe suppressed {} repeated successful tool call(s) within {} seconds:\n- {}",
                             suppressed_calls.len(),
                             BALANCE_FRESHNESS_WINDOW_SECS,
-                            suppressed_calls.join("\n- "),
+                            details,
                         ),
                     );
                 }
+                suppressed_autonomy_calls = suppressed_calls;
             }
 
             if planned_tool_calls.is_empty() {
@@ -798,7 +838,7 @@ async fn run_scheduled_turn_job_with_limits(
             });
 
             let executed = manager
-                .execute_actions(&state, &planned_tool_calls, signer.as_ref(), &turn_id)
+                .execute_actions(&state, &executable_tool_calls, signer.as_ref(), &turn_id)
                 .await;
             executed_any_tool = executed_any_tool || !executed.is_empty();
 
@@ -806,17 +846,59 @@ async fn run_scheduled_turn_job_with_limits(
             if !has_external_input {
                 record_successful_autonomy_tool_calls(&executed, execution_completed_ns);
             }
-            persist_eth_balance_from_tool_calls(&executed, &turn_id, execution_completed_ns);
-            if let Some(tool_results_reply) = render_tool_results_reply(&executed) {
+            let mut executed_iter = executed.into_iter();
+            let mut suppressed_iter = suppressed_autonomy_calls.into_iter().peekable();
+            let mut round_tool_records = Vec::with_capacity(planned_tool_calls.len());
+            for (index, call) in planned_tool_calls.iter().enumerate() {
+                let is_suppressed = suppressed_iter
+                    .peek()
+                    .map(|entry| entry.index == index)
+                    .unwrap_or(false);
+                if is_suppressed {
+                    let suppressed = suppressed_iter
+                        .next()
+                        .expect("suppressed iterator must provide matching index");
+                    round_tool_records.push(synthetic_suppressed_autonomy_tool_record(
+                        &turn_id,
+                        call,
+                        suppressed.age_secs,
+                    ));
+                    continue;
+                }
+
+                let Some(record) = executed_iter.next() else {
+                    last_error =
+                        Some("tool execution record mismatch: missing executed record".to_string());
+                    break;
+                };
+                round_tool_records.push(record);
+            }
+            if last_error.is_none()
+                && (executed_iter.next().is_some() || suppressed_iter.next().is_some())
+            {
+                last_error = Some(
+                    "tool execution record mismatch: unexpected extra tool record".to_string(),
+                );
+            }
+            if last_error.is_some() {
+                break;
+            }
+
+            persist_eth_balance_from_tool_calls(
+                &round_tool_records,
+                &turn_id,
+                execution_completed_ns,
+            );
+            if let Some(tool_results_reply) = render_tool_results_reply(&round_tool_records) {
                 append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
                 assistant_reply = Some(tool_results_reply);
             }
 
-            if executed.iter().any(|record| !record.success) {
+            if round_tool_records.iter().any(|record| !record.success) {
                 last_error = Some("tool execution reported failures".to_string());
             }
 
-            for (call, record) in planned_tool_calls.iter().zip(executed.iter()) {
+            for (call, record) in planned_tool_calls.iter().zip(round_tool_records.iter()) {
                 if let Some(tool_call_id) = call.tool_call_id.clone() {
                     transcript.push(InferenceTranscriptMessage::Tool {
                         tool_call_id,
@@ -825,7 +907,7 @@ async fn run_scheduled_turn_job_with_limits(
                 }
             }
 
-            all_tool_calls.extend(executed);
+            all_tool_calls.extend(round_tool_records);
 
             if last_error.is_some() {
                 break;
@@ -1425,8 +1507,8 @@ mod tests {
             "first turn should execute at least one autonomous tool"
         );
         assert_eq!(
-            turns[0].tool_call_count, 0,
-            "second turn should suppress duplicate autonomous call within freshness window"
+            turns[0].tool_call_count, 1,
+            "second turn should keep one synthetic skipped tool result for continuation completeness"
         );
         assert!(
             turns[0]
@@ -1435,6 +1517,50 @@ mod tests {
                 .unwrap_or_default()
                 .contains("autonomy dedupe suppressed"),
             "inner dialogue should explain autonomous dedupe suppression"
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mocked continuation"),
+            "suppressed calls should still feed continuation inference"
+        );
+    }
+
+    #[test]
+    fn autonomy_dedupe_suppressed_calls_emit_synthetic_tool_records_for_continuation() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be set");
+
+        let first = block_on_with_spin(run_scheduled_turn_job());
+        assert!(first.is_ok(), "first no-input turn should succeed");
+        let second = block_on_with_spin(run_scheduled_turn_job());
+        assert!(second.is_ok(), "second no-input turn should succeed");
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        let latest_turn = &turns[0];
+        let tool_records = stable::get_tools_for_turn(&latest_turn.id);
+        assert_eq!(
+            tool_records.len(),
+            usize::try_from(latest_turn.tool_call_count).expect("count conversion should succeed"),
+            "turn tool count should match persisted records"
+        );
+        assert!(
+            tool_records
+                .iter()
+                .all(|record| record.output.contains("skipped due to freshness dedupe")),
+            "suppressed autonomous calls should be persisted as synthetic skipped tool outputs"
+        );
+        assert!(
+            latest_turn
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mocked continuation"),
+            "synthetic tool outputs must allow continuation inference to complete"
         );
     }
 
