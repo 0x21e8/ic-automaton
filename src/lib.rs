@@ -8,8 +8,9 @@ mod storage;
 mod tools;
 
 use crate::domain::types::{
-    InboxMessage, InboxStats, InferenceConfigView, InferenceProvider, ObservabilitySnapshot,
-    OutboxMessage, OutboxStats, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord, TaskKind,
+    ConversationLog, ConversationSummary, InboxMessage, InboxStats, InferenceConfigView,
+    InferenceProvider, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer,
+    PromptLayerView, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord, TaskKind,
     TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
 };
 use crate::scheduler::scheduler_tick;
@@ -24,6 +25,30 @@ use std::time::Duration;
 #[derive(CandidType, Deserialize)]
 struct InitArgs {
     ecdsa_key_name: String,
+}
+
+fn ensure_controller() -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let caller = ic_cdk::api::msg_caller();
+        if !ic_cdk::api::is_controller(&caller) {
+            return Err("caller is not a controller".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Ok(())
+    }
+}
+
+fn caller_for_audit() -> String {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::msg_caller().to_text();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return "native".to_string();
 }
 
 #[ic_cdk::init]
@@ -125,6 +150,31 @@ fn post_inbox_message(message: String) -> Result<String, String> {
 #[ic_cdk::query]
 fn list_inbox_messages(limit: u32) -> Vec<InboxMessage> {
     stable::list_inbox_messages(limit as usize)
+}
+
+#[ic_cdk::query]
+fn get_prompt_layers() -> Vec<PromptLayerView> {
+    stable::list_prompt_layers()
+}
+
+#[ic_cdk::update]
+fn update_prompt_layer_admin(layer_id: u8, content: String) -> Result<PromptLayer, String> {
+    ensure_controller()?;
+    crate::tools::update_prompt_layer_content(
+        layer_id,
+        content,
+        &format!("admin:{}", caller_for_audit()),
+    )
+}
+
+#[ic_cdk::query]
+fn list_conversations() -> Vec<ConversationSummary> {
+    stable::list_conversation_summaries()
+}
+
+#[ic_cdk::query]
+fn get_conversation(sender: String) -> Option<ConversationLog> {
+    stable::get_conversation_log(&sender)
 }
 
 #[ic_cdk::query]

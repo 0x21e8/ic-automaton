@@ -1,7 +1,8 @@
 use crate::domain::state_machine;
 use crate::domain::types::SurvivalOperationClass;
 use crate::domain::types::{
-    AgentEvent, AgentState, ConversationEntry, InboxMessage, InferenceInput, MemoryFact, TurnRecord,
+    AgentEvent, AgentState, ConversationEntry, InboxMessage, InferenceInput, InferenceProvider,
+    MemoryFact, TurnRecord,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
@@ -26,26 +27,206 @@ fn current_time_ns() -> u64 {
     }
 }
 
-fn build_inference_context_summary(
-    staged_message_count: usize,
-    evm_events: usize,
-    inbox_preview: &str,
-    memory_facts: &[MemoryFact],
-) -> String {
-    let mut parts = vec![
-        format!("inbox_messages:{staged_message_count}"),
-        format!("evm_events:{evm_events}"),
-    ];
-    if !memory_facts.is_empty() {
-        let memory_lines = memory_facts
-            .iter()
-            .map(|fact| format!("{}={}", fact.key, fact.value))
-            .collect::<Vec<_>>()
-            .join("\n");
-        parts.push(format!("[memory]\n{memory_lines}"));
+fn current_cycle_balance() -> Option<u128> {
+    #[cfg(target_arch = "wasm32")]
+    return Some(ic_cdk::api::canister_cycle_balance());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
     }
-    parts.push(format!("inbox_preview:{inbox_preview}"));
-    parts.join(";")
+}
+
+fn current_liquid_cycle_balance() -> Option<u128> {
+    #[cfg(target_arch = "wasm32")]
+    return Some(ic_cdk::api::canister_liquid_cycle_balance());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+fn sanitize_preview(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out = compact.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String {
+    let unique_senders = staged_messages
+        .iter()
+        .map(|message| message.posted_by.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut lines = vec![
+        "### Pending Obligations".to_string(),
+        format!("- staged_count: {}", staged_messages.len()),
+        format!("- active_senders: {}", unique_senders.len()),
+    ];
+
+    if staged_messages.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        for message in staged_messages {
+            lines.push(format!(
+                "- id={} sender={} body_preview={}",
+                message.id,
+                message.posted_by,
+                sanitize_preview(&message.body, 140)
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit: usize) -> String {
+    let senders = staged_messages
+        .iter()
+        .map(|message| message.posted_by.as_str())
+        .collect::<BTreeSet<_>>();
+
+    if senders.is_empty() {
+        return "### Conversation History\n- none".to_string();
+    }
+
+    let mut lines = vec!["### Conversation History".to_string()];
+    let mut any_entries = false;
+    for sender in senders {
+        let Some(log) = stable::get_conversation_log(sender) else {
+            continue;
+        };
+        let recent = log
+            .entries
+            .iter()
+            .rev()
+            .take(per_sender_limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        if recent.is_empty() {
+            continue;
+        }
+        any_entries = true;
+        lines.push(format!("### Conversation with {sender}"));
+        for entry in recent {
+            lines.push(format!(
+                "  [{}]: {}",
+                sender,
+                sanitize_preview(&entry.sender_body, 220)
+            ));
+            lines.push(format!(
+                "  [you]: {}",
+                sanitize_preview(&entry.agent_reply, 220)
+            ));
+        }
+    }
+
+    if !any_entries {
+        lines.push("- none".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn build_available_tools_section(turn_id: &str) -> String {
+    let manager = ToolManager::new();
+    let usage = stable::get_tools_for_turn(turn_id).into_iter().fold(
+        std::collections::BTreeMap::new(),
+        |mut acc, call| {
+            let entry = acc.entry(call.tool).or_insert(0usize);
+            *entry = entry.saturating_add(1);
+            acc
+        },
+    );
+
+    let mut lines = vec!["### Available Tools".to_string()];
+    for (name, policy) in manager.list_tools() {
+        if !policy.enabled {
+            continue;
+        }
+        let used = usage.get(&name).copied().unwrap_or_default();
+        let max = usize::from(policy.max_calls_per_turn);
+        let remaining = max.saturating_sub(used);
+        lines.push(format!("- {name}: remaining={remaining}/{max}"));
+    }
+    if lines.len() == 1 {
+        lines.push("- none".to_string());
+    }
+    lines.join("\n")
+}
+
+fn conversation_history_limit_for_provider(provider: &InferenceProvider) -> usize {
+    match provider {
+        InferenceProvider::IcLlm => 2,
+        _ => 5,
+    }
+}
+
+fn build_dynamic_context(
+    snapshot: &crate::domain::types::RuntimeSnapshot,
+    staged_messages: &[InboxMessage],
+    evm_events: usize,
+    memory_facts: &[MemoryFact],
+    turn_id: &str,
+    conversation_history_limit: usize,
+) -> String {
+    let cycles_balance = current_cycle_balance()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let liquid_cycles_balance = current_liquid_cycle_balance()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let survival_tier = format!("{:?}", stable::scheduler_survival_tier());
+    let recovery_checks = stable::scheduler_survival_tier_recovery_checks();
+    let eth_balance = stable::list_memory_facts_by_prefix("balance.eth", 1)
+        .first()
+        .map(|fact| fact.value.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let memory_section = if memory_facts.is_empty() {
+        "### Recent Memory\n- none".to_string()
+    } else {
+        let mut lines = vec!["### Recent Memory".to_string()];
+        for fact in memory_facts {
+            lines.push(format!(
+                "- {}={}",
+                fact.key,
+                sanitize_preview(&fact.value, 220)
+            ));
+        }
+        lines.join("\n")
+    };
+
+    [
+        "## Layer 10: Dynamic Context".to_string(),
+        "### Current State".to_string(),
+        format!("- cycles_balance: {cycles_balance}"),
+        format!("- liquid_cycles_balance: {liquid_cycles_balance}"),
+        "- cycles_runway_hours: unknown".to_string(),
+        format!("- survival_tier: {survival_tier}"),
+        format!("- survival_tier_recovery_checks: {recovery_checks}"),
+        format!(
+            "- base_wallet: {}",
+            snapshot.evm_address.as_deref().unwrap_or("unconfigured")
+        ),
+        format!("- eth_balance: {eth_balance}"),
+        format!("- turn_number: {}", snapshot.turn_counter),
+        format!("- turn_id: {turn_id}"),
+        format!("- timestamp_ns: {}", current_time_ns()),
+        format!("- state: {:?}", snapshot.state),
+        format!("- evm_events: {evm_events}"),
+        build_pending_obligations_section(staged_messages),
+        build_conversation_context(staged_messages, conversation_history_limit),
+        memory_section,
+        build_available_tools_section(turn_id),
+    ]
+    .join("\n\n")
 }
 
 fn record_conversation_entries(
@@ -184,11 +365,15 @@ pub async fn run_scheduled_turn_job() -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(" | ");
         let memory_facts = stable::list_all_memory_facts(20);
-        let context_summary = build_inference_context_summary(
-            staged_message_count,
+        let conversation_history_limit =
+            conversation_history_limit_for_provider(&snapshot.inference_provider);
+        let context_summary = build_dynamic_context(
+            &snapshot,
+            &staged_messages,
             evm_events,
-            &inbox_preview,
             &memory_facts,
+            &turn_id,
+            conversation_history_limit,
         );
         let input = InferenceInput {
             input: if staged_message_count > 0 {
@@ -339,7 +524,9 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{MemoryFact, RuntimeSnapshot};
+    use crate::domain::types::{
+        InboxMessageStatus, MemoryFact, RuntimeSnapshot, SurvivalTier, ToolCallRecord,
+    };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -386,6 +573,19 @@ mod tests {
         }
 
         panic!("future did not complete in test polling loop");
+    }
+
+    fn staged_message(id: &str, seq: u64, sender: &str, body: &str) -> InboxMessage {
+        InboxMessage {
+            id: id.to_string(),
+            seq,
+            body: body.to_string(),
+            posted_at_ns: 1,
+            posted_by: sender.to_string(),
+            status: InboxMessageStatus::Staged,
+            staged_at_ns: Some(1),
+            consumed_at_ns: None,
+        }
     }
 
     #[test]
@@ -458,7 +658,21 @@ mod tests {
     }
 
     #[test]
-    fn inference_context_summary_includes_memory_lines() {
+    fn dynamic_context_uses_structured_markdown_and_state_sections() {
+        reset_runtime(AgentState::Sleeping, true, false, 12);
+        stable::set_scheduler_survival_tier(SurvivalTier::LowCycles);
+        stable::set_evm_address(Some(
+            "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+        ))
+        .expect("evm address should be accepted");
+        stable::set_memory_fact(&MemoryFact {
+            key: "balance.eth".to_string(),
+            value: "0.42".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 10,
+            source_turn_id: "turn-10".to_string(),
+        });
+
         let memory = vec![MemoryFact {
             key: "strategy".to_string(),
             value: "buy dips".to_string(),
@@ -466,11 +680,144 @@ mod tests {
             updated_at_ns: 2,
             source_turn_id: "turn-1".to_string(),
         }];
-        let summary = build_inference_context_summary(2, 3, "hello | world", &memory);
-        assert!(summary.contains("inbox_messages:2"));
-        assert!(summary.contains("evm_events:3"));
-        assert!(summary.contains("[memory]"));
-        assert!(summary.contains("strategy=buy dips"));
+        let staged = vec![
+            staged_message(
+                "inbox-1",
+                1,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "hello from sender a",
+            ),
+            staged_message(
+                "inbox-2",
+                2,
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "hello from sender b",
+            ),
+        ];
+        let snapshot = stable::runtime_snapshot();
+
+        let context = build_dynamic_context(&snapshot, &staged, 3, &memory, "turn-12", 5);
+        assert!(context.contains("## Layer 10: Dynamic Context"));
+        assert!(context.contains("### Current State"));
+        assert!(context.contains("- survival_tier: LowCycles"));
+        assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
+        assert!(context.contains("- eth_balance: 0.42"));
+        assert!(context.contains("### Pending Obligations"));
+        assert!(context.contains("- staged_count: 2"));
+        assert!(context.contains("### Recent Memory"));
+        assert!(context.contains("- strategy=buy dips"));
+        assert!(context.contains("### Available Tools"));
+    }
+
+    #[test]
+    fn dynamic_context_scopes_conversation_to_active_senders_and_last_five_entries() {
+        reset_runtime(AgentState::Sleeping, true, false, 2);
+        let sender_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sender_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sender_c = "0xcccccccccccccccccccccccccccccccccccccccc";
+
+        for idx in 0..6 {
+            stable::append_conversation_entry(
+                sender_a,
+                ConversationEntry {
+                    inbox_message_id: format!("a-{idx}"),
+                    sender_body: format!("a-msg-{idx}"),
+                    agent_reply: format!("a-reply-{idx}"),
+                    turn_id: "turn-history".to_string(),
+                    timestamp_ns: u64::try_from(idx).unwrap_or_default(),
+                },
+            );
+        }
+        stable::append_conversation_entry(
+            sender_c,
+            ConversationEntry {
+                inbox_message_id: "c-0".to_string(),
+                sender_body: "c-msg-0".to_string(),
+                agent_reply: "c-reply-0".to_string(),
+                turn_id: "turn-history".to_string(),
+                timestamp_ns: 999,
+            },
+        );
+
+        let staged = vec![
+            staged_message("inbox-a", 1, sender_a, "new msg from a"),
+            staged_message("inbox-b", 2, sender_b, "new msg from b"),
+        ];
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &staged, 0, &[], "turn-2", 5);
+
+        assert!(context.contains(&format!("### Conversation with {sender_a}")));
+        assert!(context.contains("a-msg-1"));
+        assert!(context.contains("a-reply-5"));
+        assert!(!context.contains("a-msg-0"));
+        assert!(!context.contains(sender_c));
+    }
+
+    #[test]
+    fn dynamic_context_reports_remaining_tool_budget_for_turn() {
+        reset_runtime(AgentState::Sleeping, true, false, 3);
+        let turn_id = "turn-3";
+        stable::set_tool_records(
+            turn_id,
+            &[
+                ToolCallRecord {
+                    turn_id: turn_id.to_string(),
+                    tool: "record_signal".to_string(),
+                    args_json: "{}".to_string(),
+                    output: "ok".to_string(),
+                    success: true,
+                    error: None,
+                },
+                ToolCallRecord {
+                    turn_id: turn_id.to_string(),
+                    tool: "record_signal".to_string(),
+                    args_json: "{}".to_string(),
+                    output: "ok".to_string(),
+                    success: true,
+                    error: None,
+                },
+                ToolCallRecord {
+                    turn_id: turn_id.to_string(),
+                    tool: "evm_read".to_string(),
+                    args_json: "{}".to_string(),
+                    output: "ok".to_string(),
+                    success: true,
+                    error: None,
+                },
+            ],
+        );
+
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], turn_id, 5);
+        assert!(context.contains("- record_signal: remaining=3/5"));
+        assert!(context.contains("- evm_read: remaining=2/3"));
+    }
+
+    #[test]
+    fn dynamic_context_compact_mode_limits_conversation_to_last_two_entries() {
+        reset_runtime(AgentState::Sleeping, true, false, 4);
+        let sender = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        for idx in 0..4 {
+            stable::append_conversation_entry(
+                sender,
+                ConversationEntry {
+                    inbox_message_id: format!("msg-{idx}"),
+                    sender_body: format!("sender-{idx}"),
+                    agent_reply: format!("reply-{idx}"),
+                    turn_id: "turn-history".to_string(),
+                    timestamp_ns: u64::try_from(idx).unwrap_or_default(),
+                },
+            );
+        }
+
+        let staged = vec![staged_message("inbox-1", 1, sender, "newest incoming")];
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &staged, 0, &[], "turn-4", 2);
+        assert!(context.contains("sender-2"));
+        assert!(context.contains("sender-3"));
+        assert!(!context.contains("sender-1"));
+        assert!(!context.contains("sender-0"));
     }
 
     #[test]

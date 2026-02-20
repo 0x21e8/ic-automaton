@@ -1,5 +1,7 @@
 use crate::storage::stable;
 
+pub const IMMUTABLE_LAYER_MIN_ID: u8 = 0;
+pub const IMMUTABLE_LAYER_MAX_ID: u8 = 5;
 pub const MUTABLE_LAYER_MIN_ID: u8 = 6;
 pub const MUTABLE_LAYER_MAX_ID: u8 = 9;
 pub const SECTION_SEPARATOR: &str = "\n\n---\n\n";
@@ -131,6 +133,18 @@ pub const LAYER_9_SELF_MOD_DEFAULT: &str = r#"## Layer 9: Self-Modification & Re
 - Preserve accountability and traceability in any self-change workflow.
 - If uncertain, defer change and request review."#;
 
+pub fn immutable_layer_content(layer_id: u8) -> Option<&'static str> {
+    match layer_id {
+        0 => Some(LAYER_0_INTERPRETATION),
+        1 => Some(LAYER_1_CONSTITUTION),
+        2 => Some(LAYER_2_SURVIVAL),
+        3 => Some(LAYER_3_IDENTITY),
+        4 => Some(LAYER_4_ETHICS),
+        5 => Some(LAYER_5_OPERATIONS),
+        _ => None,
+    }
+}
+
 pub fn default_layer_content(layer_id: u8) -> Option<&'static str> {
     match layer_id {
         6 => Some(LAYER_6_DECISION_LOOP_DEFAULT),
@@ -141,14 +155,40 @@ pub fn default_layer_content(layer_id: u8) -> Option<&'static str> {
     }
 }
 
+fn render_layer_3_identity() -> String {
+    let soul = stable::get_soul();
+    LAYER_3_IDENTITY.replace("{soul}", soul.trim())
+}
+
+fn render_layer_5_operations() -> String {
+    let mut section = LAYER_5_OPERATIONS.to_string();
+    let active_skills = stable::list_skills()
+        .into_iter()
+        .filter(|skill| skill.enabled)
+        .collect::<Vec<_>>();
+    if active_skills.is_empty() {
+        section.push_str("\n- none active");
+        return section;
+    }
+
+    for skill in active_skills {
+        section.push_str(&format!(
+            "\n- {}: {}",
+            skill.name.trim(),
+            skill.instructions.trim()
+        ));
+    }
+    section
+}
+
 pub fn assemble_system_prompt(dynamic_context: &str) -> String {
     let mut sections = vec![
         LAYER_0_INTERPRETATION.to_string(),
         LAYER_1_CONSTITUTION.to_string(),
         LAYER_2_SURVIVAL.to_string(),
-        LAYER_3_IDENTITY.to_string(),
+        render_layer_3_identity(),
         LAYER_4_ETHICS.to_string(),
-        LAYER_5_OPERATIONS.to_string(),
+        render_layer_5_operations(),
     ];
 
     for layer_id in MUTABLE_LAYER_MIN_ID..=MUTABLE_LAYER_MAX_ID {
@@ -166,12 +206,23 @@ pub fn assemble_system_prompt(dynamic_context: &str) -> String {
     sections.join(SECTION_SEPARATOR)
 }
 
+pub fn assemble_system_prompt_compact(dynamic_context: &str) -> String {
+    [
+        LAYER_0_INTERPRETATION.to_string(),
+        LAYER_1_CONSTITUTION.to_string(),
+        render_layer_5_operations(),
+        dynamic_context.to_string(),
+    ]
+    .join(SECTION_SEPARATOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::PromptLayer;
+    use crate::domain::types::{PromptLayer, SkillRecord};
 
     fn seed_mutable_layers_for_test() {
+        stable::init_storage();
         for layer_id in MUTABLE_LAYER_MIN_ID..=MUTABLE_LAYER_MAX_ID {
             let content = default_layer_content(layer_id)
                 .expect("default layer content must exist")
@@ -240,5 +291,49 @@ mod tests {
         let prompt = assemble_system_prompt("## Layer 10: Dynamic Context");
         assert!(prompt.contains(override_content));
         assert!(!prompt.contains(LAYER_6_DECISION_LOOP_DEFAULT));
+    }
+
+    #[test]
+    fn assemble_system_prompt_injects_soul_and_active_skills() {
+        seed_mutable_layers_for_test();
+        let soul = stable::set_soul("ic-automaton-test-soul".to_string());
+        stable::upsert_skill(&SkillRecord {
+            name: "determinism".to_string(),
+            description: "Determinism profile".to_string(),
+            instructions: "Favor deterministic execution plans.".to_string(),
+            enabled: true,
+            mutable: true,
+        });
+        stable::upsert_skill(&SkillRecord {
+            name: "disabled-skill".to_string(),
+            description: "Disabled profile".to_string(),
+            instructions: "This should not appear.".to_string(),
+            enabled: false,
+            mutable: true,
+        });
+
+        let prompt = assemble_system_prompt("## Layer 10: Dynamic Context\n- context: yes");
+        assert!(prompt.contains(&format!("- Soul identifier: `{soul}`.")));
+        assert!(prompt.contains("### Active Skills"));
+        assert!(prompt.contains("- determinism: Favor deterministic execution plans."));
+        assert!(!prompt.contains("disabled-skill"));
+    }
+
+    #[test]
+    fn assemble_system_prompt_compact_uses_layers_0_1_5_and_10_only() {
+        seed_mutable_layers_for_test();
+        let prompt = assemble_system_prompt_compact("## Layer 10: Dynamic Context\n- compact: yes");
+
+        assert!(prompt.contains("## Layer 0: Interpretation & Precedence"));
+        assert!(prompt.contains("## Layer 1: Constitution - Safety & Non-Harm"));
+        assert!(prompt.contains("## Layer 5: Operational Reality"));
+        assert!(prompt.contains("## Layer 10: Dynamic Context"));
+        assert!(!prompt.contains("## Layer 2: Survival Economics"));
+        assert!(!prompt.contains("## Layer 3: Identity & On-Chain Personhood"));
+        assert!(!prompt.contains("## Layer 4: Ethics of Cooperation & Value"));
+        assert!(!prompt.contains("## Layer 6: Economic Decision Loop"));
+        assert!(!prompt.contains("## Layer 7: Inbox Message Handling"));
+        assert!(!prompt.contains("## Layer 8: Memory & Learning"));
+        assert!(!prompt.contains("## Layer 9: Self-Modification & Replication"));
     }
 }

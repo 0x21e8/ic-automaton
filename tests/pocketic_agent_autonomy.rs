@@ -102,6 +102,26 @@ struct InboxStats {
     consumed_count: u64,
 }
 
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct PromptLayerView {
+    layer_id: u8,
+    is_mutable: bool,
+    content: String,
+    updated_at_ns: Option<u64>,
+    updated_by_turn: Option<String>,
+    version: Option<u32>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct OutboxMessage {
+    id: String,
+    seq: u64,
+    turn_id: String,
+    body: String,
+    created_at_ns: u64,
+    source_inbox_ids: Vec<String>,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -222,6 +242,22 @@ fn get_runtime_view(pic: &PocketIc, canister_id: Principal) -> RuntimeView {
         "get_runtime_view",
         encode_args(()).expect("failed to encode empty args"),
     )
+}
+
+fn get_prompt_layers(pic: &PocketIc, canister_id: Principal) -> Vec<PromptLayerView> {
+    call_query(
+        pic,
+        canister_id,
+        "get_prompt_layers",
+        encode_args(()).expect("failed to encode empty args"),
+    )
+}
+
+fn list_outbox_messages(pic: &PocketIc, canister_id: Principal, limit: u32) -> Vec<OutboxMessage> {
+    let payload = encode_args((limit,)).unwrap_or_else(|error| {
+        panic!("failed to encode list_outbox_messages args: {error}");
+    });
+    call_query(pic, canister_id, "list_outbox_messages", payload)
 }
 
 fn configure_only_agent_turn(pic: &PocketIc, canister_id: Principal, interval_secs: u64) {
@@ -378,4 +414,68 @@ fn poll_inbox_stages_messages_and_agent_turn_consumes_them() {
         .into_iter()
         .any(|job| job.kind == TaskKind::AgentTurn && job.status == JobStatus::Succeeded);
     assert!(agent_succeeded, "agent turn should complete successfully");
+}
+
+#[test]
+fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
+    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+
+    let update_message_id =
+        post_inbox_message(&pic, canister_id, "request_update_prompt_layer:true")
+            .expect("update message should post");
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, false);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let layer_6 = get_prompt_layers(&pic, canister_id)
+        .into_iter()
+        .find(|layer| layer.layer_id == 6)
+        .expect("layer 6 should be returned");
+    assert!(layer_6.is_mutable);
+    assert!(
+        layer_6.content.contains("phase5-layer6-marker"),
+        "layer 6 should be updated by tool call"
+    );
+
+    let update_outbox = list_outbox_messages(&pic, canister_id, 20)
+        .into_iter()
+        .find(|message| message.source_inbox_ids.contains(&update_message_id))
+        .expect("first turn should produce outbox response");
+    assert!(update_outbox.body.contains("mocked inference"));
+
+    let probe_message_id = post_inbox_message(&pic, canister_id, "request_layer_6_probe:true")
+        .expect("probe message should post");
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, false);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, false);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let probe_outbox = list_outbox_messages(&pic, canister_id, 20)
+        .into_iter()
+        .find(|message| message.source_inbox_ids.contains(&probe_message_id))
+        .expect("second turn should produce outbox response");
+    assert_eq!(probe_outbox.body, "layer6_probe:present");
 }
