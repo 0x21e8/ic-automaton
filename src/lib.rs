@@ -135,12 +135,6 @@ fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, String
 }
 
 #[ic_cdk::update]
-fn set_automaton_evm_address_admin(address: Option<String>) -> Result<Option<String>, String> {
-    ensure_controller()?;
-    stable::set_automaton_evm_address(address)
-}
-
-#[ic_cdk::update]
 fn set_inbox_contract_address_admin(address: Option<String>) -> Result<Option<String>, String> {
     ensure_controller()?;
     stable::set_inbox_contract_address(address)
@@ -172,6 +166,11 @@ fn get_runtime_view() -> RuntimeView {
 #[ic_cdk::query]
 fn get_evm_route_state_view() -> EvmRouteStateView {
     stable::evm_route_state_view()
+}
+
+#[ic_cdk::query]
+fn get_automaton_evm_address() -> Option<String> {
+    stable::get_automaton_evm_address()
 }
 
 #[ic_cdk::query]
@@ -350,6 +349,20 @@ fn arm_timer() {
         Duration::from_secs(SCHEDULER_TICK_INTERVAL_SECS),
         scheduler_tick,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_automaton_evm_address_query_returns_stored_value() {
+        stable::init_storage();
+        let expected = "0x1111111111111111111111111111111111111111".to_string();
+        stable::set_evm_address(Some(expected.clone())).expect("automaton address should store");
+
+        assert_eq!(get_automaton_evm_address(), Some(expected));
+    }
 }
 
 ic_cdk::export_candid!();

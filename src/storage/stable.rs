@@ -861,10 +861,6 @@ pub fn get_evm_address() -> Option<String> {
     runtime_snapshot().evm_address
 }
 
-pub fn set_automaton_evm_address(address: Option<String>) -> Result<Option<String>, String> {
-    set_evm_address(address)
-}
-
 #[allow(dead_code)]
 pub fn get_automaton_evm_address() -> Option<String> {
     get_evm_address()
@@ -3028,7 +3024,7 @@ mod tests {
     #[test]
     fn evm_route_state_view_reports_binding_and_cursor() {
         init_storage();
-        set_automaton_evm_address(Some(
+        set_evm_address(Some(
             "0x1111111111111111111111111111111111111111".to_string(),
         ))
         .expect("automaton address should store");

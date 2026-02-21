@@ -118,6 +118,30 @@ contract InboxTest {
         _assertEq(uint256(inbox.nonces(automaton)), 1, "override thresholds should allow exact payment");
     }
 
+    function test_QueueMessageEthOnlyForwardsEthAndSkipsUsdc() public {
+        EthReceiver automaton = new EthReceiver();
+        address automatonAddress = address(automaton);
+        uint256 payerUsdcBefore = usdc.balanceOf(PAYER);
+
+        vm.prank(PAYER);
+        uint64 nonce = inbox.queueMessageEth{value: DEFAULT_ETH_MIN}(automatonAddress, "eth only");
+
+        _assertEq(uint256(nonce), 1, "eth-only nonce mismatch");
+        _assertEq(uint256(inbox.nonces(automatonAddress)), 1, "eth-only stored nonce mismatch");
+        _assertEq(usdc.balanceOf(automatonAddress), 0, "eth-only should not transfer usdc");
+        _assertEq(usdc.balanceOf(PAYER), payerUsdcBefore, "eth-only should not debit payer usdc");
+        _assertEq(automatonAddress.balance, DEFAULT_ETH_MIN, "eth-only should forward eth");
+    }
+
+    function test_QueueMessageEthOnlyRequiresEthMin() public {
+        EthReceiver automaton = new EthReceiver();
+        address automatonAddress = address(automaton);
+
+        vm.expectRevert(bytes("insufficient eth"));
+        vm.prank(PAYER);
+        inbox.queueMessageEth{value: DEFAULT_ETH_MIN - 1}(automatonAddress, "underfunded eth only");
+    }
+
     function _assertEq(uint256 lhs, uint256 rhs, string memory reason) private pure {
         require(lhs == rhs, reason);
     }
