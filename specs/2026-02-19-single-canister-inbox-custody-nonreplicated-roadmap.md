@@ -209,7 +209,7 @@ Hard truth on empty polls:
       - Validation: `cargo test --features pocketic_tests`
       - Notes: Add cases for route mismatch ignore, duplicate log dedupe, empty-poll backoff behavior, default pricing, override pricing, and no-registration flow.
 
-- [ ] **Task 7: Anvil-backed E2E polling coverage**
+- [x] **Task 7: Anvil-backed E2E polling coverage**
       - Files: `src/features/evm.rs`, `Cargo.toml` (or `tests/` if implemented as integration test)
       - Validation: `cargo test --features anvil_e2e --lib http_evm_poller_e2e_against_anvil -- --nocapture`
       - Notes: Run against a local Anvil process and verify real JSON-RPC polling path end-to-end (not host stub), with stable setup/teardown and clear skip/ignore behavior when feature is disabled. Add a real test scenario where a user sends a message with payment for the automaton and the automaton succeffuly gets the message
@@ -312,6 +312,7 @@ _Dev agent writes here during execution._
 - Task 4 complete: updated poller ABI/topic handling and route validation, added `(tx_hash, log_index)` ingest idempotency, and implemented adaptive empty-poll backoff with passing unit/integration validation.
 - Task 5 complete: added controller authorization checks for mutable runtime/scheduler/inference/RPC control-plane endpoints and PocketIC coverage for non-controller rejection with public inbox ingress preserved.
 - Task 6 complete: added PocketIC canister-http-mocked EVM polling integration coverage for route mismatch filtering, `(tx_hash, log_index)` dedupe, adaptive empty-poll backoff skip/resume behavior, pricing payload variants, and no-registration ingress flow.
+- Task 7 complete: replaced the Anvil placeholder with a real end-to-end JSON-RPC scenario that deploys `MockUSDC` and `Inbox`, submits a paid `queueMessage`, verifies poller ingestion for the routed automaton, and asserts forwarded ETH/USDC balances plus decoded message payload.
 
 ### Blockers
 

@@ -1200,9 +1200,15 @@ mod tests {
     use super::*;
     use crate::tools::SignerPort;
     use async_trait::async_trait;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use serde_json::Map;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::fs;
     use std::future::Future;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::net::TcpListener;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::path::PathBuf;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::process::{Child, Command, Stdio};
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
@@ -1499,24 +1505,18 @@ mod tests {
         let _anvil = start_anvil(port).expect("anvil must start for E2E test");
 
         with_host_rpc_mode_real(|| {
-            let snapshot = RuntimeSnapshot {
-                evm_rpc_url: format!("http://127.0.0.1:{port}"),
+            let rpc_url = format!("http://127.0.0.1:{port}");
+            let rpc_snapshot = RuntimeSnapshot {
+                evm_rpc_url: rpc_url,
                 evm_rpc_max_response_bytes: 65_536,
-                evm_address: Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string()),
-                inbox_contract_address: Some(
-                    "0x1000000000000000000000000000000000000001".to_string(),
-                ),
                 evm_cursor: EvmPollCursor {
                     chain_id: 31_337,
-                    next_block: 0,
-                    next_log_index: 0,
                     ..EvmPollCursor::default()
                 },
                 ..RuntimeSnapshot::default()
             };
-
-            let rpc =
-                HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should initialize");
+            let rpc = HttpEvmRpcClient::from_snapshot(&rpc_snapshot)
+                .expect("rpc client should initialize");
             let chain_id = block_on_with_spin(rpc.rpc_call(
                 "eth_chainId",
                 json!([]),
@@ -1531,6 +1531,79 @@ mod tests {
                 "0x7a69"
             );
 
+            let accounts = anvil_accounts(&rpc).expect("anvil accounts should be available");
+            let deployer = accounts[0].clone();
+            let payer = accounts[1].clone();
+            let automaton = "0x1111111111111111111111111111111111111111".to_string();
+            let message = "survival ping";
+            let usdc_amount = U256::from(1_500_000u64);
+            let eth_amount = U256::from(1_000_000_000_000_000u64);
+
+            let mock_usdc_bytecode =
+                load_contract_creation_bytecode("evm/out/MockUSDC.sol/MockUSDC.json")
+                    .expect("mock usdc artifact should load");
+            let mock_usdc = deploy_contract(&rpc, &deployer, &mock_usdc_bytecode)
+                .expect("mock usdc should deploy");
+
+            let inbox_base_bytecode =
+                load_contract_creation_bytecode("evm/out/Inbox.sol/Inbox.json")
+                    .expect("inbox artifact should load");
+            let inbox_constructor_data = encode_constructor_single_address(&mock_usdc)
+                .expect("inbox constructor args should encode");
+            let inbox_bytecode =
+                append_constructor_args(&inbox_base_bytecode, &inbox_constructor_data);
+            let inbox =
+                deploy_contract(&rpc, &deployer, &inbox_bytecode).expect("inbox should deploy");
+
+            let mint_data = encode_call_address_u256("mint(address,uint256)", &payer, usdc_amount)
+                .expect("mint calldata should encode");
+            send_transaction(
+                &rpc,
+                &deployer,
+                Some(mock_usdc.as_str()),
+                mint_data.as_str(),
+                None,
+            )
+            .expect("mint should succeed");
+
+            let approve_data =
+                encode_call_address_u256("approve(address,uint256)", &inbox, usdc_amount)
+                    .expect("approve calldata should encode");
+            send_transaction(
+                &rpc,
+                &payer,
+                Some(mock_usdc.as_str()),
+                approve_data.as_str(),
+                None,
+            )
+            .expect("approve should succeed");
+
+            let queue_message_data =
+                encode_queue_message_calldata(&automaton, message, usdc_amount)
+                    .expect("queueMessage calldata should encode");
+            send_transaction(
+                &rpc,
+                &payer,
+                Some(inbox.as_str()),
+                queue_message_data.as_str(),
+                Some(eth_amount),
+            )
+            .expect("queueMessage should succeed");
+
+            let snapshot = RuntimeSnapshot {
+                evm_rpc_url: rpc_snapshot.evm_rpc_url.clone(),
+                evm_rpc_max_response_bytes: rpc_snapshot.evm_rpc_max_response_bytes,
+                evm_address: Some(automaton.clone()),
+                inbox_contract_address: Some(inbox.clone()),
+                evm_cursor: EvmPollCursor {
+                    chain_id: 31_337,
+                    next_block: 0,
+                    next_log_index: 0,
+                    confirmation_depth: 0,
+                    ..EvmPollCursor::default()
+                },
+                ..RuntimeSnapshot::default()
+            };
             let poller = HttpEvmPoller::from_snapshot(&snapshot).expect("poller should initialize");
             let result = block_on_with_spin(poller.poll(&snapshot.evm_cursor))
                 .expect("poll should succeed against anvil");
@@ -1538,11 +1611,311 @@ mod tests {
                 result.cursor.next_block >= 1,
                 "cursor should advance after polling anvil head"
             );
-            assert!(
-                result.events.is_empty(),
-                "no matching MessageQueued logs are expected in this fixture"
+            assert_eq!(
+                result.events.len(),
+                1,
+                "exactly one route-matching MessageQueued event is expected"
+            );
+
+            let event = &result.events[0];
+            let decoded =
+                decode_message_queued_payload(&event.payload).expect("event payload should decode");
+            assert_eq!(
+                decoded.sender,
+                normalize_address(&payer).unwrap_or_default()
+            );
+            assert_eq!(decoded.message, message);
+            assert_eq!(decoded.usdc_amount, usdc_amount);
+            assert_eq!(decoded.eth_amount, eth_amount);
+
+            let automaton_eth_balance = parse_hex_u256(
+                &block_on_with_spin(rpc.eth_get_balance(&automaton))
+                    .expect("eth balance should be readable"),
+                "automaton eth balance",
+            )
+            .expect("automaton eth balance should parse");
+            assert_eq!(
+                automaton_eth_balance, eth_amount,
+                "automaton should receive forwarded ETH payment"
+            );
+
+            let usdc_balance_call = encode_call_address("balanceOf(address)", &automaton)
+                .expect("balanceOf calldata should encode");
+            let automaton_usdc_balance = parse_hex_u256(
+                &block_on_with_spin(rpc.eth_call(&mock_usdc, &usdc_balance_call))
+                    .expect("usdc balance call should succeed"),
+                "automaton usdc balance",
+            )
+            .expect("automaton usdc balance should parse");
+            assert_eq!(
+                automaton_usdc_balance, usdc_amount,
+                "automaton should receive forwarded USDC payment"
             );
         });
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedMessageQueuedPayload {
+        sender: String,
+        message: String,
+        usdc_amount: U256,
+        eth_amount: U256,
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn anvil_accounts(rpc: &HttpEvmRpcClient) -> Result<Vec<String>, String> {
+        let response = block_on_with_spin(rpc.rpc_call(
+            "eth_accounts",
+            json!([]),
+            rpc.control_plane_max_response_bytes(),
+        ))?;
+        let result = response
+            .get("result")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "eth_accounts result was missing".to_string())?;
+        let mut accounts = Vec::with_capacity(result.len());
+        for value in result {
+            let account = value
+                .as_str()
+                .ok_or_else(|| "eth_accounts result must contain strings".to_string())?;
+            accounts.push(normalize_address(account)?);
+        }
+        if accounts.len() < 2 {
+            return Err("anvil did not return enough unlocked accounts".to_string());
+        }
+        Ok(accounts)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn load_contract_creation_bytecode(artifact_path: &str) -> Result<String, String> {
+        let artifact_abs_path = project_root().join(artifact_path);
+        let artifact_content = fs::read_to_string(&artifact_abs_path).map_err(|error| {
+            format!(
+                "failed to read contract artifact {}: {error}",
+                artifact_abs_path.display()
+            )
+        })?;
+        let json: Value = serde_json::from_str(&artifact_content).map_err(|error| {
+            format!(
+                "failed to parse contract artifact {} as JSON: {error}",
+                artifact_abs_path.display()
+            )
+        })?;
+        let bytecode = json
+            .pointer("/bytecode/object")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "contract artifact {} is missing bytecode.object",
+                    artifact_abs_path.display()
+                )
+            })?;
+        normalize_hex_blob(bytecode, "artifact bytecode")
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn deploy_contract(
+        rpc: &HttpEvmRpcClient,
+        from: &str,
+        creation_bytecode: &str,
+    ) -> Result<String, String> {
+        let receipt = send_transaction(rpc, from, None, creation_bytecode, None)?;
+        let contract_address = receipt
+            .get("contractAddress")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "transaction receipt missing contractAddress".to_string())?;
+        normalize_address(contract_address)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn send_transaction(
+        rpc: &HttpEvmRpcClient,
+        from: &str,
+        to: Option<&str>,
+        data: &str,
+        value_wei: Option<U256>,
+    ) -> Result<Value, String> {
+        let mut tx = Map::new();
+        tx.insert("from".to_string(), Value::String(normalize_address(from)?));
+        if let Some(to) = to {
+            tx.insert("to".to_string(), Value::String(normalize_address(to)?));
+        }
+        tx.insert(
+            "data".to_string(),
+            Value::String(normalize_hex_blob(data, "transaction data")?),
+        );
+        if let Some(value) = value_wei {
+            tx.insert("value".to_string(), Value::String(format!("0x{value:x}")));
+        }
+
+        let response = block_on_with_spin(rpc.rpc_call(
+            "eth_sendTransaction",
+            Value::Array(vec![Value::Object(tx)]),
+            rpc.control_plane_max_response_bytes(),
+        ))?;
+        let tx_hash = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_sendTransaction result was missing".to_string())
+            .and_then(|value| normalize_hex_blob(value, "transaction hash"))?;
+
+        wait_for_receipt(rpc, &tx_hash)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn wait_for_receipt(rpc: &HttpEvmRpcClient, tx_hash: &str) -> Result<Value, String> {
+        for _ in 0..50 {
+            let response = block_on_with_spin(rpc.rpc_call(
+                "eth_getTransactionReceipt",
+                json!([tx_hash]),
+                rpc.control_plane_max_response_bytes(),
+            ))?;
+            if let Some(receipt) = response.get("result") {
+                if !receipt.is_null() {
+                    return Ok(receipt.clone());
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        Err(format!(
+            "transaction receipt was not mined in time for {tx_hash}"
+        ))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn encode_constructor_single_address(address: &str) -> Result<String, String> {
+        Ok(format!("0x{}", encode_address_word_hex(address)?))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn append_constructor_args(bytecode: &str, encoded_args: &str) -> String {
+        format!(
+            "0x{}{}",
+            bytecode.trim_start_matches("0x"),
+            encoded_args.trim_start_matches("0x")
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn encode_call_address_u256(
+        signature: &str,
+        address: &str,
+        amount: U256,
+    ) -> Result<String, String> {
+        Ok(format!(
+            "0x{}{}{}",
+            function_selector_hex(signature),
+            encode_address_word_hex(address)?,
+            encode_u256_word_hex(amount)
+        ))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn encode_call_address(signature: &str, address: &str) -> Result<String, String> {
+        Ok(format!(
+            "0x{}{}",
+            function_selector_hex(signature),
+            encode_address_word_hex(address)?
+        ))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn encode_queue_message_calldata(
+        automaton: &str,
+        message: &str,
+        usdc_amount: U256,
+    ) -> Result<String, String> {
+        let message_hex = hex::encode(message.as_bytes());
+        let message_padding = "0".repeat((64 - (message_hex.len() % 64)) % 64);
+        Ok(format!(
+            "0x{}{}{}{}{}{}",
+            function_selector_hex("queueMessage(address,string,uint256)"),
+            encode_address_word_hex(automaton)?,
+            encode_u256_word_hex(U256::from(96u64)),
+            encode_u256_word_hex(usdc_amount),
+            encode_u256_word_hex(U256::from(message.len())),
+            message_hex + &message_padding
+        ))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn function_selector_hex(signature: &str) -> String {
+        let hash = keccak256(signature.as_bytes());
+        hex::encode(&hash.as_slice()[..4])
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn encode_address_word_hex(address: &str) -> Result<String, String> {
+        let normalized = normalize_address(address)?;
+        Ok(format!("{:0>64}", normalized.trim_start_matches("0x")))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn encode_u256_word_hex(value: U256) -> String {
+        format!("{value:064x}")
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn decode_message_queued_payload(
+        payload_hex: &str,
+    ) -> Result<DecodedMessageQueuedPayload, String> {
+        let payload = normalize_hex_blob(payload_hex, "message queued payload")?;
+        let bytes = hex::decode(payload.trim_start_matches("0x"))
+            .map_err(|error| format!("failed to decode message queued payload: {error}"))?;
+        if bytes.len() < 128 {
+            return Err("message queued payload must be at least 128 bytes".to_string());
+        }
+
+        let sender = format!("0x{}", hex::encode(&bytes[12..32]));
+        let sender = normalize_address(&sender)?;
+        let message_offset = read_usize_word(&bytes[32..64], "message offset")?;
+        let usdc_amount = U256::from_be_slice(&bytes[64..96]);
+        let eth_amount = U256::from_be_slice(&bytes[96..128]);
+        if message_offset.saturating_add(32) > bytes.len() {
+            return Err("message offset points outside payload".to_string());
+        }
+        let message_len = read_usize_word(
+            &bytes[message_offset..message_offset + 32],
+            "message length",
+        )?;
+        let message_start = message_offset + 32;
+        let message_end = message_start.saturating_add(message_len);
+        if message_end > bytes.len() {
+            return Err("message bytes exceed payload length".to_string());
+        }
+
+        let message = std::str::from_utf8(&bytes[message_start..message_end])
+            .map_err(|error| format!("message payload is not utf-8: {error}"))?
+            .to_string();
+
+        Ok(DecodedMessageQueuedPayload {
+            sender,
+            message,
+            usdc_amount,
+            eth_amount,
+        })
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn read_usize_word(word: &[u8], field: &str) -> Result<usize, String> {
+        if word.len() != 32 {
+            return Err(format!("{field} word must be 32 bytes"));
+        }
+        let size = std::mem::size_of::<usize>();
+        if word[..(32 - size)].iter().any(|byte| *byte != 0) {
+            return Err(format!("{field} overflowed usize"));
+        }
+        let mut value = 0usize;
+        for byte in &word[(32 - size)..] {
+            value = (value << 8) | usize::from(*byte);
+        }
+        Ok(value)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn project_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
