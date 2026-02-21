@@ -432,6 +432,15 @@ fn poll_inbox_stages_messages_and_agent_turn_consumes_them() {
     assert_eq!(after_poll.pending_count, 0);
     assert_eq!(after_poll.staged_count, 2);
     assert_eq!(after_poll.consumed_count, 0);
+    assert_eq!(
+        get_runtime_view(&pic, canister_id).turn_counter,
+        0,
+        "poll inbox should not execute agent turns"
+    );
+    assert!(
+        list_outbox_messages(&pic, canister_id, 10).is_empty(),
+        "poll inbox should not emit outbox replies"
+    );
 
     let poll_succeeded = list_scheduler_jobs(&pic, canister_id)
         .into_iter()
@@ -456,6 +465,39 @@ fn poll_inbox_stages_messages_and_agent_turn_consumes_them() {
         .into_iter()
         .any(|job| job.kind == TaskKind::AgentTurn && job.status == JobStatus::Succeeded);
     assert!(agent_succeeded, "agent turn should complete successfully");
+}
+
+#[test]
+fn agent_turn_does_not_stage_pending_messages_without_poll_inbox() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
+
+    assert!(post_inbox_message(&pic, canister_id, "pending only").is_ok());
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let stats = get_inbox_stats(&pic, canister_id);
+    assert_eq!(stats.pending_count, 1);
+    assert_eq!(stats.staged_count, 0);
+    assert_eq!(stats.consumed_count, 0);
+
+    let runtime = get_runtime_view(&pic, canister_id);
+    assert_eq!(runtime.turn_counter, 1, "agent turn should still execute");
+
+    assert!(
+        list_outbox_messages(&pic, canister_id, 10).is_empty(),
+        "agent turn should not reply without staged input"
+    );
 }
 
 #[test]

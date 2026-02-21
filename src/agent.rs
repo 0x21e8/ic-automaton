@@ -668,7 +668,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         .collect::<Vec<_>>();
     let staged_message_count = staged_messages.len();
 
-    let next_cursor = snapshot.evm_cursor.clone();
     let evm_events = 0usize;
     let has_external_input = staged_message_count > 0;
     let should_infer = true;
@@ -1074,7 +1073,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         input_summary: if has_external_input {
             format!(
                 "inbox:{}:evm:{}:{}",
-                staged_message_count, next_cursor.chain_id, evm_events
+                staged_message_count, snapshot.evm_cursor.chain_id, evm_events
             )
         } else {
             "autonomy:no-input".to_string()
@@ -1086,9 +1085,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     };
 
     stable::append_turn_record(&turn_record, &all_tool_calls);
-    if last_error.is_none() {
-        stable::set_evm_cursor(&next_cursor);
-    }
 
     stable::complete_turn(state, last_error.clone());
     log!(
@@ -1124,8 +1120,8 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ContinuationStopReason, InboxMessageStatus, MemoryFact, RuntimeSnapshot, SurvivalTier,
-        ToolCall, ToolCallRecord,
+        ContinuationStopReason, EvmPollCursor, InboxMessageStatus, MemoryFact, RuntimeSnapshot,
+        SurvivalTier, ToolCall, ToolCallRecord,
     };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -1878,6 +1874,56 @@ mod tests {
             outbox[0].body.contains("Tool results:"),
             "fallback response should use deterministic tool summary"
         );
+    }
+
+    #[test]
+    fn scheduled_turn_only_consumes_pre_staged_inbox_messages() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "pending message should not be auto-staged".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+
+        let before = stable::inbox_stats();
+        assert_eq!(before.pending_count, 1);
+        assert_eq!(before.staged_count, 0);
+        assert_eq!(before.consumed_count, 0);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok(), "turn should still succeed");
+
+        let after = stable::inbox_stats();
+        assert_eq!(after.pending_count, 1);
+        assert_eq!(after.staged_count, 0);
+        assert_eq!(after.consumed_count, 0);
+        assert!(
+            stable::list_outbox_messages(10).is_empty(),
+            "turn should not emit an outbox reply without staged input"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].input_summary, "autonomy:no-input");
+    }
+
+    #[test]
+    fn scheduled_turn_does_not_advance_evm_poll_cursor() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_evm_cursor(&EvmPollCursor {
+            chain_id: 8453,
+            next_block: 0,
+            next_log_index: 7,
+        });
+
+        let before = stable::runtime_snapshot().evm_cursor;
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok(), "turn should complete successfully");
+
+        let after = stable::runtime_snapshot().evm_cursor;
+        assert_eq!(after.chain_id, before.chain_id);
+        assert_eq!(after.next_block, before.next_block);
+        assert_eq!(after.next_log_index, before.next_log_index);
     }
 
     #[test]
