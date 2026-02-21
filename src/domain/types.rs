@@ -63,16 +63,31 @@ pub struct MemoryFact {
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmPollCursor {
     pub chain_id: u64,
+    #[serde(default)]
+    pub contract_address: Option<String>,
+    #[serde(default)]
+    pub automaton_address_topic: Option<String>,
     pub next_block: u64,
     pub next_log_index: u64,
+    #[serde(default = "default_evm_confirmation_depth")]
+    pub confirmation_depth: u64,
+    #[serde(default)]
+    pub last_poll_at_ns: u64,
+    #[serde(default)]
+    pub consecutive_empty_polls: u32,
 }
 
 impl Default for EvmPollCursor {
     fn default() -> Self {
         Self {
             chain_id: 8453,
+            contract_address: None,
+            automaton_address_topic: None,
             next_block: 0,
             next_log_index: 0,
+            confirmation_depth: default_evm_confirmation_depth(),
+            last_poll_at_ns: 0,
+            consecutive_empty_polls: 0,
         }
     }
 }
@@ -259,6 +274,19 @@ pub struct RuntimeView {
     pub inference_model: String,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct EvmRouteStateView {
+    pub chain_id: u64,
+    pub automaton_evm_address: Option<String>,
+    pub inbox_contract_address: Option<String>,
+    pub automaton_address_topic: Option<String>,
+    pub next_block: u64,
+    pub next_log_index: u64,
+    pub confirmation_depth: u64,
+    pub last_poll_at_ns: u64,
+    pub consecutive_empty_polls: u32,
+}
+
 impl From<&RuntimeSnapshot> for RuntimeView {
     fn from(snapshot: &RuntimeSnapshot) -> Self {
         Self {
@@ -275,6 +303,22 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             last_transition_at_ns: snapshot.last_transition_at_ns,
             inference_provider: snapshot.inference_provider.clone(),
             inference_model: snapshot.inference_model.clone(),
+        }
+    }
+}
+
+impl From<&RuntimeSnapshot> for EvmRouteStateView {
+    fn from(snapshot: &RuntimeSnapshot) -> Self {
+        Self {
+            chain_id: snapshot.evm_cursor.chain_id,
+            automaton_evm_address: snapshot.evm_address.clone(),
+            inbox_contract_address: snapshot.inbox_contract_address.clone(),
+            automaton_address_topic: snapshot.evm_cursor.automaton_address_topic.clone(),
+            next_block: snapshot.evm_cursor.next_block,
+            next_log_index: snapshot.evm_cursor.next_log_index,
+            confirmation_depth: snapshot.evm_cursor.confirmation_depth,
+            last_poll_at_ns: snapshot.evm_cursor.last_poll_at_ns,
+            consecutive_empty_polls: snapshot.evm_cursor.consecutive_empty_polls,
         }
     }
 }
@@ -616,4 +660,8 @@ fn default_evm_rpc_url() -> String {
 
 fn default_evm_rpc_max_response_bytes() -> u64 {
     64 * 1024
+}
+
+fn default_evm_confirmation_depth() -> u64 {
+    6
 }
