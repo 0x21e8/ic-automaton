@@ -49,6 +49,7 @@ const MAX_CONVERSATION_BODY_CHARS: usize = 500;
 const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
 const MAX_EVM_CONFIRMATION_DEPTH: u64 = 100;
 const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
+const EVM_INGEST_DEDUPE_KEY_PREFIX: &str = "evm.ingest";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
 #[cfg(not(target_arch = "wasm32"))]
@@ -1313,6 +1314,16 @@ pub fn set_evm_cursor(cursor: &EvmPollCursor) {
     save_runtime_snapshot(&snapshot);
 }
 
+pub fn try_mark_evm_event_ingested(tx_hash: &str, log_index: u64) -> bool {
+    let key = evm_ingest_dedupe_key(tx_hash, log_index);
+    let already_seen = RUNTIME_MAP.with(|map| map.borrow().get(&key).is_some());
+    if already_seen {
+        return false;
+    }
+    save_runtime_bool(&key, true);
+    true
+}
+
 pub fn post_inbox_message(body: String, caller: String) -> Result<String, String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -2069,6 +2080,10 @@ fn parse_task_kind(raw_key: &str) -> Option<TaskKind> {
 
 fn dedupe_index_key(dedupe_key: &str) -> String {
     format!("dedupe:{dedupe_key}")
+}
+
+fn evm_ingest_dedupe_key(tx_hash: &str, log_index: u64) -> String {
+    format!("{EVM_INGEST_DEDUPE_KEY_PREFIX}:{tx_hash}:{log_index}")
 }
 
 fn inbox_pending_key(seq: u64) -> String {
@@ -2925,6 +2940,21 @@ mod tests {
         let stored =
             set_evm_confirmation_depth(MAX_EVM_CONFIRMATION_DEPTH).expect("depth should store");
         assert_eq!(stored, MAX_EVM_CONFIRMATION_DEPTH);
+    }
+
+    #[test]
+    fn evm_ingest_idempotency_key_dedupes_tx_hash_and_log_index() {
+        init_storage();
+        let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(try_mark_evm_event_ingested(tx_hash, 7));
+        assert!(
+            !try_mark_evm_event_ingested(tx_hash, 7),
+            "same (tx_hash, log_index) must dedupe"
+        );
+        assert!(
+            try_mark_evm_event_ingested(tx_hash, 8),
+            "different log_index must be independent"
+        );
     }
 
     #[test]

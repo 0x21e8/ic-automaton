@@ -94,6 +94,7 @@ impl Default for EvmPollCursor {
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmEvent {
+    pub tx_hash: String,
     pub chain_id: u64,
     pub block_number: u64,
     pub log_index: u64,
