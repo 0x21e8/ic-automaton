@@ -5,7 +5,7 @@ use crate::domain::types::{
     OutboxMessage, OutboxStats, PromptLayer, PromptLayerView, RuntimeSnapshot, RuntimeView,
     ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
     SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
-    TransitionLogRecord, TurnRecord,
+    TransitionLogRecord, TurnRecord, WalletBalanceSnapshot, WalletBalanceSyncConfig,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -60,6 +60,18 @@ pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+#[allow(dead_code)]
+const MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS: u64 = 30;
+#[allow(dead_code)]
+const MAX_WALLET_BALANCE_SYNC_INTERVAL_SECS: u64 = 24 * 60 * 60;
+#[allow(dead_code)]
+const MIN_WALLET_BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60;
+#[allow(dead_code)]
+const MAX_WALLET_BALANCE_FRESHNESS_WINDOW_SECS: u64 = 24 * 60 * 60;
+#[allow(dead_code)]
+const MIN_WALLET_BALANCE_SYNC_RESPONSE_BYTES: u64 = 256;
+#[allow(dead_code)]
+const MAX_WALLET_BALANCE_SYNC_RESPONSE_BYTES: u64 = 4 * 1024;
 const DEFAULT_HTTP_ALLOWED_DOMAINS: &[&str] = &[
     "api.coingecko.com",
     "api.coinbase.com",
@@ -1135,6 +1147,89 @@ pub fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, St
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(max_response_bytes)
+}
+
+#[allow(dead_code)]
+fn validate_wallet_balance_sync_config(config: &WalletBalanceSyncConfig) -> Result<(), String> {
+    if config.normal_interval_secs < MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS
+        || config.normal_interval_secs > MAX_WALLET_BALANCE_SYNC_INTERVAL_SECS
+    {
+        return Err(format!(
+            "wallet balance sync normal_interval_secs must be in {MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS}..={MAX_WALLET_BALANCE_SYNC_INTERVAL_SECS}"
+        ));
+    }
+    if config.low_cycles_interval_secs < MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS
+        || config.low_cycles_interval_secs > MAX_WALLET_BALANCE_SYNC_INTERVAL_SECS
+    {
+        return Err(format!(
+            "wallet balance sync low_cycles_interval_secs must be in {MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS}..={MAX_WALLET_BALANCE_SYNC_INTERVAL_SECS}"
+        ));
+    }
+    if config.low_cycles_interval_secs < config.normal_interval_secs {
+        return Err(
+            "wallet balance sync low_cycles_interval_secs must be >= normal_interval_secs"
+                .to_string(),
+        );
+    }
+    if config.freshness_window_secs < MIN_WALLET_BALANCE_FRESHNESS_WINDOW_SECS
+        || config.freshness_window_secs > MAX_WALLET_BALANCE_FRESHNESS_WINDOW_SECS
+    {
+        return Err(format!(
+            "wallet balance sync freshness_window_secs must be in {MIN_WALLET_BALANCE_FRESHNESS_WINDOW_SECS}..={MAX_WALLET_BALANCE_FRESHNESS_WINDOW_SECS}"
+        ));
+    }
+    if config.max_response_bytes < MIN_WALLET_BALANCE_SYNC_RESPONSE_BYTES
+        || config.max_response_bytes > MAX_WALLET_BALANCE_SYNC_RESPONSE_BYTES
+    {
+        return Err(format!(
+            "wallet balance sync max_response_bytes must be in {MIN_WALLET_BALANCE_SYNC_RESPONSE_BYTES}..={MAX_WALLET_BALANCE_SYNC_RESPONSE_BYTES}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn wallet_balance_snapshot() -> WalletBalanceSnapshot {
+    runtime_snapshot().wallet_balance
+}
+
+#[allow(dead_code)]
+pub fn set_wallet_balance_snapshot(balance: WalletBalanceSnapshot) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.wallet_balance = balance;
+    save_runtime_snapshot(&snapshot);
+}
+
+#[allow(dead_code)]
+pub fn wallet_balance_sync_config() -> WalletBalanceSyncConfig {
+    runtime_snapshot().wallet_balance_sync
+}
+
+#[allow(dead_code)]
+pub fn set_wallet_balance_sync_config(
+    config: WalletBalanceSyncConfig,
+) -> Result<WalletBalanceSyncConfig, String> {
+    validate_wallet_balance_sync_config(&config)?;
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.wallet_balance_sync = config.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+
+    Ok(config)
+}
+
+#[allow(dead_code)]
+pub fn wallet_balance_bootstrap_pending() -> bool {
+    runtime_snapshot().wallet_balance_bootstrap_pending
+}
+
+#[allow(dead_code)]
+pub fn set_wallet_balance_bootstrap_pending(pending: bool) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.wallet_balance_bootstrap_pending = pending;
+    save_runtime_snapshot(&snapshot);
 }
 
 pub fn set_last_error(error: Option<String>) {
@@ -2237,7 +2332,8 @@ fn read_json<T: DeserializeOwned>(value: Option<&[u8]>) -> Option<T> {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer, TaskKind, TaskLane,
+        ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer, RuntimeSnapshot, TaskKind,
+        TaskLane, WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
 
     fn clear_conversation_map() {
@@ -2993,6 +3089,90 @@ mod tests {
         init_storage();
         let snapshot = runtime_snapshot();
         assert_eq!(snapshot.evm_rpc_url, "https://mainnet.base.org");
+    }
+
+    #[test]
+    fn runtime_snapshot_migration_defaults_wallet_balance_fields() {
+        init_storage();
+        let mut legacy = serde_json::to_value(RuntimeSnapshot::default())
+            .expect("runtime snapshot should serialize");
+        let legacy_obj = legacy
+            .as_object_mut()
+            .expect("runtime snapshot json should be an object");
+        legacy_obj.remove("wallet_balance");
+        legacy_obj.remove("wallet_balance_sync");
+        legacy_obj.remove("wallet_balance_bootstrap_pending");
+        let payload = serde_json::to_vec(&legacy).expect("legacy json should serialize");
+
+        RUNTIME_MAP.with(|map| {
+            map.borrow_mut().insert(RUNTIME_KEY.to_string(), payload);
+        });
+
+        let loaded = runtime_snapshot();
+        assert_eq!(loaded.wallet_balance.usdc_decimals, 6);
+        assert_eq!(loaded.wallet_balance_sync.normal_interval_secs, 300);
+        assert_eq!(loaded.wallet_balance_sync.low_cycles_interval_secs, 900);
+        assert_eq!(loaded.wallet_balance_sync.freshness_window_secs, 600);
+        assert_eq!(loaded.wallet_balance_sync.max_response_bytes, 256);
+        assert!(loaded.wallet_balance_bootstrap_pending);
+    }
+
+    #[test]
+    fn wallet_balance_sync_config_validates_and_persists() {
+        init_storage();
+        assert!(set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+            normal_interval_secs: 29,
+            ..WalletBalanceSyncConfig::default()
+        })
+        .is_err());
+        assert!(set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+            low_cycles_interval_secs: 299,
+            normal_interval_secs: 300,
+            ..WalletBalanceSyncConfig::default()
+        })
+        .is_err());
+        assert!(set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+            max_response_bytes: 128,
+            ..WalletBalanceSyncConfig::default()
+        })
+        .is_err());
+        assert!(set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+            freshness_window_secs: 10,
+            ..WalletBalanceSyncConfig::default()
+        })
+        .is_err());
+
+        let expected = WalletBalanceSyncConfig {
+            enabled: false,
+            normal_interval_secs: 600,
+            low_cycles_interval_secs: 1200,
+            freshness_window_secs: 1800,
+            max_response_bytes: 512,
+            discover_usdc_via_inbox: false,
+        };
+        let stored = set_wallet_balance_sync_config(expected.clone())
+            .expect("wallet balance sync config should persist");
+        assert_eq!(stored, expected);
+        assert_eq!(wallet_balance_sync_config(), expected);
+    }
+
+    #[test]
+    fn wallet_balance_snapshot_and_bootstrap_flag_persist() {
+        init_storage();
+        let expected = WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x123".to_string()),
+            usdc_balance_raw_hex: Some("0x456".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(42),
+            last_synced_block: Some(7),
+            last_error: Some("rpc timeout".to_string()),
+        };
+        set_wallet_balance_snapshot(expected.clone());
+        assert_eq!(wallet_balance_snapshot(), expected);
+
+        set_wallet_balance_bootstrap_pending(false);
+        assert!(!wallet_balance_bootstrap_pending());
     }
 
     #[test]
