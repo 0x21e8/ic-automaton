@@ -326,6 +326,10 @@ pub fn init_storage() {
             snapshot_changed = true;
         }
     }
+    if !snapshot.wallet_balance_bootstrap_pending {
+        snapshot.wallet_balance_bootstrap_pending = true;
+        snapshot_changed = true;
+    }
     if snapshot_changed {
         save_runtime_snapshot(&snapshot);
     }
@@ -1230,6 +1234,33 @@ pub fn set_wallet_balance_bootstrap_pending(pending: bool) {
     let mut snapshot = runtime_snapshot();
     snapshot.wallet_balance_bootstrap_pending = pending;
     save_runtime_snapshot(&snapshot);
+}
+
+pub fn record_wallet_balance_sync_success(
+    now_ns: u64,
+    eth_balance_wei_hex: String,
+    usdc_balance_raw_hex: String,
+    usdc_contract_address: String,
+) -> WalletBalanceSnapshot {
+    let mut snapshot = runtime_snapshot();
+    snapshot.wallet_balance.eth_balance_wei_hex = Some(eth_balance_wei_hex);
+    snapshot.wallet_balance.usdc_balance_raw_hex = Some(usdc_balance_raw_hex);
+    snapshot.wallet_balance.usdc_contract_address = Some(usdc_contract_address);
+    snapshot.wallet_balance.last_synced_at_ns = Some(now_ns);
+    snapshot.wallet_balance.last_synced_block = None;
+    snapshot.wallet_balance.last_error = None;
+    snapshot.wallet_balance_bootstrap_pending = false;
+    let updated = snapshot.wallet_balance.clone();
+    save_runtime_snapshot(&snapshot);
+    updated
+}
+
+pub fn record_wallet_balance_sync_error(error: String) -> WalletBalanceSnapshot {
+    let mut snapshot = runtime_snapshot();
+    snapshot.wallet_balance.last_error = Some(error);
+    let updated = snapshot.wallet_balance.clone();
+    save_runtime_snapshot(&snapshot);
+    updated
 }
 
 pub fn set_last_error(error: Option<String>) {
@@ -3172,6 +3203,55 @@ mod tests {
         assert_eq!(wallet_balance_snapshot(), expected);
 
         set_wallet_balance_bootstrap_pending(false);
+        assert!(!wallet_balance_bootstrap_pending());
+    }
+
+    #[test]
+    fn init_storage_rearms_wallet_balance_bootstrap_pending() {
+        init_storage();
+        set_wallet_balance_bootstrap_pending(false);
+        assert!(!wallet_balance_bootstrap_pending());
+
+        init_storage();
+        assert!(wallet_balance_bootstrap_pending());
+    }
+
+    #[test]
+    fn wallet_balance_sync_record_helpers_preserve_existing_fields() {
+        init_storage();
+        set_wallet_balance_snapshot(WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0xaaaa".to_string()),
+            usdc_balance_raw_hex: Some("0xbbbb".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            last_synced_at_ns: Some(100),
+            last_synced_block: Some(10),
+            last_error: None,
+        });
+
+        let failed = record_wallet_balance_sync_error("rpc timeout".to_string());
+        assert_eq!(failed.eth_balance_wei_hex.as_deref(), Some("0xaaaa"));
+        assert_eq!(failed.usdc_balance_raw_hex.as_deref(), Some("0xbbbb"));
+        assert_eq!(failed.last_synced_at_ns, Some(100));
+        assert_eq!(failed.last_synced_block, Some(10));
+        assert_eq!(failed.last_error.as_deref(), Some("rpc timeout"));
+        assert!(wallet_balance_bootstrap_pending());
+
+        let succeeded = record_wallet_balance_sync_success(
+            500,
+            "0x1".to_string(),
+            "0x2a".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+        );
+        assert_eq!(succeeded.eth_balance_wei_hex.as_deref(), Some("0x1"));
+        assert_eq!(succeeded.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
+        assert_eq!(
+            succeeded.usdc_contract_address.as_deref(),
+            Some("0x3333333333333333333333333333333333333333")
+        );
+        assert_eq!(succeeded.last_synced_at_ns, Some(500));
+        assert_eq!(succeeded.last_synced_block, None);
+        assert_eq!(succeeded.last_error, None);
         assert!(!wallet_balance_bootstrap_pending());
     }
 
