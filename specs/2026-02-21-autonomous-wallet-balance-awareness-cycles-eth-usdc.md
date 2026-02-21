@@ -234,7 +234,7 @@ Recommended baseline:
       - Validation: `cargo test --lib http::tests:: && icp build && cargo test --features pocketic_tests --test pocketic_scheduler_queue -- --nocapture`
       - Notes: expose only non-secret telemetry/config fields and verify bootstrap gating (first inference blocked until sync), periodic refresh, stale transition, and non-fatal degradation behavior.
 
-- [ ] **Task 4: Full validation**
+- [x] **Task 4: Full validation**
       - Files: `src/agent.rs`, `src/scheduler.rs`, `src/features/evm.rs`, `src/storage/stable.rs`, `src/domain/types.rs`, `src/http.rs`, `src/lib.rs`
       - Validation: `cargo fmt --all -- --check && cargo clippy --all-targets --all-features && cargo test && icp build`
       - Dependencies: Task 1-3
@@ -324,9 +324,9 @@ Snapshot date: 2026-02-21
 
 ## Ship Checklist (non-negotiable final step)
 
-- [ ] Run smoke, regression, and integration verification commands.
-- [ ] Confirm first inference is blocked until initial ETH/USDC sync succeeds after init/upgrade.
-- [ ] Confirm runtime keeps operating when ETH/USDC sync fails transiently.
-- [ ] Confirm dynamic context shows freshness and staleness explicitly.
-- [ ] Confirm no secrets are exposed by new telemetry/config endpoints.
-- [ ] Confirm `ic-automaton.did` remains generated from Rust exports only.
+- [x] Run smoke, regression, and integration verification commands.
+- [x] Confirm first inference is blocked until initial ETH/USDC sync succeeds after init/upgrade.
+- [x] Confirm runtime keeps operating when ETH/USDC sync fails transiently.
+- [x] Confirm dynamic context shows freshness and staleness explicitly.
+- [x] Confirm no secrets are exposed by new telemetry/config endpoints.
+- [x] Confirm `ic-automaton.did` remains generated from Rust exports only.
