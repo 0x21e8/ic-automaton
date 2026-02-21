@@ -5,8 +5,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use candid::{decode_one, encode_args, CandidType, Principal};
+use pocket_ic::common::rest::{
+    CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse,
+};
 use pocket_ic::PocketIc;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 const WASM_PATHS: &[&str] = &[
     "target/wasm32-unknown-unknown/release/backend.wasm",
@@ -210,6 +214,38 @@ fn set_openrouter_api_key(pic: &PocketIc, canister_id: Principal, api_key: Optio
     let _: String = call_update(pic, canister_id, "set_openrouter_api_key", payload);
 }
 
+fn set_evm_rpc_url(pic: &PocketIc, canister_id: Principal, url: &str) {
+    let payload = encode_args((url.to_string(),)).expect("failed to encode set_evm_rpc_url args");
+    let result: Result<String, String> = call_update(pic, canister_id, "set_evm_rpc_url", payload);
+    assert!(result.is_ok(), "set_evm_rpc_url failed: {result:?}");
+}
+
+fn set_automaton_evm_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
+    let payload = encode_args((Some(address.to_string()),))
+        .expect("failed to encode set_automaton_evm_address_admin args");
+    let result: Result<Option<String>, String> =
+        call_update(pic, canister_id, "set_automaton_evm_address_admin", payload);
+    assert!(
+        result.is_ok(),
+        "set_automaton_evm_address_admin failed: {result:?}"
+    );
+}
+
+fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
+    let payload = encode_args((Some(address.to_string()),))
+        .expect("failed to encode set_inbox_contract_address_admin args");
+    let result: Result<Option<String>, String> = call_update(
+        pic,
+        canister_id,
+        "set_inbox_contract_address_admin",
+        payload,
+    );
+    assert!(
+        result.is_ok(),
+        "set_inbox_contract_address_admin failed: {result:?}"
+    );
+}
+
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
     let payload = encode_args((200u32,)).unwrap_or_else(|error| {
         panic!("failed to encode list_scheduler_jobs args: {error}");
@@ -269,6 +305,115 @@ fn assert_single_slot_poll_inbox_job(counted_jobs: &[ObservedJob]) -> String {
     );
 
     poll_jobs[0].dedupe_key.clone()
+}
+
+fn latest_poll_job(jobs: &[ObservedJob]) -> Option<&ObservedJob> {
+    jobs.iter()
+        .filter(|job| job.kind == TaskKind::PollInbox)
+        .max_by_key(|job| job.created_at_ns)
+}
+
+fn response_word_from_address(address: &str) -> String {
+    let suffix = address.trim_start_matches("0x").to_ascii_lowercase();
+    format!("0x{suffix:0>64}")
+}
+
+fn response_word_from_quantity(quantity_hex: &str) -> String {
+    let suffix = quantity_hex.trim_start_matches("0x").to_ascii_lowercase();
+    format!("0x{suffix:0>64}")
+}
+
+fn wallet_sync_rpc_response(request: &CanisterHttpRequest) -> CanisterHttpResponse {
+    let request_json: Value = serde_json::from_slice(&request.body)
+        .unwrap_or_else(|error| panic!("failed to parse canister http request body: {error}"));
+    let method = request_json
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let response = match method {
+        "eth_blockNumber" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0xa",
+        }),
+        "eth_getLogs" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":[],
+        }),
+        "eth_getBalance" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x64",
+        }),
+        "eth_call" => {
+            let calldata = request_json
+                .get("params")
+                .and_then(Value::as_array)
+                .and_then(|params| params.first())
+                .and_then(|tx| tx.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = if calldata.len() <= 10 {
+                response_word_from_address("0x3333333333333333333333333333333333333333")
+            } else {
+                response_word_from_quantity("0x2a")
+            };
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "result":result,
+            })
+        }
+        unsupported => panic!("unsupported canister http method in test: {unsupported}"),
+    };
+
+    CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+        status: 200,
+        headers: vec![],
+        body: serde_json::to_vec(&response)
+            .unwrap_or_else(|error| panic!("failed to encode rpc response: {error}")),
+    })
+}
+
+fn drive_poll_inbox_with_wallet_sync_mocks(pic: &PocketIc, canister_id: Principal) {
+    let before_poll_jobs = list_scheduler_jobs(pic, canister_id)
+        .into_iter()
+        .filter(|job| job.kind == TaskKind::PollInbox)
+        .count();
+
+    pic.tick();
+
+    for _ in 0..30 {
+        let pending_http = pic.get_canister_http();
+        if !pending_http.is_empty() {
+            for request in pending_http {
+                pic.mock_canister_http_response(MockCanisterHttpResponse {
+                    subnet_id: request.subnet_id,
+                    request_id: request.request_id,
+                    response: wallet_sync_rpc_response(&request),
+                    additional_responses: vec![],
+                });
+            }
+        }
+
+        pic.tick();
+
+        let jobs = list_scheduler_jobs(pic, canister_id);
+        let poll_jobs = jobs
+            .iter()
+            .filter(|job| job.kind == TaskKind::PollInbox)
+            .count();
+        let terminal = latest_poll_job(&jobs)
+            .map(|job| matches!(job.status, JobStatus::Succeeded | JobStatus::Failed))
+            .unwrap_or(false);
+        if poll_jobs > before_poll_jobs && terminal && pic.get_canister_http().is_empty() {
+            return;
+        }
+    }
+
+    panic!("poll inbox did not complete with wallet sync mocks in expected ticks");
 }
 
 #[cfg(not(feature = "pocketic_tests"))]
@@ -457,6 +602,22 @@ fn placeholder_low_cycles_mode_suppresses_non_essential_jobs() {
 #[test]
 fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
     let (pic, canister_id) = with_backend_canister();
+
+    configure_only_poll_inbox(&pic, canister_id, 60);
+    set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
+    set_automaton_evm_address_admin(
+        &pic,
+        canister_id,
+        "0x1111111111111111111111111111111111111111",
+    );
+    set_inbox_contract_address_admin(
+        &pic,
+        canister_id,
+        "0x2222222222222222222222222222222222222222",
+    );
+    pic.advance_time(Duration::from_secs(61));
+    drive_poll_inbox_with_wallet_sync_mocks(&pic, canister_id);
+
     configure_only_agent_turn(&pic, canister_id, 60);
     set_inference_provider(&pic, canister_id, InferenceProvider::OpenRouter);
     set_openrouter_api_key(&pic, canister_id, Some("test-api-key".to_string()));

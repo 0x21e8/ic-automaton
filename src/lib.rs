@@ -11,7 +11,8 @@ use crate::domain::types::{
     ConversationLog, ConversationSummary, EvmRouteStateView, InboxMessage, InboxStats,
     InferenceConfigView, InferenceProvider, ObservabilitySnapshot, OutboxMessage, OutboxStats,
     PromptLayer, PromptLayerView, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord,
-    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
@@ -171,6 +172,16 @@ fn get_runtime_view() -> RuntimeView {
 #[ic_cdk::query]
 fn get_evm_route_state_view() -> EvmRouteStateView {
     stable::evm_route_state_view()
+}
+
+#[ic_cdk::query]
+fn get_wallet_balance_telemetry() -> WalletBalanceTelemetryView {
+    stable::wallet_balance_telemetry_view()
+}
+
+#[ic_cdk::query]
+fn get_wallet_balance_sync_config() -> WalletBalanceSyncConfigView {
+    stable::wallet_balance_sync_config_view()
 }
 
 #[ic_cdk::query]

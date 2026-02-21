@@ -5,9 +5,12 @@ use std::time::Duration;
 
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
+use pocket_ic::common::rest::{
+    CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse,
+};
 use pocket_ic::PocketIc;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const WASM_PATHS: &[&str] = &[
     "target/wasm32-unknown-unknown/release/backend.wasm",
@@ -80,6 +83,132 @@ where
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
 }
 
+fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
+where
+    T: for<'de> Deserialize<'de> + CandidType,
+{
+    let response = pic
+        .update_call(canister_id, Principal::anonymous(), method, payload)
+        .unwrap_or_else(|error| panic!("update call {method} failed: {error:?}"));
+    decode_one(&response)
+        .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
+}
+
+fn set_evm_rpc_url(pic: &PocketIc, canister_id: Principal, url: &str) {
+    let payload = encode_args((url.to_string(),)).expect("failed to encode set_evm_rpc_url");
+    let result: Result<String, String> = call_update(pic, canister_id, "set_evm_rpc_url", payload);
+    assert!(result.is_ok(), "set_evm_rpc_url failed: {result:?}");
+}
+
+fn set_automaton_evm_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
+    let payload = encode_args((Some(address.to_string()),))
+        .expect("failed to encode set_automaton_evm_address_admin");
+    let result: Result<Option<String>, String> =
+        call_update(pic, canister_id, "set_automaton_evm_address_admin", payload);
+    assert!(
+        result.is_ok(),
+        "set_automaton_evm_address_admin failed: {result:?}"
+    );
+}
+
+fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
+    let payload = encode_args((Some(address.to_string()),))
+        .expect("failed to encode set_inbox_contract_address_admin");
+    let result: Result<Option<String>, String> = call_update(
+        pic,
+        canister_id,
+        "set_inbox_contract_address_admin",
+        payload,
+    );
+    assert!(
+        result.is_ok(),
+        "set_inbox_contract_address_admin failed: {result:?}"
+    );
+}
+
+fn response_word_from_address(address: &str) -> String {
+    let suffix = address.trim_start_matches("0x").to_ascii_lowercase();
+    format!("0x{suffix:0>64}")
+}
+
+fn response_word_from_quantity(quantity_hex: &str) -> String {
+    let suffix = quantity_hex.trim_start_matches("0x").to_ascii_lowercase();
+    format!("0x{suffix:0>64}")
+}
+
+fn wallet_sync_rpc_response(request: &CanisterHttpRequest) -> CanisterHttpResponse {
+    let request_json: Value = serde_json::from_slice(&request.body)
+        .unwrap_or_else(|error| panic!("failed to parse canister http request body: {error}"));
+    let method = request_json
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let response = match method {
+        "eth_blockNumber" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0xa",
+        }),
+        "eth_getLogs" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":[],
+        }),
+        "eth_getBalance" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x64",
+        }),
+        "eth_call" => {
+            let calldata = request_json
+                .get("params")
+                .and_then(Value::as_array)
+                .and_then(|params| params.first())
+                .and_then(|tx| tx.get("data"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = if calldata.len() <= 10 {
+                response_word_from_address("0x3333333333333333333333333333333333333333")
+            } else {
+                response_word_from_quantity("0x2a")
+            };
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "result":result,
+            })
+        }
+        unsupported => panic!("unsupported canister http method in test: {unsupported}"),
+    };
+
+    CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+        status: 200,
+        headers: vec![],
+        body: serde_json::to_vec(&response)
+            .unwrap_or_else(|error| panic!("failed to encode rpc response: {error}")),
+    })
+}
+
+fn flush_wallet_sync_http(pic: &PocketIc) {
+    for _ in 0..20 {
+        let pending_http = pic.get_canister_http();
+        if pending_http.is_empty() {
+            pic.tick();
+            continue;
+        }
+        for request in pending_http {
+            pic.mock_canister_http_response(MockCanisterHttpResponse {
+                subnet_id: request.subnet_id,
+                request_id: request.request_id,
+                response: wallet_sync_rpc_response(&request),
+                additional_responses: vec![],
+            });
+        }
+        pic.tick();
+    }
+}
+
 fn call_http_update<'a>(
     pic: &PocketIc,
     canister_id: Principal,
@@ -107,6 +236,17 @@ fn parse_json_response(response: &HttpUpdateResponse<'_>, context: &str) -> Valu
 #[test]
 fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
     let (pic, canister_id) = with_backend_canister();
+    set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
+    set_automaton_evm_address_admin(
+        &pic,
+        canister_id,
+        "0x1111111111111111111111111111111111111111",
+    );
+    set_inbox_contract_address_admin(
+        &pic,
+        canister_id,
+        "0x2222222222222222222222222222222222222222",
+    );
 
     let root_request = HttpRequest::get("/").build();
     let root_payload = encode_args((root_request,))
@@ -202,9 +342,10 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
         "snapshot should include all prompt layers"
     );
 
-    for _ in 0..3 {
+    for _ in 0..6 {
         pic.advance_time(Duration::from_secs(31));
         pic.tick();
+        flush_wallet_sync_http(&pic);
     }
 
     let after_turn_response = call_http_update(

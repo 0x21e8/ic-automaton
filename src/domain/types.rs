@@ -214,6 +214,67 @@ impl Default for WalletBalanceSyncConfig {
     }
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WalletBalanceTelemetryView {
+    pub eth_balance_wei_hex: Option<String>,
+    pub usdc_balance_raw_hex: Option<String>,
+    pub usdc_decimals: u8,
+    pub usdc_contract_address: Option<String>,
+    pub last_synced_at_ns: Option<u64>,
+    pub last_synced_block: Option<u64>,
+    pub last_error: Option<String>,
+    pub age_secs: Option<u64>,
+    pub freshness_window_secs: u64,
+    pub is_stale: bool,
+    pub status: WalletBalanceStatus,
+    pub bootstrap_pending: bool,
+}
+
+impl WalletBalanceTelemetryView {
+    pub fn from_snapshot(snapshot: &RuntimeSnapshot, now_ns: u64) -> Self {
+        let freshness = snapshot
+            .wallet_balance
+            .derive_freshness(now_ns, snapshot.wallet_balance_sync.freshness_window_secs);
+        Self {
+            eth_balance_wei_hex: snapshot.wallet_balance.eth_balance_wei_hex.clone(),
+            usdc_balance_raw_hex: snapshot.wallet_balance.usdc_balance_raw_hex.clone(),
+            usdc_decimals: snapshot.wallet_balance.usdc_decimals,
+            usdc_contract_address: snapshot.wallet_balance.usdc_contract_address.clone(),
+            last_synced_at_ns: snapshot.wallet_balance.last_synced_at_ns,
+            last_synced_block: snapshot.wallet_balance.last_synced_block,
+            last_error: snapshot.wallet_balance.last_error.clone(),
+            age_secs: freshness.age_secs,
+            freshness_window_secs: freshness.freshness_window_secs,
+            is_stale: freshness.is_stale,
+            status: freshness.status,
+            bootstrap_pending: snapshot.wallet_balance_bootstrap_pending,
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WalletBalanceSyncConfigView {
+    pub enabled: bool,
+    pub normal_interval_secs: u64,
+    pub low_cycles_interval_secs: u64,
+    pub freshness_window_secs: u64,
+    pub max_response_bytes: u64,
+    pub discover_usdc_via_inbox: bool,
+}
+
+impl From<&WalletBalanceSyncConfig> for WalletBalanceSyncConfigView {
+    fn from(config: &WalletBalanceSyncConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            normal_interval_secs: config.normal_interval_secs,
+            low_cycles_interval_secs: config.low_cycles_interval_secs,
+            freshness_window_secs: config.freshness_window_secs,
+            max_response_bytes: config.max_response_bytes,
+            discover_usdc_via_inbox: config.discover_usdc_via_inbox,
+        }
+    }
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeSnapshot {
     pub state: AgentState,
@@ -824,6 +885,7 @@ fn default_wallet_balance_bootstrap_pending() -> bool {
 mod tests {
     use super::{
         RuntimeSnapshot, WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
+        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
     };
 
     #[test]
@@ -886,5 +948,65 @@ mod tests {
     fn runtime_snapshot_defaults_bootstrap_pending_for_wallet_sync() {
         let snapshot = RuntimeSnapshot::default();
         assert!(snapshot.wallet_balance_bootstrap_pending);
+    }
+
+    #[test]
+    fn wallet_balance_telemetry_view_derives_freshness_from_snapshot() {
+        let now_ns: u64 = 2_000_000_000_000;
+        let snapshot = RuntimeSnapshot {
+            wallet_balance: WalletBalanceSnapshot {
+                eth_balance_wei_hex: Some("0x1".to_string()),
+                usdc_balance_raw_hex: Some("0x2a".to_string()),
+                usdc_decimals: 6,
+                usdc_contract_address: Some(
+                    "0x3333333333333333333333333333333333333333".to_string(),
+                ),
+                last_synced_at_ns: Some(now_ns.saturating_sub(601 * 1_000_000_000)),
+                last_synced_block: Some(123),
+                last_error: None,
+            },
+            wallet_balance_sync: WalletBalanceSyncConfig {
+                freshness_window_secs: 600,
+                ..WalletBalanceSyncConfig::default()
+            },
+            wallet_balance_bootstrap_pending: true,
+            ..RuntimeSnapshot::default()
+        };
+
+        let view = WalletBalanceTelemetryView::from_snapshot(&snapshot, now_ns);
+        assert_eq!(view.eth_balance_wei_hex.as_deref(), Some("0x1"));
+        assert_eq!(view.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
+        assert_eq!(
+            view.usdc_contract_address.as_deref(),
+            Some("0x3333333333333333333333333333333333333333")
+        );
+        assert_eq!(view.last_synced_block, Some(123));
+        assert_eq!(view.age_secs, Some(601));
+        assert_eq!(view.freshness_window_secs, 600);
+        assert!(view.is_stale);
+        assert_eq!(view.status, WalletBalanceStatus::Stale);
+        assert!(view.bootstrap_pending);
+    }
+
+    #[test]
+    fn wallet_balance_sync_config_view_matches_runtime_config() {
+        let snapshot = RuntimeSnapshot {
+            wallet_balance_sync: WalletBalanceSyncConfig {
+                enabled: true,
+                normal_interval_secs: 300,
+                low_cycles_interval_secs: 900,
+                freshness_window_secs: 777,
+                max_response_bytes: 512,
+                discover_usdc_via_inbox: false,
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        let view = WalletBalanceSyncConfigView::from(&snapshot.wallet_balance_sync);
+        assert_eq!(view.normal_interval_secs, 300);
+        assert_eq!(view.low_cycles_interval_secs, 900);
+        assert_eq!(view.freshness_window_secs, 777);
+        assert_eq!(view.max_response_bytes, 512);
+        assert!(!view.discover_usdc_via_inbox);
     }
 }

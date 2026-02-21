@@ -190,6 +190,14 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let snapshot = stable::observability_snapshot(DEFAULT_SNAPSHOT_LIMIT);
             json_update_response(StatusCode::OK, &snapshot)
         }
+        (&Method::GET, "/api/wallet/balance") => {
+            let telemetry = stable::wallet_balance_telemetry_view();
+            json_update_response(StatusCode::OK, &telemetry)
+        }
+        (&Method::GET, "/api/wallet/balance/sync-config") => {
+            let config = stable::wallet_balance_sync_config_view();
+            json_update_response(StatusCode::OK, &config)
+        }
         (&Method::POST, "/api/inbox") => {
             let payload = parse_inbox_post_request(request.body());
             match payload {
@@ -336,6 +344,8 @@ fn build_certification_state() -> HttpCertificationState {
             CONTENT_TYPE_JS,
         ),
         upgrade_route(Method::GET, "/api/snapshot"),
+        upgrade_route(Method::GET, "/api/wallet/balance"),
+        upgrade_route(Method::GET, "/api/wallet/balance/sync-config"),
         upgrade_route(Method::GET, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/conversation"),
@@ -733,6 +743,104 @@ mod tests {
 
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn get_wallet_balance_route_is_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::get("/api/wallet/balance").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn get_wallet_balance_sync_config_route_is_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::get("/api/wallet/balance/sync-config").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn wallet_balance_routes_return_safe_non_secret_views() {
+        init_certification();
+        stable::init_storage();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x1".to_string()),
+            usdc_balance_raw_hex: Some("0x2a".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(1),
+            last_synced_block: Some(123),
+            last_error: Some("rpc timeout".to_string()),
+        });
+        stable::set_wallet_balance_bootstrap_pending(true);
+        stable::set_wallet_balance_sync_config(crate::domain::types::WalletBalanceSyncConfig {
+            enabled: true,
+            normal_interval_secs: 300,
+            low_cycles_interval_secs: 900,
+            freshness_window_secs: 600,
+            max_response_bytes: 256,
+            discover_usdc_via_inbox: true,
+        })
+        .expect("wallet sync config should persist");
+
+        let telemetry_response =
+            handle_http_request_update(HttpRequest::get("/api/wallet/balance").build_update());
+        assert_eq!(telemetry_response.status_code(), StatusCode::OK);
+        let telemetry = serde_json::from_slice::<Value>(telemetry_response.body())
+            .expect("telemetry body should decode as json");
+        assert_eq!(
+            telemetry.get("eth_balance_wei_hex").and_then(Value::as_str),
+            Some("0x1")
+        );
+        assert_eq!(
+            telemetry
+                .get("usdc_balance_raw_hex")
+                .and_then(Value::as_str),
+            Some("0x2a")
+        );
+        assert_eq!(
+            telemetry.get("status").and_then(Value::as_str),
+            Some("Error")
+        );
+        assert_eq!(
+            telemetry.get("bootstrap_pending").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(telemetry.get("ecdsa_key_name").is_none());
+        assert!(telemetry.get("evm_rpc_url").is_none());
+        assert!(telemetry.get("openrouter_api_key").is_none());
+
+        let config_response = handle_http_request_update(
+            HttpRequest::get("/api/wallet/balance/sync-config").build_update(),
+        );
+        assert_eq!(config_response.status_code(), StatusCode::OK);
+        let config = serde_json::from_slice::<Value>(config_response.body())
+            .expect("config body should decode as json");
+        assert_eq!(
+            config.get("normal_interval_secs").and_then(Value::as_u64),
+            Some(300)
+        );
+        assert_eq!(
+            config
+                .get("low_cycles_interval_secs")
+                .and_then(Value::as_u64),
+            Some(900)
+        );
+        assert_eq!(
+            config.get("freshness_window_secs").and_then(Value::as_u64),
+            Some(600)
+        );
+        assert!(config.get("ecdsa_key_name").is_none());
+        assert!(config.get("evm_rpc_url").is_none());
+        assert!(config.get("openrouter_api_key").is_none());
     }
 
     #[test]

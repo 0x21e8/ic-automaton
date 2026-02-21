@@ -229,7 +229,7 @@ Recommended baseline:
       - Validation: `cargo test --lib scheduler::tests:: agent::tests::`
       - Notes: run sync opportunistically in `run_poll_inbox_job` with tier-aware due windows; enforce no-inference bootstrap gate until first sync success; update Layer-10 context to consume typed telemetry/freshness.
 
-- [ ] **Task 3: Expose safe interfaces and add integration coverage**
+- [x] **Task 3: Expose safe interfaces and add integration coverage**
       - Files: `src/lib.rs`, `src/http.rs`, `src/domain/types.rs`, `tests/pocketic_scheduler_queue.rs`, `tests/pocketic_ui_observability.rs` (or new `tests/pocketic_wallet_balance_sync.rs`)
       - Validation: `cargo test --lib http::tests:: && icp build && cargo test --features pocketic_tests --test pocketic_scheduler_queue -- --nocapture`
       - Notes: expose only non-secret telemetry/config fields and verify bootstrap gating (first inference blocked until sync), periodic refresh, stale transition, and non-fatal degradation behavior.

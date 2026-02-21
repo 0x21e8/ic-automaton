@@ -6,6 +6,7 @@ use crate::domain::types::{
     ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
     SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
     TransitionLogRecord, TurnRecord, WalletBalanceSnapshot, WalletBalanceSyncConfig,
+    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -1286,6 +1287,14 @@ pub fn snapshot_to_view() -> RuntimeView {
 
 pub fn evm_route_state_view() -> EvmRouteStateView {
     EvmRouteStateView::from(&runtime_snapshot())
+}
+
+pub fn wallet_balance_telemetry_view() -> WalletBalanceTelemetryView {
+    WalletBalanceTelemetryView::from_snapshot(&runtime_snapshot(), now_ns())
+}
+
+pub fn wallet_balance_sync_config_view() -> WalletBalanceSyncConfigView {
+    WalletBalanceSyncConfigView::from(&runtime_snapshot().wallet_balance_sync)
 }
 
 pub fn inference_config_view() -> InferenceConfigView {
