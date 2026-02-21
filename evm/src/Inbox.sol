@@ -81,6 +81,25 @@ contract Inbox {
         emit MessageQueued(automaton, nonce, msg.sender, message, usdcAmount, msg.value);
     }
 
+    function queueMessageEth(address automaton, string calldata message)
+        external
+        payable
+        returns (uint64 nonce)
+    {
+        require(automaton != address(0), "automaton required");
+
+        (, uint256 minEthWei,) = minPricesFor(automaton);
+        require(msg.value >= minEthWei, "insufficient eth");
+
+        (bool sent,) = automaton.call{value: msg.value}("");
+        require(sent, "eth forward failed");
+
+        nonce = nonces[automaton] + 1;
+        nonces[automaton] = nonce;
+
+        emit MessageQueued(automaton, nonce, msg.sender, message, 0, msg.value);
+    }
+
     function _safeTransferFrom(address token, address from, address to, uint256 value) internal {
         (bool success, bytes memory data) =
             token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, value));
