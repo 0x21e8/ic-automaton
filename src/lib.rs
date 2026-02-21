@@ -29,6 +29,8 @@ struct InitArgs {
     ecdsa_key_name: String,
     #[serde(default)]
     inbox_contract_address: Option<String>,
+    #[serde(default)]
+    evm_chain_id: Option<u64>,
 }
 
 fn ensure_controller() -> Result<(), String> {
@@ -60,6 +62,9 @@ fn init(args: InitArgs) {
     stable::init_storage();
     let _ = stable::set_ecdsa_key_name(args.ecdsa_key_name)
         .unwrap_or_else(|error| ic_cdk::trap(&error));
+    if let Some(chain_id) = args.evm_chain_id {
+        let _ = stable::set_evm_chain_id(chain_id).unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
     let _ = stable::set_evm_address(None).unwrap_or_else(|error| ic_cdk::trap(&error));
     let _ = stable::set_inbox_contract_address(args.inbox_contract_address)
         .unwrap_or_else(|error| ic_cdk::trap(&error));

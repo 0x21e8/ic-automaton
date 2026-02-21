@@ -93,6 +93,7 @@ struct RuntimeView {
 struct InitArgs {
     ecdsa_key_name: String,
     inbox_contract_address: Option<String>,
+    evm_chain_id: Option<u64>,
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
@@ -137,20 +138,24 @@ fn assert_wasm_artifact_present() -> Vec<u8> {
     );
 }
 
-fn with_backend_canister() -> (PocketIc, Principal) {
+fn with_backend_canister_with_init_args(init: InitArgs) -> (PocketIc, Principal) {
     let pic = PocketIc::new();
     let canister_id = pic.create_canister();
     let wasm = assert_wasm_artifact_present();
-    let init_args = encode_args((InitArgs {
-        ecdsa_key_name: "dfx_test_key".to_string(),
-        inbox_contract_address: None,
-    },))
-    .expect("failed to encode init args");
+    let init_args = encode_args((init,)).expect("failed to encode init args");
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
     pic.install_canister(canister_id, wasm, init_args, None);
 
     (pic, canister_id)
+}
+
+fn with_backend_canister() -> (PocketIc, Principal) {
+    with_backend_canister_with_init_args(InitArgs {
+        ecdsa_key_name: "dfx_test_key".to_string(),
+        inbox_contract_address: None,
+        evm_chain_id: None,
+    })
 }
 
 fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
@@ -314,6 +319,18 @@ fn loop_disabled_agent_turn_is_counted_as_successful_skip() {
         AgentState::Faulted,
         "disabled loop skip must not transition runtime to faulted"
     );
+}
+
+#[test]
+fn init_args_can_override_evm_chain_id() {
+    let (pic, canister_id) = with_backend_canister_with_init_args(InitArgs {
+        ecdsa_key_name: "dfx_test_key".to_string(),
+        inbox_contract_address: None,
+        evm_chain_id: Some(84532),
+    });
+
+    let runtime = get_runtime_view(&pic, canister_id);
+    assert_eq!(runtime.evm_chain_id, 84532);
 }
 
 #[test]
