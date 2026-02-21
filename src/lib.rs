@@ -95,26 +95,22 @@ fn set_loop_enabled(enabled: bool) -> String {
 
 #[ic_cdk::update]
 fn set_inference_provider(provider: InferenceProvider) -> String {
-    ensure_controller_or_trap();
     stable::set_inference_provider(provider.clone());
     format!("inference_provider={provider:?}")
 }
 
 #[ic_cdk::update]
 fn set_inference_model(model: String) -> Result<String, String> {
-    ensure_controller()?;
     stable::set_inference_model(model)
 }
 
 #[ic_cdk::update]
 fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
-    ensure_controller()?;
     stable::set_openrouter_base_url(base_url)
 }
 
 #[ic_cdk::update]
 fn set_openrouter_api_key(api_key: Option<String>) -> String {
-    ensure_controller_or_trap();
     stable::set_openrouter_api_key(api_key);
     "openrouter_api_key_updated".to_string()
 }
