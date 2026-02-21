@@ -704,6 +704,157 @@ pub enum SurvivalOperationClass {
     ThresholdSign,
 }
 
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum RecoveryOperation {
+    WalletBalanceSync,
+    EvmPoll,
+    Inference,
+    ToolExecution,
+    #[default]
+    Unknown,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum OutcallFailureKind {
+    ResponseTooLarge,
+    Timeout,
+    Transport,
+    RateLimited,
+    UpstreamUnavailable,
+    InvalidRequest,
+    InvalidResponse,
+    RejectedByPolicy,
+    Unknown,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OutcallFailure {
+    pub kind: OutcallFailureKind,
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
+    #[serde(default)]
+    pub observed_response_bytes: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum OperationFailureKind {
+    BlockedBySurvivalPolicy,
+    MissingConfiguration,
+    InvalidConfiguration,
+    InsufficientCycles,
+    Unauthorized,
+    Deterministic,
+    Unknown,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OperationFailure {
+    pub kind: OperationFailureKind,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryFailure {
+    Outcall(OutcallFailure),
+    Operation(OperationFailure),
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum RecoveryPolicyAction {
+    Skip,
+    RetryImmediate,
+    Backoff,
+    TuneResponseLimit,
+    #[default]
+    EscalateFault,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryDecisionReason {
+    ResponseTooLarge,
+    ResponseLimitAlreadyMaxed,
+    TransientOutcallFailure,
+    OutcallRateLimited,
+    NonRetriableOutcallFailure,
+    SurvivalPolicyBlocked,
+    InsufficientCycles,
+    NonRetriableOperationFailure,
+    UnknownFailure,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ResponseLimitAdjustment {
+    pub from_bytes: u64,
+    pub to_bytes: u64,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryDecision {
+    pub action: RecoveryPolicyAction,
+    pub reason: RecoveryDecisionReason,
+    #[serde(default)]
+    pub backoff_secs: Option<u64>,
+    #[serde(default)]
+    pub response_limit_adjustment: Option<ResponseLimitAdjustment>,
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ResponseLimitPolicy {
+    pub current_bytes: u64,
+    pub min_bytes: u64,
+    pub max_bytes: u64,
+    #[serde(default = "default_response_limit_tune_multiplier")]
+    pub tune_multiplier: u64,
+}
+
+impl Default for ResponseLimitPolicy {
+    fn default() -> Self {
+        Self {
+            current_bytes: 256,
+            min_bytes: 256,
+            max_bytes: 4 * 1024,
+            tune_multiplier: default_response_limit_tune_multiplier(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryContext {
+    #[serde(default)]
+    pub operation: RecoveryOperation,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default = "default_recovery_backoff_base_secs")]
+    pub backoff_base_secs: u64,
+    #[serde(default = "default_recovery_backoff_max_secs")]
+    pub backoff_max_secs: u64,
+    #[serde(default)]
+    pub response_limit: Option<ResponseLimitPolicy>,
+}
+
+impl Default for RecoveryContext {
+    fn default() -> Self {
+        Self {
+            operation: RecoveryOperation::Unknown,
+            consecutive_failures: 0,
+            backoff_base_secs: default_recovery_backoff_base_secs(),
+            backoff_max_secs: default_recovery_backoff_max_secs(),
+            response_limit: None,
+        }
+    }
+}
+
 impl TaskLane {
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -881,11 +1032,27 @@ fn default_wallet_balance_bootstrap_pending() -> bool {
     true
 }
 
+#[allow(dead_code)]
+fn default_recovery_backoff_base_secs() -> u64 {
+    5
+}
+
+#[allow(dead_code)]
+fn default_recovery_backoff_max_secs() -> u64 {
+    300
+}
+
+#[allow(dead_code)]
+fn default_response_limit_tune_multiplier() -> u64 {
+    2
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeSnapshot, WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
-        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+        RecoveryContext, ResponseLimitPolicy, RuntimeSnapshot, WalletBalanceSnapshot,
+        WalletBalanceStatus, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+        WalletBalanceTelemetryView,
     };
 
     #[test]
@@ -1008,5 +1175,22 @@ mod tests {
         assert_eq!(view.freshness_window_secs, 777);
         assert_eq!(view.max_response_bytes, 512);
         assert!(!view.discover_usdc_via_inbox);
+    }
+
+    #[test]
+    fn recovery_context_defaults_are_bounded_and_safe() {
+        let context = RecoveryContext::default();
+        assert_eq!(context.backoff_base_secs, 5);
+        assert_eq!(context.backoff_max_secs, 300);
+        assert!(context.response_limit.is_none());
+    }
+
+    #[test]
+    fn response_limit_policy_defaults_match_wallet_sync_bounds() {
+        let policy = ResponseLimitPolicy::default();
+        assert_eq!(policy.current_bytes, 256);
+        assert_eq!(policy.min_bytes, 256);
+        assert_eq!(policy.max_bytes, 4 * 1024);
+        assert_eq!(policy.tune_multiplier, 2);
     }
 }
