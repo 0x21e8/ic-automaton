@@ -28,6 +28,8 @@ const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
 const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
 const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
+const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
+const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
 
@@ -287,11 +289,20 @@ impl HttpEvmRpcClient {
     }
 
     pub async fn eth_get_balance(&self, address: &str) -> Result<String, String> {
+        self.eth_get_balance_with_limit(address, self.control_plane_max_response_bytes())
+            .await
+    }
+
+    pub async fn eth_get_balance_with_limit(
+        &self,
+        address: &str,
+        max_response_bytes: u64,
+    ) -> Result<String, String> {
         let response = self
             .rpc_call(
                 "eth_getBalance",
                 json!([address, "latest"]),
-                self.control_plane_max_response_bytes(),
+                max_response_bytes,
             )
             .await
             .map_err(|error| format!("eth_getBalance failed: {error}"))?;
@@ -303,11 +314,21 @@ impl HttpEvmRpcClient {
     }
 
     pub async fn eth_call(&self, address: &str, calldata: &str) -> Result<String, String> {
+        self.eth_call_with_limit(address, calldata, self.control_plane_max_response_bytes())
+            .await
+    }
+
+    pub async fn eth_call_with_limit(
+        &self,
+        address: &str,
+        calldata: &str,
+        max_response_bytes: u64,
+    ) -> Result<String, String> {
         let response = self
             .rpc_call(
                 "eth_call",
                 json!([{"to": address, "data": calldata}, "latest"]),
-                self.control_plane_max_response_bytes(),
+                max_response_bytes,
             )
             .await
             .map_err(|error| format!("eth_call failed: {error}"))?;
@@ -580,7 +601,7 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
         "eth_blockNumber" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
         "eth_getLogs" => json!({"jsonrpc":"2.0","id":1,"result":[]}),
         "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
-        "eth_call" => json!({"jsonrpc":"2.0","id":1,"result":"0x"}),
+        "eth_call" => host_rpc_stub_eth_call_result(&request),
         "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
         "eth_gasPrice" => json!({"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}),
         "eth_estimateGas" => json!({"jsonrpc":"2.0","id":1,"result":"0x5208"}),
@@ -598,6 +619,38 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
 
     serde_json::to_vec(&response)
         .map_err(|error| format!("host rpc stub failed to serialize response: {error}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_stub_eth_call_result(request: &Value) -> Value {
+    let data = request
+        .pointer("/params/0/data")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let usdc_selector = encode_call_no_args(INBOX_USDC_FUNCTION_SIGNATURE);
+    let balance_selector = format!(
+        "0x{}",
+        function_selector_hex(ERC20_BALANCE_OF_FUNCTION_SIGNATURE)
+    );
+
+    if data == usdc_selector {
+        return json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x0000000000000000000000003333333333333333333333333333333333333333"
+        });
+    }
+    if data.starts_with(&balance_selector) {
+        return json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x000000000000000000000000000000000000000000000000000000000000002a"
+        });
+    }
+
+    json!({"jsonrpc":"2.0","id":1,"result":"0x"})
 }
 
 fn parse_hex_u64(raw: &str, field: &str) -> Result<u64, String> {
@@ -634,6 +687,55 @@ fn address_to_topic(raw: &str) -> Result<String, String> {
     let normalized = normalize_address(raw)?;
     let bytes = normalized.trim_start_matches("0x");
     Ok(format!("0x{:0>64}", bytes))
+}
+
+fn function_selector_hex(signature: &str) -> String {
+    let hash = keccak256(signature.as_bytes());
+    hex::encode(&hash.as_slice()[..4])
+}
+
+fn encode_call_no_args(signature: &str) -> String {
+    format!("0x{}", function_selector_hex(signature))
+}
+
+#[allow(dead_code)]
+fn encode_call_single_address_arg(signature: &str, address: &str) -> Result<String, String> {
+    let normalized = normalize_address(address)?;
+    Ok(format!(
+        "0x{}{:0>64}",
+        function_selector_hex(signature),
+        normalized.trim_start_matches("0x")
+    ))
+}
+
+#[allow(dead_code)]
+fn decode_u256_word_hex_as_quantity(raw: &str, field: &str) -> Result<String, String> {
+    let normalized = normalize_hex_blob(raw, field)?;
+    let payload = normalized.trim_start_matches("0x");
+    if payload.is_empty() {
+        return Ok("0x0".to_string());
+    }
+    let value_hex = if payload.len() >= 64 {
+        &payload[..64]
+    } else {
+        payload
+    };
+    let value = parse_hex_u256(&format!("0x{value_hex}"), field)?;
+    Ok(format!("0x{value:x}"))
+}
+
+#[allow(dead_code)]
+fn decode_address_word_from_eth_call(raw: &str, field: &str) -> Result<String, String> {
+    let normalized = normalize_hex_blob(raw, field)?;
+    let payload = normalized.trim_start_matches("0x");
+    if payload.len() < 64 {
+        return Err(format!("{field} must be at least 32 bytes"));
+    }
+    let word = &payload[..64];
+    let decoded = hex::decode(word)
+        .map_err(|error| format!("failed to decode {field} return data: {error}"))?;
+    let address = format!("0x{}", hex::encode(&decoded[12..32]));
+    normalize_address(&address)
 }
 
 fn normalize_topic(raw: &str, field: &str) -> Result<String, String> {
@@ -827,6 +929,108 @@ fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
         address,
         calldata,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct WalletBalanceSyncRead {
+    pub eth_balance_wei_hex: String,
+    pub usdc_balance_raw_hex: String,
+    pub usdc_contract_address: String,
+}
+
+#[allow(dead_code)]
+pub async fn fetch_wallet_balance_sync_read(
+    snapshot: &RuntimeSnapshot,
+) -> Result<WalletBalanceSyncRead, String> {
+    let wallet_address = snapshot
+        .evm_address
+        .as_deref()
+        .ok_or_else(|| "evm address is not configured".to_string())
+        .and_then(normalize_address)?;
+    let rpc = HttpEvmRpcClient::from_snapshot(snapshot)?;
+    let max_response_bytes = clamp_response_bytes(snapshot.wallet_balance_sync.max_response_bytes);
+    let usdc_contract_address =
+        resolve_usdc_contract_address(snapshot, &rpc, max_response_bytes).await?;
+    let eth_balance_wei_hex =
+        fetch_eth_balance_wei_hex(&rpc, &wallet_address, max_response_bytes).await?;
+    let usdc_balance_raw_hex = fetch_usdc_balance_raw_hex(
+        &rpc,
+        &usdc_contract_address,
+        &wallet_address,
+        max_response_bytes,
+    )
+    .await?;
+
+    Ok(WalletBalanceSyncRead {
+        eth_balance_wei_hex,
+        usdc_balance_raw_hex,
+        usdc_contract_address,
+    })
+}
+
+#[allow(dead_code)]
+async fn resolve_usdc_contract_address(
+    snapshot: &RuntimeSnapshot,
+    rpc: &HttpEvmRpcClient,
+    max_response_bytes: u64,
+) -> Result<String, String> {
+    if let Some(explicit) = snapshot.wallet_balance.usdc_contract_address.as_deref() {
+        return normalize_address(explicit);
+    }
+    if !snapshot.wallet_balance_sync.discover_usdc_via_inbox {
+        return Err("usdc contract address is not configured".to_string());
+    }
+    let inbox_contract_address = snapshot
+        .inbox_contract_address
+        .as_deref()
+        .ok_or_else(|| "inbox contract address is not configured".to_string())?;
+    discover_usdc_contract_address_via_inbox(rpc, inbox_contract_address, max_response_bytes).await
+}
+
+#[allow(dead_code)]
+pub async fn fetch_eth_balance_wei_hex(
+    rpc: &HttpEvmRpcClient,
+    wallet_address: &str,
+    max_response_bytes: u64,
+) -> Result<String, String> {
+    let wallet = normalize_address(wallet_address)?;
+    rpc.eth_get_balance_with_limit(&wallet, max_response_bytes)
+        .await
+}
+
+#[allow(dead_code)]
+pub async fn fetch_usdc_balance_raw_hex(
+    rpc: &HttpEvmRpcClient,
+    usdc_contract_address: &str,
+    wallet_address: &str,
+    max_response_bytes: u64,
+) -> Result<String, String> {
+    let usdc_contract = normalize_address(usdc_contract_address)?;
+    let wallet = normalize_address(wallet_address)?;
+    let calldata = encode_call_single_address_arg(ERC20_BALANCE_OF_FUNCTION_SIGNATURE, &wallet)?;
+    let raw = rpc
+        .eth_call_with_limit(&usdc_contract, &calldata, max_response_bytes)
+        .await?;
+    decode_u256_word_hex_as_quantity(&raw, "usdc balanceOf result")
+}
+
+#[allow(dead_code)]
+pub async fn discover_usdc_contract_address_via_inbox(
+    rpc: &HttpEvmRpcClient,
+    inbox_contract_address: &str,
+    max_response_bytes: u64,
+) -> Result<String, String> {
+    let inbox_contract = normalize_address(inbox_contract_address)?;
+    let calldata = encode_call_no_args(INBOX_USDC_FUNCTION_SIGNATURE);
+    let raw = rpc
+        .eth_call_with_limit(&inbox_contract, &calldata, max_response_bytes)
+        .await?;
+    let usdc_address = decode_address_word_from_eth_call(&raw, "Inbox.usdc result")?;
+    if usdc_address == "0x0000000000000000000000000000000000000000" {
+        return Err("Inbox.usdc returned zero address".to_string());
+    }
+    Ok(usdc_address)
 }
 
 pub async fn evm_read_tool(args_json: &str) -> Result<String, String> {
@@ -1447,6 +1651,76 @@ mod tests {
         .expect("evm_read should succeed in host-mode stub");
 
         assert_eq!(out, "0x1");
+    }
+
+    #[test]
+    fn fetch_wallet_balance_sync_read_discovers_usdc_and_reads_balances() {
+        let snapshot = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            inbox_contract_address: Some("0x2222222222222222222222222222222222222222".to_string()),
+            wallet_balance_sync: crate::domain::types::WalletBalanceSyncConfig {
+                max_response_bytes: 256,
+                discover_usdc_via_inbox: true,
+                ..crate::domain::types::WalletBalanceSyncConfig::default()
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        let read = block_on_with_spin(fetch_wallet_balance_sync_read(&snapshot))
+            .expect("wallet balance sync read should succeed");
+        assert_eq!(read.eth_balance_wei_hex, "0x1");
+        assert_eq!(read.usdc_balance_raw_hex, "0x2a");
+        assert_eq!(
+            read.usdc_contract_address,
+            "0x3333333333333333333333333333333333333333"
+        );
+    }
+
+    #[test]
+    fn fetch_wallet_balance_sync_read_prefers_explicit_usdc_contract_override() {
+        let snapshot = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            wallet_balance: crate::domain::types::WalletBalanceSnapshot {
+                usdc_contract_address: Some(
+                    "0x4444444444444444444444444444444444444444".to_string(),
+                ),
+                ..crate::domain::types::WalletBalanceSnapshot::default()
+            },
+            wallet_balance_sync: crate::domain::types::WalletBalanceSyncConfig {
+                max_response_bytes: 256,
+                discover_usdc_via_inbox: false,
+                ..crate::domain::types::WalletBalanceSyncConfig::default()
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        let read = block_on_with_spin(fetch_wallet_balance_sync_read(&snapshot))
+            .expect("wallet balance sync read should succeed with explicit usdc contract");
+        assert_eq!(
+            read.usdc_contract_address,
+            "0x4444444444444444444444444444444444444444"
+        );
+        assert_eq!(read.usdc_balance_raw_hex, "0x2a");
+    }
+
+    #[test]
+    fn fetch_wallet_balance_sync_read_requires_usdc_source() {
+        let snapshot = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            wallet_balance_sync: crate::domain::types::WalletBalanceSyncConfig {
+                max_response_bytes: 256,
+                discover_usdc_via_inbox: false,
+                ..crate::domain::types::WalletBalanceSyncConfig::default()
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        let err = block_on_with_spin(fetch_wallet_balance_sync_read(&snapshot))
+            .expect_err("missing usdc source should fail");
+        assert!(err.contains("usdc contract address is not configured"));
     }
 
     #[test]
