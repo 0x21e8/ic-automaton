@@ -261,6 +261,11 @@ function formatDurationNs(startNs, endNs) {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+function formatMb(mb) {
+  if (mb == null) return "unknown";
+  return `${Number(mb).toFixed(2)} MB`;
+}
+
 // =============================================================================
 // BOOT SEQUENCE
 // =============================================================================
@@ -509,10 +514,11 @@ async function cmdStatus() {
   }
   spinner.stop("");
 
-  const runtime   = snapshot?.runtime   ?? {};
-  const scheduler = snapshot?.scheduler ?? {};
-  const cycles    = snapshot?.cycles    ?? {};
-  const inbox     = snapshot?.inbox_stats ?? {};
+  const runtime   = snapshot?.runtime        ?? {};
+  const scheduler = snapshot?.scheduler      ?? {};
+  const cycles    = snapshot?.cycles         ?? {};
+  const inbox     = snapshot?.inbox_stats    ?? {};
+  const storage   = snapshot?.storage_growth ?? {};
 
   // — AUTOMATON STATUS —
   printLine("AUTOMATON STATUS", "system bright");
@@ -574,6 +580,13 @@ async function cmdStatus() {
     }
     printEmpty();
   }
+
+  // — MEMORY —
+  printLine("MEMORY", "system bright");
+  printSeparator();
+  printLine(`  HEAP:            ${formatMb(storage.heap_memory_mb)}`, "system");
+  printLine(`  STABLE:          ${formatMb(storage.stable_memory_mb)}`, "system");
+  printEmpty();
 
   // — INBOX —
   printLine("INBOX", "system bright");

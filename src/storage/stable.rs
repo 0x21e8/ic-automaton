@@ -3,10 +3,10 @@ use crate::domain::types::{
     CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage, InboxMessageStatus, InboxStats,
     InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
     OutboxMessage, OutboxStats, PromptLayer, PromptLayerView, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
-    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
-    TransitionLogRecord, TurnRecord, WalletBalanceSnapshot, WalletBalanceSyncConfig,
-    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, StorageGrowthMetrics,
+    SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
+    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord, WalletBalanceSnapshot,
+    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -15,6 +15,7 @@ use ic_stable_structures::{
     DefaultMemoryImpl, StableBTreeMap,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use std::cell::RefCell;
 
 fn now_ns() -> u64 {
@@ -49,6 +50,13 @@ const MAX_CONVERSATION_SENDERS: usize = 200;
 const MAX_CONVERSATION_BODY_CHARS: usize = 500;
 const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
 const MAX_EVM_CONFIRMATION_DEPTH: u64 = 100;
+pub const MAX_MEMORY_FACTS: usize = 500;
+pub const MAX_INBOX_BODY_CHARS: usize = 4_096;
+const MAX_TURN_INNER_DIALOGUE_CHARS: usize = 12_000;
+const MAX_TOOL_ARGS_JSON_CHARS: usize = 4_000;
+const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
+#[cfg(test)]
+const MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS: usize = 120;
 const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
 const EVM_INGEST_DEDUPE_KEY_PREFIX: &str = "evm.ingest";
 #[cfg(not(target_arch = "wasm32"))]
@@ -895,6 +903,14 @@ pub fn get_automaton_evm_address() -> Option<String> {
     get_evm_address()
 }
 
+pub fn get_evm_rpc_url() -> String {
+    runtime_snapshot().evm_rpc_url
+}
+
+pub fn get_discovered_usdc_address() -> Option<String> {
+    runtime_snapshot().wallet_balance.usdc_contract_address
+}
+
 pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<String>, String> {
     let normalized = match address {
         Some(raw) => Some(normalize_evm_hex_address(&raw, "inbox contract address")?),
@@ -938,10 +954,16 @@ pub fn set_evm_confirmation_depth(confirmation_depth: u64) -> Result<u64, String
     Ok(confirmation_depth)
 }
 
-pub fn set_memory_fact(fact: &MemoryFact) {
+pub fn set_memory_fact(fact: &MemoryFact) -> Result<(), String> {
     MEMORY_FACTS_MAP.with(|map| {
-        map.borrow_mut().insert(fact.key.clone(), encode_json(fact));
-    });
+        let mut map_ref = map.borrow_mut();
+        let exists = map_ref.get(&fact.key).is_some();
+        if !exists && map_ref.len() as usize >= MAX_MEMORY_FACTS {
+            return Err(format!("memory full: max {MAX_MEMORY_FACTS} facts"));
+        }
+        map_ref.insert(fact.key.clone(), encode_json(fact));
+        Ok(())
+    })
 }
 
 pub fn get_memory_fact(key: &str) -> Option<MemoryFact> {
@@ -956,6 +978,7 @@ pub fn remove_memory_fact(key: &str) -> bool {
         .is_some()
 }
 
+#[allow(dead_code)]
 pub fn memory_fact_count() -> usize {
     MEMORY_FACTS_MAP.with(|map| map.borrow().len() as usize)
 }
@@ -1402,12 +1425,18 @@ pub fn record_transition(
 }
 
 pub fn append_turn_record(record: &TurnRecord, tool_calls: &[ToolCallRecord]) {
-    let turn_key = format!("{:020}-{}", record.created_at_ns, record.id);
+    let mut bounded_record = record.clone();
+    bounded_record.inner_dialogue = bounded_record
+        .inner_dialogue
+        .as_ref()
+        .map(|dialogue| truncate_text_field(dialogue, MAX_TURN_INNER_DIALOGUE_CHARS));
+    let turn_key = format!("{:020}-{}", bounded_record.created_at_ns, bounded_record.id);
     TURN_MAP.with(|map| {
-        map.borrow_mut().insert(turn_key, encode_json(record));
+        map.borrow_mut()
+            .insert(turn_key, encode_json(&bounded_record));
     });
 
-    set_tool_records(&record.id, tool_calls);
+    set_tool_records(&bounded_record.id, tool_calls);
 }
 
 pub fn list_recent_transitions(limit: usize) -> Vec<TransitionLogRecord> {
@@ -1439,9 +1468,19 @@ pub fn list_turns(limit: usize) -> Vec<TurnRecord> {
 }
 
 pub fn set_tool_records(turn_id: &str, tool_calls: &[ToolCallRecord]) {
+    let bounded_tool_calls = tool_calls
+        .iter()
+        .map(|record| {
+            let mut bounded = record.clone();
+            bounded.args_json = truncate_text_field(&bounded.args_json, MAX_TOOL_ARGS_JSON_CHARS);
+            bounded.output = truncate_text_field(&bounded.output, MAX_TOOL_OUTPUT_CHARS);
+            bounded
+        })
+        .collect::<Vec<_>>();
     let tool_key = format!("tools:{turn_id}");
     TOOL_MAP.with(|map| {
-        map.borrow_mut().insert(tool_key, encode_json(tool_calls));
+        map.borrow_mut()
+            .insert(tool_key, encode_json(&bounded_tool_calls));
     });
 }
 
@@ -1484,18 +1523,23 @@ pub fn try_mark_evm_event_ingested(tx_hash: &str, log_index: u64) -> bool {
     true
 }
 
-pub fn post_inbox_message(body: String, caller: String) -> Result<String, String> {
-    let trimmed = body.trim();
+pub fn normalize_inbox_body(raw_body: &str) -> Result<String, String> {
+    let trimmed = raw_body.trim();
     if trimmed.is_empty() {
         return Err("message cannot be empty".to_string());
     }
+    Ok(truncate_text_field(trimmed, MAX_INBOX_BODY_CHARS))
+}
+
+pub fn post_inbox_message(body: String, caller: String) -> Result<String, String> {
+    let bounded_body = normalize_inbox_body(&body)?;
 
     let seq = next_inbox_seq();
     let id = format!("inbox:{seq:020}");
     let message = InboxMessage {
         id: id.clone(),
         seq,
-        body: trimmed.to_string(),
+        body: bounded_body,
         posted_at_ns: now_ns(),
         posted_by: caller,
         status: InboxMessageStatus::Pending,
@@ -1522,15 +1566,14 @@ pub fn list_inbox_messages(limit: usize) -> Vec<InboxMessage> {
     if limit == 0 {
         return Vec::new();
     }
-    let mut messages = INBOX_MAP.with(|map| {
+    INBOX_MAP.with(|map| {
         map.borrow()
             .iter()
+            .rev()
+            .take(limit)
             .filter_map(|entry| read_json::<InboxMessage>(Some(entry.value().as_slice())))
-            .collect::<Vec<_>>()
-    });
-    messages.sort_by_key(|message| std::cmp::Reverse(message.seq));
-    messages.truncate(limit);
-    messages
+            .collect()
+    })
 }
 
 pub fn inbox_stats() -> InboxStats {
@@ -1719,6 +1762,44 @@ fn derive_cycle_telemetry(
     }
 }
 
+fn storage_growth_metrics() -> StorageGrowthMetrics {
+    #[cfg(target_arch = "wasm32")]
+    let heap_memory_mb = {
+        let pages = core::arch::wasm32::memory_size(0) as u64;
+        pages as f64 * 65536.0 / 1_048_576.0
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let heap_memory_mb = 0.0_f64;
+
+    #[cfg(target_arch = "wasm32")]
+    let stable_memory_mb = {
+        let pages = ic_cdk::api::stable_size();
+        pages as f64 * 65536.0 / 1_048_576.0
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let stable_memory_mb = 0.0_f64;
+
+    StorageGrowthMetrics {
+        runtime_map_entries: RUNTIME_MAP.with(|map| map.borrow().len()),
+        transition_map_entries: TRANSITION_MAP.with(|map| map.borrow().len()),
+        turn_map_entries: TURN_MAP.with(|map| map.borrow().len()),
+        tool_map_entries: TOOL_MAP.with(|map| map.borrow().len()),
+        job_map_entries: JOB_MAP.with(|map| map.borrow().len()),
+        job_queue_map_entries: JOB_QUEUE_MAP.with(|map| map.borrow().len()),
+        dedupe_map_entries: DEDUPE_MAP.with(|map| map.borrow().len()),
+        inbox_map_entries: INBOX_MAP.with(|map| map.borrow().len()),
+        inbox_pending_queue_entries: INBOX_PENDING_QUEUE_MAP.with(|map| map.borrow().len()),
+        inbox_staged_queue_entries: INBOX_STAGED_QUEUE_MAP.with(|map| map.borrow().len()),
+        outbox_map_entries: OUTBOX_MAP.with(|map| map.borrow().len()),
+        memory_fact_entries: MEMORY_FACTS_MAP.with(|map| map.borrow().len()),
+        memory_fact_limit: u64::try_from(MAX_MEMORY_FACTS).unwrap_or(u64::MAX),
+        retention_progress_percent: 0,
+        summarization_progress_percent: 0,
+        heap_memory_mb,
+        stable_memory_mb,
+    }
+}
+
 pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
     let bounded_limit = if limit == 0 {
         DEFAULT_OBSERVABILITY_LIMIT
@@ -1738,6 +1819,7 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
         captured_at_ns,
         runtime: snapshot_to_view(),
         scheduler: scheduler_runtime_view(),
+        storage_growth: storage_growth_metrics(),
         inbox_stats: inbox_stats(),
         inbox_messages: list_inbox_messages(bounded_limit),
         outbox_stats: outbox_stats(),
@@ -1781,15 +1863,14 @@ pub fn list_outbox_messages(limit: usize) -> Vec<OutboxMessage> {
     if limit == 0 {
         return Vec::new();
     }
-    let mut messages = OUTBOX_MAP.with(|map| {
+    OUTBOX_MAP.with(|map| {
         map.borrow()
             .iter()
+            .rev()
+            .take(limit)
             .filter_map(|entry| read_json::<OutboxMessage>(Some(entry.value().as_slice())))
-            .collect::<Vec<_>>()
-    });
-    messages.sort_by_key(|message| std::cmp::Reverse(message.seq));
-    messages.truncate(limit);
-    messages
+            .collect()
+    })
 }
 
 pub fn outbox_stats() -> OutboxStats {
@@ -2232,18 +2313,15 @@ pub fn list_recent_jobs(limit: usize) -> Vec<ScheduledJob> {
     if limit == 0 {
         return Vec::new();
     }
-    let mut jobs = JOB_MAP.with(|map| {
+    let keep = limit.min(MAX_RECENT_JOBS);
+    JOB_MAP.with(|map| {
         map.borrow()
             .iter()
+            .rev()
+            .take(keep)
             .filter_map(|entry| read_json::<ScheduledJob>(Some(entry.value().as_slice())))
-            .collect::<Vec<_>>()
-    });
-    jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at_ns));
-    let keep = limit.min(MAX_RECENT_JOBS);
-    if jobs.len() > keep {
-        jobs.truncate(keep);
-    }
-    jobs
+            .collect()
+    })
 }
 
 fn scheduler_runtime() -> SchedulerRuntime {
@@ -2361,6 +2439,42 @@ fn truncate_to_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn truncate_text_field(value: &str, max_chars: usize) -> String {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let truncated = total_chars.saturating_sub(max_chars);
+    let digest = Keccak256::digest(value.as_bytes());
+    let digest_hex = hex::encode(digest);
+    let marker = format!(
+        "...[truncated {truncated} chars keccak:{}]",
+        &digest_hex[..16]
+    );
+    let marker_len = marker.chars().count();
+    if marker_len >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+
+    let keep_chars = max_chars.saturating_sub(marker_len);
+    let prefix_chars = keep_chars / 2;
+    let suffix_chars = keep_chars.saturating_sub(prefix_chars);
+    let prefix = value.chars().take(prefix_chars).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(suffix_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}{marker}{suffix}")
+}
+
 fn evict_oldest_conversation_sender_if_needed() {
     loop {
         let len = CONVERSATION_MAP.with(|map| map.borrow().len() as usize);
@@ -2438,6 +2552,177 @@ fn encode_json<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
 
 fn read_json<T: DeserializeOwned>(value: Option<&[u8]>) -> Option<T> {
     value.and_then(|raw| serde_json::from_slice(raw).ok())
+}
+
+#[cfg(feature = "canbench-rs")]
+mod canbench_pilots {
+    use super::*;
+    use canbench_rs::bench;
+
+    const BENCH_DATASET_SIZE: u64 = 2_000;
+    const BENCH_LIST_LIMIT: usize = 50;
+
+    fn clear_inbox_maps() {
+        let inbox_keys = INBOX_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        INBOX_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in inbox_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let pending_keys = INBOX_PENDING_QUEUE_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        INBOX_PENDING_QUEUE_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in pending_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let staged_keys = INBOX_STAGED_QUEUE_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        INBOX_STAGED_QUEUE_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in staged_keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_outbox_map() {
+        let keys = OUTBOX_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        OUTBOX_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_job_map() {
+        let keys = JOB_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        JOB_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn seed_inbox_messages(count: u64) {
+        init_storage();
+        clear_inbox_maps();
+        for seq in 1..=count {
+            let id = format!("inbox:{seq:020}");
+            let message = InboxMessage {
+                id: id.clone(),
+                seq,
+                body: format!("seed inbox message {seq}"),
+                posted_at_ns: seq,
+                posted_by: "bench".to_string(),
+                status: InboxMessageStatus::Pending,
+                staged_at_ns: None,
+                consumed_at_ns: None,
+            };
+            INBOX_MAP.with(|map| {
+                map.borrow_mut().insert(id, encode_json(&message));
+            });
+        }
+        save_runtime_u64(INBOX_SEQ_KEY, count);
+    }
+
+    fn seed_outbox_messages(count: u64) {
+        init_storage();
+        clear_outbox_map();
+        for seq in 1..=count {
+            let id = format!("outbox:{seq:020}");
+            let message = OutboxMessage {
+                id: id.clone(),
+                seq,
+                turn_id: format!("turn-{seq}"),
+                body: format!("seed outbox message {seq}"),
+                created_at_ns: seq,
+                source_inbox_ids: Vec::new(),
+            };
+            OUTBOX_MAP.with(|map| {
+                map.borrow_mut().insert(id, encode_json(&message));
+            });
+        }
+        save_runtime_u64(OUTBOX_SEQ_KEY, count);
+    }
+
+    fn seed_jobs(count: u64) {
+        init_storage();
+        clear_job_map();
+        for seq in 1..=count {
+            let job = ScheduledJob {
+                id: format!("job:{seq:020}:{seq:020}"),
+                kind: TaskKind::PollInbox,
+                lane: TaskLane::Mutating,
+                dedupe_key: format!("PollInbox:{seq}"),
+                priority: 1,
+                created_at_ns: seq,
+                scheduled_for_ns: seq,
+                started_at_ns: None,
+                finished_at_ns: None,
+                status: JobStatus::Pending,
+                attempts: 0,
+                max_attempts: 3,
+                last_error: None,
+            };
+            JOB_MAP.with(|map| {
+                map.borrow_mut().insert(job.id.clone(), encode_json(&job));
+            });
+        }
+    }
+
+    #[bench(raw)]
+    fn bench_list_inbox_messages_recent() -> canbench_rs::BenchResult {
+        seed_inbox_messages(BENCH_DATASET_SIZE);
+        canbench_rs::bench_fn(|| {
+            std::hint::black_box(list_inbox_messages(BENCH_LIST_LIMIT));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_list_outbox_messages_recent() -> canbench_rs::BenchResult {
+        seed_outbox_messages(BENCH_DATASET_SIZE);
+        canbench_rs::bench_fn(|| {
+            std::hint::black_box(list_outbox_messages(BENCH_LIST_LIMIT));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_list_recent_jobs() -> canbench_rs::BenchResult {
+        seed_jobs(BENCH_DATASET_SIZE);
+        canbench_rs::bench_fn(|| {
+            std::hint::black_box(list_recent_jobs(BENCH_LIST_LIMIT));
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2689,6 +2974,52 @@ mod tests {
     }
 
     #[test]
+    fn list_recent_jobs_prefers_key_recency_over_created_at_field() {
+        init_storage();
+        save_job(&ScheduledJob {
+            id: "job:00000000000000000001:00000000000000000001".to_string(),
+            kind: TaskKind::PollInbox,
+            lane: TaskLane::Mutating,
+            dedupe_key: "PollInbox:1".to_string(),
+            priority: 1,
+            created_at_ns: 999,
+            scheduled_for_ns: 1,
+            started_at_ns: None,
+            finished_at_ns: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            last_error: None,
+        });
+        save_job(&ScheduledJob {
+            id: "job:00000000000000000002:00000000000000000002".to_string(),
+            kind: TaskKind::PollInbox,
+            lane: TaskLane::Mutating,
+            dedupe_key: "PollInbox:2".to_string(),
+            priority: 1,
+            created_at_ns: 100,
+            scheduled_for_ns: 2,
+            started_at_ns: None,
+            finished_at_ns: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            last_error: None,
+        });
+
+        let listed = list_recent_jobs(2);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].id,
+            "job:00000000000000000002:00000000000000000002"
+        );
+        assert_eq!(
+            listed[1].id,
+            "job:00000000000000000001:00000000000000000001"
+        );
+    }
+
+    #[test]
     fn inbox_messages_stay_pending_until_explicit_stage_call() {
         init_storage();
         post_inbox_message(
@@ -2771,6 +3102,102 @@ mod tests {
     }
 
     #[test]
+    fn inbox_post_truncates_oversized_payloads() {
+        init_storage();
+        let oversized = "x".repeat(MAX_INBOX_BODY_CHARS.saturating_add(128));
+        let posted_id = post_inbox_message(oversized, "2vxsx-fae".to_string())
+            .expect("oversized inbox payload should be accepted with truncation");
+
+        let messages = list_inbox_messages(10);
+        let stored = messages
+            .iter()
+            .find(|message| message.id == posted_id)
+            .expect("posted message must be persisted");
+        assert!(
+            stored.body.chars().count() <= MAX_INBOX_BODY_CHARS,
+            "stored inbox payload must be bounded"
+        );
+        assert!(
+            stored.body.contains("[truncated"),
+            "stored inbox payload should retain truncation marker for debugging"
+        );
+    }
+
+    #[test]
+    fn append_turn_record_truncates_inner_dialogue_and_tool_text_fields() {
+        init_storage();
+        let turn_id = "turn-large";
+        let turn = TurnRecord {
+            id: turn_id.to_string(),
+            created_at_ns: 42,
+            state_from: AgentState::Inferring,
+            state_to: AgentState::Persisting,
+            source_events: 1,
+            tool_call_count: 1,
+            input_summary: "oversized fields".to_string(),
+            inner_dialogue: Some(
+                "d".repeat(
+                    MAX_TURN_INNER_DIALOGUE_CHARS
+                        .saturating_add(MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS)
+                        .saturating_add(200),
+                ),
+            ),
+            inference_round_count: 1,
+            continuation_stop_reason: crate::domain::types::ContinuationStopReason::None,
+            error: None,
+        };
+        let tool_records = vec![ToolCallRecord {
+            turn_id: turn_id.to_string(),
+            tool: "remember".to_string(),
+            args_json: "a".repeat(
+                MAX_TOOL_ARGS_JSON_CHARS
+                    .saturating_add(MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS)
+                    .saturating_add(120),
+            ),
+            output: "o".repeat(
+                MAX_TOOL_OUTPUT_CHARS
+                    .saturating_add(MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS)
+                    .saturating_add(120),
+            ),
+            success: true,
+            error: None,
+        }];
+
+        append_turn_record(&turn, &tool_records);
+
+        let stored_turn = list_turns(1)
+            .into_iter()
+            .find(|record| record.id == turn_id)
+            .expect("stored turn should be listed");
+        assert!(
+            stored_turn
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                <= MAX_TURN_INNER_DIALOGUE_CHARS
+        );
+        assert!(
+            stored_turn
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("[truncated"),
+            "turn inner dialogue should preserve truncation marker"
+        );
+
+        let stored_tools = get_tools_for_turn(turn_id);
+        assert_eq!(stored_tools.len(), 1);
+        assert!(stored_tools[0].args_json.chars().count() <= MAX_TOOL_ARGS_JSON_CHARS);
+        assert!(stored_tools[0].output.chars().count() <= MAX_TOOL_OUTPUT_CHARS);
+        assert!(
+            stored_tools[0].output.contains("[truncated"),
+            "tool output should preserve truncation marker"
+        );
+    }
+
+    #[test]
     fn observability_snapshot_applies_limits_and_includes_runtime() {
         init_storage();
         post_inbox_message("snapshot message one".to_string(), "2vxsx-fae".to_string()).unwrap();
@@ -2815,6 +3242,14 @@ mod tests {
         assert!(
             defaulted.inbox_messages.len() <= DEFAULT_OBSERVABILITY_LIMIT,
             "default limit should bound inbox messages"
+        );
+        assert_eq!(
+            bounded.storage_growth.inbox_map_entries, 2,
+            "storage growth metrics should report inbox cardinality"
+        );
+        assert_eq!(
+            bounded.storage_growth.memory_fact_limit, MAX_MEMORY_FACTS as u64,
+            "storage growth metrics should expose memory fact cap"
         );
     }
 
@@ -3422,8 +3857,8 @@ mod tests {
             source_turn_id: "turn-2".to_string(),
         };
 
-        set_memory_fact(&first);
-        set_memory_fact(&second);
+        set_memory_fact(&first).expect("first memory fact should store");
+        set_memory_fact(&second).expect("second memory fact should store");
 
         assert_eq!(memory_fact_count(), 2);
         assert_eq!(
@@ -3448,6 +3883,45 @@ mod tests {
         assert!(remove_memory_fact("strategy.primary"));
         assert!(!remove_memory_fact("strategy.primary"));
         assert_eq!(memory_fact_count(), 1);
+    }
+
+    #[test]
+    fn memory_fact_store_enforces_max_cardinality_for_new_keys() {
+        init_storage();
+        let now_ns = 77u64;
+        for idx in 0..MAX_MEMORY_FACTS {
+            set_memory_fact(&MemoryFact {
+                key: format!("fact.{idx}"),
+                value: format!("value-{idx}"),
+                created_at_ns: now_ns,
+                updated_at_ns: now_ns,
+                source_turn_id: "turn-fill".to_string(),
+            })
+            .expect("fact within cap should store");
+        }
+        assert_eq!(memory_fact_count(), MAX_MEMORY_FACTS);
+
+        let overflow = set_memory_fact(&MemoryFact {
+            key: "fact.overflow".to_string(),
+            value: "overflow".to_string(),
+            created_at_ns: now_ns,
+            updated_at_ns: now_ns,
+            source_turn_id: "turn-overflow".to_string(),
+        });
+        assert!(overflow.is_err(), "new key beyond cap must be rejected");
+        assert_eq!(memory_fact_count(), MAX_MEMORY_FACTS);
+
+        let update_existing = set_memory_fact(&MemoryFact {
+            key: "fact.0".to_string(),
+            value: "updated".to_string(),
+            created_at_ns: now_ns,
+            updated_at_ns: now_ns.saturating_add(1),
+            source_turn_id: "turn-update".to_string(),
+        });
+        assert!(
+            update_existing.is_ok(),
+            "existing fact updates should still succeed at capacity"
+        );
     }
 
     #[test]

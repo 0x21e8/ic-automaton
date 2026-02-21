@@ -511,6 +511,8 @@ pub struct ObservabilitySnapshot {
     pub captured_at_ns: u64,
     pub runtime: RuntimeView,
     pub scheduler: SchedulerRuntime,
+    #[serde(default)]
+    pub storage_growth: StorageGrowthMetrics,
     pub inbox_stats: InboxStats,
     pub inbox_messages: Vec<InboxMessage>,
     pub outbox_stats: OutboxStats,
@@ -522,6 +524,29 @@ pub struct ObservabilitySnapshot {
     pub recent_turns: Vec<TurnRecord>,
     pub recent_transitions: Vec<TransitionLogRecord>,
     pub recent_jobs: Vec<ScheduledJob>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct StorageGrowthMetrics {
+    pub runtime_map_entries: u64,
+    pub transition_map_entries: u64,
+    pub turn_map_entries: u64,
+    pub tool_map_entries: u64,
+    pub job_map_entries: u64,
+    pub job_queue_map_entries: u64,
+    pub dedupe_map_entries: u64,
+    pub inbox_map_entries: u64,
+    pub inbox_pending_queue_entries: u64,
+    pub inbox_staged_queue_entries: u64,
+    pub outbox_map_entries: u64,
+    pub memory_fact_entries: u64,
+    pub memory_fact_limit: u64,
+    pub retention_progress_percent: u8,
+    pub summarization_progress_percent: u8,
+    #[serde(default)]
+    pub heap_memory_mb: f64,
+    #[serde(default)]
+    pub stable_memory_mb: f64,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
