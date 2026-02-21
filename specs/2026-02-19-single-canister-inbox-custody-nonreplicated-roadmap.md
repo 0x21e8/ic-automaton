@@ -204,7 +204,7 @@ Hard truth on empty polls:
       - Validation: `cargo test`
       - Notes: Controller-only controls should cover scheduler/runtime/inference/RPC config mutation endpoints while preserving intended public ingress endpoints.
 
-- [ ] **Task 6: PocketIC integration and outcall-economy assertions**
+- [x] **Task 6: PocketIC integration and outcall-economy assertions**
       - Files: `tests/pocketic_agent_autonomy.rs`, `tests/pocketic_scheduler_queue.rs`, `tests/` (new as needed)
       - Validation: `cargo test --features pocketic_tests`
       - Notes: Add cases for route mismatch ignore, duplicate log dedupe, empty-poll backoff behavior, default pricing, override pricing, and no-registration flow.
@@ -212,7 +212,7 @@ Hard truth on empty polls:
 - [ ] **Task 7: Anvil-backed E2E polling coverage**
       - Files: `src/features/evm.rs`, `Cargo.toml` (or `tests/` if implemented as integration test)
       - Validation: `cargo test --features anvil_e2e --lib http_evm_poller_e2e_against_anvil -- --nocapture`
-      - Notes: Run against a local Anvil process and verify real JSON-RPC polling path end-to-end (not host stub), with stable setup/teardown and clear skip/ignore behavior when feature is disabled.
+      - Notes: Run against a local Anvil process and verify real JSON-RPC polling path end-to-end (not host stub), with stable setup/teardown and clear skip/ignore behavior when feature is disabled. Add a real test scenario where a user sends a message with payment for the automaton and the automaton succeffuly gets the message
 
 ---
 
@@ -311,6 +311,7 @@ _Dev agent writes here during execution._
 - Task 3 complete: added `evm/` Foundry workspace with `Inbox.sol` forwarding logic, per-automaton min-price defaults/overrides, and passing Forge tests for forwarding and no-registration behavior.
 - Task 4 complete: updated poller ABI/topic handling and route validation, added `(tx_hash, log_index)` ingest idempotency, and implemented adaptive empty-poll backoff with passing unit/integration validation.
 - Task 5 complete: added controller authorization checks for mutable runtime/scheduler/inference/RPC control-plane endpoints and PocketIC coverage for non-controller rejection with public inbox ingress preserved.
+- Task 6 complete: added PocketIC canister-http-mocked EVM polling integration coverage for route mismatch filtering, `(tx_hash, log_index)` dedupe, adaptive empty-poll backoff skip/resume behavior, pricing payload variants, and no-registration ingress flow.
 
 ### Blockers
 
