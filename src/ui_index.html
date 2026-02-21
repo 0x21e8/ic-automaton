@@ -1,134 +1,80 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Autonomous Automaton</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AUTOMATON</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="bg-grid" aria-hidden="true"></div>
-    <main class="shell">
-      <header class="panel hero reveal">
-        <p class="kicker">Decentralized Substrate</p>
-        <h1>Autonomous Automaton</h1>
-        <p class="lede">
-          A self-operating canister runtime. Observe state transitions, queue activity, and post
-          new input directly to its inbox.
-        </p>
+    <!-- Ambient background canvas -->
+    <canvas id="bg-canvas" aria-hidden="true"></canvas>
+    <!-- Heartbeat pulse overlay -->
+    <div id="heartbeat-overlay" aria-hidden="true"></div>
+
+    <div class="terminal-container">
+      <!-- Brand header -->
+      <header class="brand-header" aria-label="Automaton">
+        <h1 class="logo-text">AUTOMATON</h1>
+        <p class="logo-sub">AUTONOMOUS AGENT V.2.0.0</p>
       </header>
 
-      <section class="panel composer reveal" aria-labelledby="composer-title">
-        <h2 id="composer-title">Send A Message</h2>
-        <form id="composer-form" class="composer-form">
-          <label class="sr-only" for="composer-input">Message</label>
-          <textarea
-            id="composer-input"
-            rows="3"
-            maxlength="2000"
-            placeholder="Ask the automaton something..."
-            required
-          ></textarea>
-          <div class="composer-row">
-            <button id="composer-submit" class="btn" type="submit">Transmit</button>
-            <p id="composer-status" class="muted status-text" aria-live="polite"></p>
-          </div>
-        </form>
-      </section>
+      <!-- Terminal window -->
+      <div class="terminal-window" role="region" aria-label="Terminal">
+        <div
+          id="output"
+          class="terminal-output"
+          aria-live="polite"
+          aria-atomic="false"
+          aria-relevant="additions"
+        ></div>
+        <div class="terminal-divider" aria-hidden="true"></div>
+        <div class="terminal-input-row" id="input-row">
+          <span class="prompt-symbol" aria-hidden="true">&gt;</span>
+          <input
+            type="text"
+            id="cmd-input"
+            class="terminal-input"
+            autocomplete="off"
+            spellcheck="false"
+            autocorrect="off"
+            autocapitalize="off"
+            aria-label="Command input"
+            placeholder="type 'help' for commands..."
+            autofocus
+          />
+        </div>
+      </div>
 
-      <section class="panel inference reveal" aria-labelledby="inference-title">
-        <h2 id="inference-title">Inference Provider</h2>
-        <form id="inference-form" class="inference-form">
-          <div class="field">
-            <label for="inference-provider">Provider</label>
-            <select id="inference-provider">
-              <option value="llm_canister">llm_canister (mock)</option>
-              <option value="openrouter">openrouter</option>
-            </select>
-          </div>
+      <!-- Status bar -->
+      <div class="status-bar" aria-label="System status">
+        <span id="sb-indicator" class="sb-indicator" aria-hidden="true">●</span>
+        <span id="sb-state">CONNECTING</span>
+        <span class="sb-sep" aria-hidden="true">│</span>
+        <span id="sb-wallet">WALLET: not connected</span>
+        <span class="sb-sep" aria-hidden="true">│</span>
+        <span id="sb-time" aria-live="off">--:--:--</span>
+      </div>
+    </div>
 
-          <div class="field" id="inference-model-section">
-            <label for="inference-model-preset">Model</label>
-            <select id="inference-model-preset">
-              <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
-              <option value="meta-llama/llama-3.1-8b-instruct">meta-llama/llama-3.1-8b-instruct</option>
-              <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
-              <option value="moonshotai/kimi-k2.5">moonshotai/kimi-k2.5</option>
-              <option value="custom">custom override</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="inference-model-custom">Custom model override</label>
-            <input id="inference-model-custom" type="text" placeholder="Or enter any model id" />
-          </div>
-
-          <div class="field" id="inference-key-section">
-            <label for="inference-key-action">OpenRouter API Key</label>
-            <select id="inference-key-action">
-              <option value="keep">keep</option>
-              <option value="set">set</option>
-              <option value="clear">clear</option>
-            </select>
-            <input id="inference-api-key" type="password" placeholder="API key" autocomplete="off" />
-            <p id="inference-key-help" class="muted">Current key: not shown</p>
-          </div>
-
-          <div class="composer-row">
-            <button id="inference-submit" class="btn" type="submit">Apply Inference Config</button>
-            <p id="inference-status" class="muted status-text" aria-live="polite"></p>
-          </div>
-        </form>
-      </section>
-
-      <section class="grid reveal">
-        <article class="panel">
-          <h2>Runtime</h2>
-          <div id="runtime-kv" class="kv"></div>
-        </article>
-        <article class="panel">
-          <h2>Scheduler</h2>
-          <div id="scheduler-kv" class="kv"></div>
-        </article>
-        <article class="panel">
-          <h2>Inbox</h2>
-          <div id="inbox-kv" class="kv"></div>
-        </article>
-      </section>
-
-      <section class="grid reveal">
-        <article class="panel">
-          <h2>Recent Transitions</h2>
-          <div id="transitions-list" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <h2>Recent Jobs</h2>
-          <div id="jobs-list" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <h2>Chat</h2>
-          <div id="chat-list" class="chat"></div>
-        </article>
-      </section>
-
-      <section class="panel reveal">
-        <h2>Inner Dialogue</h2>
-        <div id="inner-dialogue-list" class="chat"></div>
-      </section>
-
-      <section class="grid grid-dual reveal">
-        <article class="panel">
-          <h2>Prompt Layers</h2>
-          <div id="prompt-layers-list" class="layers"></div>
-        </article>
-        <article class="panel">
-          <h2>Conversations</h2>
-          <div id="conversations-list" class="timeline"></div>
-          <h2>Conversation History</h2>
-          <div id="conversation-detail" class="chat"></div>
-        </article>
-      </section>
-    </main>
-    <script src="/app.js"></script>
+    <!--
+      Import map for viem (used in Phase 3+).
+      Phase 1 does not import from viem — the map is inert until needed.
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "viem": "https://esm.sh/viem@2",
+          "viem/chains": "https://esm.sh/viem@2/chains"
+        }
+      }
+    </script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>

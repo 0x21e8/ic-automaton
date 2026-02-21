@@ -112,6 +112,15 @@ enum OpenRouterKeyAction {
     Clear,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct EvmConfigView {
+    automaton_address: Option<String>,
+    inbox_contract_address: Option<String>,
+    usdc_address: Option<String>,
+    chain_id: u64,
+    rpc_url: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct InboxPostRequest {
     message: String,
@@ -252,6 +261,17 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
                 ),
             }
         }
+        (&Method::GET, "/api/evm/config") => {
+            let route = stable::evm_route_state_view();
+            let config = EvmConfigView {
+                automaton_address: route.automaton_evm_address,
+                inbox_contract_address: route.inbox_contract_address,
+                usdc_address: stable::get_discovered_usdc_address(),
+                chain_id: route.chain_id,
+                rpc_url: stable::get_evm_rpc_url(),
+            };
+            json_update_response(StatusCode::OK, &config)
+        }
         (&Method::GET, "/api/inference/config") => {
             let config = stable::inference_config_view();
             json_update_response(StatusCode::OK, &config)
@@ -346,6 +366,7 @@ fn build_certification_state() -> HttpCertificationState {
         upgrade_route(Method::GET, "/api/snapshot"),
         upgrade_route(Method::GET, "/api/wallet/balance"),
         upgrade_route(Method::GET, "/api/wallet/balance/sync-config"),
+        upgrade_route(Method::GET, "/api/evm/config"),
         upgrade_route(Method::GET, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/conversation"),
@@ -727,7 +748,7 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::OK);
         assert!(std::str::from_utf8(response.body())
             .expect("root body should be utf8")
-            .contains("Autonomous Automaton"));
+            .contains("AUTOMATON"));
         assert_eq!(
             find_header(&response, HEADER_CONTENT_TYPE),
             Some(CONTENT_TYPE_HTML)
@@ -765,6 +786,57 @@ mod tests {
 
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn get_evm_config_route_is_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::get("/api/evm/config").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn get_evm_config_returns_expected_fields() {
+        init_certification();
+        stable::init_storage();
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("automaton address should store");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should store");
+        stable::set_evm_chain_id(31337).expect("chain id should store");
+
+        let request: HttpUpdateRequest = HttpRequest::get("/api/evm/config").build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<serde_json::Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.get("automaton_address")
+                .and_then(serde_json::Value::as_str),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            body.get("inbox_contract_address")
+                .and_then(serde_json::Value::as_str),
+            Some("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            body.get("chain_id").and_then(serde_json::Value::as_u64),
+            Some(31337)
+        );
+        assert!(body
+            .get("rpc_url")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
     }
 
     #[test]
