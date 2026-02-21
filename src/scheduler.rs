@@ -782,6 +782,48 @@ mod tests {
     }
 
     #[test]
+    fn poll_inbox_job_stages_pending_messages_without_running_agent_turn() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        stable::post_inbox_message(
+            "first staged by poll".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("first inbox message should be accepted");
+        stable::post_inbox_message(
+            "second staged by poll".to_string(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        )
+        .expect("second inbox message should be accepted");
+
+        let turn_counter_before = stable::runtime_snapshot().turn_counter;
+        let poll_job = stable::enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "PollInbox:stage-only".to_string(),
+            0,
+            0,
+        );
+        assert!(poll_job.is_some(), "poll job should enqueue");
+
+        block_on_with_spin(scheduler_tick());
+
+        let stats = stable::inbox_stats();
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.staged_count, 2);
+        assert_eq!(stats.consumed_count, 0);
+        assert_eq!(stable::runtime_snapshot().turn_counter, turn_counter_before);
+        assert!(
+            stable::list_outbox_messages(10).is_empty(),
+            "poll job must not emit an outbox reply"
+        );
+    }
+
+    #[test]
     fn poll_inbox_job_advances_evm_cursor_when_filters_are_configured() {
         stable::init_storage();
         stable::init_scheduler_defaults(0);

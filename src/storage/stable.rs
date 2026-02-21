@@ -2342,6 +2342,21 @@ mod tests {
     }
 
     #[test]
+    fn inbox_messages_stay_pending_until_explicit_stage_call() {
+        init_storage();
+        post_inbox_message(
+            "do not auto-stage".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should post");
+
+        let stats = inbox_stats();
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.staged_count, 0);
+        assert_eq!(stats.consumed_count, 0);
+    }
+
+    #[test]
     fn inbox_post_stage_consume_is_ordered_and_idempotent() {
         init_storage();
 
