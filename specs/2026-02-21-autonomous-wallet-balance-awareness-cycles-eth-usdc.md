@@ -224,7 +224,7 @@ Recommended baseline:
       - Validation: `cargo test --lib domain::types::tests:: storage::stable::tests:: features::evm::tests::`
       - Notes: add defaults/serde migration behavior, including bootstrap-pending flag; implement ETH fetch, USDC `balanceOf` read, and optional `Inbox.usdc()` discovery.
 
-- [ ] **Task 2: Wire runtime orchestration and agent context**
+- [x] **Task 2: Wire runtime orchestration and agent context**
       - Files: `src/scheduler.rs`, `src/storage/stable.rs`, `src/agent.rs`
       - Validation: `cargo test --lib scheduler::tests:: agent::tests::`
       - Notes: run sync opportunistically in `run_poll_inbox_job` with tier-aware due windows; enforce no-inference bootstrap gate until first sync success; update Layer-10 context to consume typed telemetry/freshness.

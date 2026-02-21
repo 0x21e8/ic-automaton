@@ -5,8 +5,10 @@ use crate::domain::cycle_admission::{
     DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    EvmEvent, JobStatus, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    EvmEvent, JobStatus, RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier,
+    TaskKind, TaskLane,
 };
+use crate::features::evm::fetch_wallet_balance_sync_read;
 use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -202,6 +204,109 @@ fn poll_inbox_rpc_due(now_ns: u64, last_poll_at_ns: u64, consecutive_empty_polls
     now_ns >= last_poll_at_ns.saturating_add(min_delay_ns)
 }
 
+fn wallet_balance_sync_interval_secs(
+    snapshot: &RuntimeSnapshot,
+    tier: &SurvivalTier,
+) -> Option<u64> {
+    if !snapshot.wallet_balance_sync.enabled {
+        return None;
+    }
+
+    match tier {
+        SurvivalTier::Normal => Some(snapshot.wallet_balance_sync.normal_interval_secs),
+        SurvivalTier::LowCycles => Some(snapshot.wallet_balance_sync.low_cycles_interval_secs),
+        SurvivalTier::Critical | SurvivalTier::OutOfCycles => None,
+    }
+}
+
+fn wallet_balance_sync_due(snapshot: &RuntimeSnapshot, now_ns: u64, interval_secs: u64) -> bool {
+    if snapshot.wallet_balance_bootstrap_pending {
+        return true;
+    }
+
+    let Some(last_synced_at_ns) = snapshot.wallet_balance.last_synced_at_ns else {
+        return true;
+    };
+    let due_ns = interval_secs.saturating_mul(1_000_000_000);
+    now_ns >= last_synced_at_ns.saturating_add(due_ns)
+}
+
+async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
+    let tier = stable::scheduler_survival_tier();
+    let Some(interval_secs) = wallet_balance_sync_interval_secs(snapshot, &tier) else {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_wallet_balance_sync_skipped reason=disabled_or_tier tier={:?}",
+            tier
+        );
+        return;
+    };
+    if !wallet_balance_sync_due(snapshot, now_ns, interval_secs) {
+        let next_due_ns = snapshot
+            .wallet_balance
+            .last_synced_at_ns
+            .unwrap_or(0)
+            .saturating_add(interval_secs.saturating_mul(1_000_000_000));
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_wallet_balance_sync_skipped reason=due_not_reached now_ns={} next_due_ns={} tier={:?}",
+            now_ns,
+            next_due_ns,
+            tier
+        );
+        return;
+    }
+
+    let mut sync_snapshot = snapshot.clone();
+    if sync_snapshot.evm_address.is_none() && !sync_snapshot.ecdsa_key_name.trim().is_empty() {
+        match crate::features::threshold_signer::derive_and_cache_evm_address(
+            &sync_snapshot.ecdsa_key_name,
+        )
+        .await
+        {
+            Ok(derived_address) => {
+                sync_snapshot.evm_address = Some(derived_address);
+            }
+            Err(error) => {
+                stable::record_wallet_balance_sync_error(format!(
+                    "wallet address derivation failed: {error}"
+                ));
+                log!(
+                    SchedulerLogPriority::Error,
+                    "scheduler_wallet_balance_sync_error stage=derive_wallet_address error={}",
+                    error
+                );
+                return;
+            }
+        }
+    }
+
+    match fetch_wallet_balance_sync_read(&sync_snapshot).await {
+        Ok(read) => {
+            stable::record_wallet_balance_sync_success(
+                now_ns,
+                read.eth_balance_wei_hex,
+                read.usdc_balance_raw_hex,
+                read.usdc_contract_address,
+            );
+            log!(
+                SchedulerLogPriority::Info,
+                "scheduler_wallet_balance_sync_success now_ns={} bootstrap_pending_cleared={}",
+                now_ns,
+                snapshot.wallet_balance_bootstrap_pending
+            );
+        }
+        Err(error) => {
+            stable::record_wallet_balance_sync_error(error.clone());
+            log!(
+                SchedulerLogPriority::Error,
+                "scheduler_wallet_balance_sync_error stage=fetch_balances error={}",
+                error
+            );
+        }
+    }
+}
+
 async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
     let mut fetched_events = 0usize;
@@ -276,6 +381,8 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
         stable::set_evm_cursor(&next_cursor);
         stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
     }
+
+    maybe_sync_wallet_balances(now_ns, &snapshot).await;
 
     let staged =
         stable::stage_pending_inbox_messages(POLL_INBOX_STAGE_BATCH_SIZE, current_time_ns());
@@ -430,7 +537,10 @@ fn lease_ttl_ns(kind: &TaskKind) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime};
+    use crate::domain::types::{
+        SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime, WalletBalanceSnapshot,
+        WalletBalanceSyncConfig,
+    };
     use crate::storage::stable;
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -966,6 +1076,139 @@ mod tests {
             after.last_poll_at_ns,
             now_ns.saturating_sub(30_000_000_000),
             "last poll timestamp must stay unchanged when skipping rpc outcall"
+        );
+    }
+
+    #[test]
+    fn poll_inbox_job_syncs_wallet_balances_and_clears_bootstrap_pending() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should be configurable");
+        stable::set_wallet_balance_bootstrap_pending(true);
+
+        let now_ns = 123_000_000_000u64;
+        block_on_with_spin(run_poll_inbox_job(now_ns)).expect("poll job should not fail");
+
+        let balance = stable::wallet_balance_snapshot();
+        assert_eq!(balance.eth_balance_wei_hex.as_deref(), Some("0x1"));
+        assert_eq!(balance.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
+        assert_eq!(
+            balance.usdc_contract_address.as_deref(),
+            Some("0x3333333333333333333333333333333333333333")
+        );
+        assert_eq!(balance.last_synced_at_ns, Some(now_ns));
+        assert!(balance.last_error.is_none());
+        assert!(
+            !stable::wallet_balance_bootstrap_pending(),
+            "successful first sync should clear bootstrap gate"
+        );
+    }
+
+    #[test]
+    fn poll_inbox_job_wallet_sync_uses_tier_aware_due_windows_after_bootstrap() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should be configurable");
+        stable::set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+            normal_interval_secs: 300,
+            low_cycles_interval_secs: 900,
+            ..WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet sync config should persist");
+        stable::set_wallet_balance_snapshot(WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0xaaaa".to_string()),
+            usdc_balance_raw_hex: Some("0xbbbb".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(1_000_000_000_000),
+            last_synced_block: None,
+            last_error: None,
+        });
+        stable::set_wallet_balance_bootstrap_pending(false);
+
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        block_on_with_spin(run_poll_inbox_job(1_250_000_000_000))
+            .expect("normal-tier pre-due poll should succeed");
+        let after_normal_skip = stable::wallet_balance_snapshot();
+        assert_eq!(
+            after_normal_skip.eth_balance_wei_hex.as_deref(),
+            Some("0xaaaa")
+        );
+        assert_eq!(after_normal_skip.last_synced_at_ns, Some(1_000_000_000_000));
+
+        stable::set_scheduler_survival_tier(SurvivalTier::LowCycles);
+        block_on_with_spin(run_poll_inbox_job(1_600_000_000_000))
+            .expect("low-tier pre-due poll should succeed");
+        let after_low_skip = stable::wallet_balance_snapshot();
+        assert_eq!(
+            after_low_skip.eth_balance_wei_hex.as_deref(),
+            Some("0xaaaa")
+        );
+        assert_eq!(after_low_skip.last_synced_at_ns, Some(1_000_000_000_000));
+
+        block_on_with_spin(run_poll_inbox_job(1_901_000_000_000))
+            .expect("low-tier due poll should succeed");
+        let after_due = stable::wallet_balance_snapshot();
+        assert_eq!(after_due.eth_balance_wei_hex.as_deref(), Some("0x1"));
+        assert_eq!(after_due.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
+        assert_eq!(after_due.last_synced_at_ns, Some(1_901_000_000_000));
+    }
+
+    #[test]
+    fn poll_inbox_job_wallet_sync_failure_is_non_fatal_and_preserves_last_good_snapshot() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        stable::set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+            discover_usdc_via_inbox: false,
+            ..WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet sync config should persist");
+        stable::set_wallet_balance_snapshot(WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x9999".to_string()),
+            usdc_balance_raw_hex: Some("0x8888".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: None,
+            last_synced_at_ns: Some(55),
+            last_synced_block: Some(7),
+            last_error: None,
+        });
+        stable::set_wallet_balance_bootstrap_pending(true);
+
+        block_on_with_spin(run_poll_inbox_job(777)).expect("poll job should not fail");
+
+        let balance = stable::wallet_balance_snapshot();
+        assert_eq!(balance.eth_balance_wei_hex.as_deref(), Some("0x9999"));
+        assert_eq!(balance.usdc_balance_raw_hex.as_deref(), Some("0x8888"));
+        assert_eq!(balance.last_synced_at_ns, Some(55));
+        assert_eq!(balance.last_synced_block, Some(7));
+        assert_eq!(
+            balance.last_error.as_deref(),
+            Some("usdc contract address is not configured")
+        );
+        assert!(
+            stable::wallet_balance_bootstrap_pending(),
+            "bootstrap gate must remain set until a successful sync occurs"
         );
     }
 }

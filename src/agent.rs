@@ -2,6 +2,7 @@ use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, ContinuationStopReason, ConversationEntry, InboxMessage,
     InferenceInput, InferenceProvider, MemoryFact, ToolCall, ToolCallRecord, TurnRecord,
+    WalletBalanceStatus,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
@@ -494,19 +495,25 @@ fn build_dynamic_context(
         .unwrap_or_else(|| "unknown".to_string());
     let survival_tier = format!("{:?}", stable::scheduler_survival_tier());
     let recovery_checks = stable::scheduler_survival_tier_recovery_checks();
-    let eth_balance_fact = stable::get_memory_fact("balance.eth");
-    let eth_balance = eth_balance_fact
-        .as_ref()
-        .map(|fact| fact.value.clone())
+    let wallet_freshness = snapshot
+        .wallet_balance
+        .derive_freshness(now_ns, snapshot.wallet_balance_sync.freshness_window_secs);
+    let wallet_balance_status = match wallet_freshness.status {
+        WalletBalanceStatus::Unknown => "Unknown",
+        WalletBalanceStatus::Fresh => "Fresh",
+        WalletBalanceStatus::Stale => "Stale",
+        WalletBalanceStatus::Error => "Error",
+    };
+    let eth_balance = snapshot
+        .wallet_balance
+        .eth_balance_wei_hex
+        .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let eth_balance_last_checked_ns = stable::get_memory_fact("balance.eth.last_checked_ns")
-        .and_then(|fact| fact.value.parse::<u64>().ok())
-        .or_else(|| eth_balance_fact.as_ref().map(|fact| fact.updated_at_ns));
-    let eth_balance_last_checked_age_secs = eth_balance_last_checked_ns
-        .map(|last_checked_ns| now_ns.saturating_sub(last_checked_ns) / 1_000_000_000);
-    let eth_balance_is_stale = eth_balance_last_checked_age_secs
-        .map(|age_secs| age_secs > BALANCE_FRESHNESS_WINDOW_SECS)
-        .unwrap_or(true);
+    let usdc_balance = snapshot
+        .wallet_balance
+        .usdc_balance_raw_hex
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
 
     let memory_section = if memory_facts.is_empty() {
         "### Recent Memory\n- none".to_string()
@@ -536,19 +543,35 @@ fn build_dynamic_context(
         ),
         format!("- eth_balance: {eth_balance}"),
         format!(
-            "- eth_balance_last_checked_ns: {}",
-            eth_balance_last_checked_ns
+            "- wallet_balance_last_synced_at_ns: {}",
+            snapshot
+                .wallet_balance
+                .last_synced_at_ns
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "- eth_balance_last_checked_age_secs: {}",
-            eth_balance_last_checked_age_secs
+            "- wallet_balance_age_secs: {}",
+            wallet_freshness
+                .age_secs
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
-        format!("- eth_balance_freshness_window_secs: {BALANCE_FRESHNESS_WINDOW_SECS}"),
-        format!("- eth_balance_is_stale: {eth_balance_is_stale}"),
+        format!("- usdc_balance: {usdc_balance}"),
+        format!(
+            "- wallet_balance_freshness_window_secs: {}",
+            wallet_freshness.freshness_window_secs
+        ),
+        format!("- wallet_balance_is_stale: {}", wallet_freshness.is_stale),
+        format!("- wallet_balance_status: {wallet_balance_status}"),
+        format!(
+            "- wallet_balance_last_error: {}",
+            snapshot
+                .wallet_balance
+                .last_error
+                .as_deref()
+                .unwrap_or("none")
+        ),
         format!("- turn_number: {}", snapshot.turn_counter),
         format!("- turn_id: {turn_id}"),
         format!("- timestamp_ns: {now_ns}"),
@@ -623,6 +646,9 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 ) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
     if !snapshot.loop_enabled || snapshot.turn_in_flight {
+        return Ok(());
+    }
+    if snapshot.wallet_balance_bootstrap_pending {
         return Ok(());
     }
 
@@ -1139,6 +1165,7 @@ mod tests {
             turn_in_flight,
             turn_counter,
             last_turn_id: Some(format!("turn-{turn_counter}")),
+            wallet_balance_bootstrap_pending: false,
             ..RuntimeSnapshot::default()
         };
         stable::save_runtime_snapshot(&snapshot);
@@ -1333,6 +1360,24 @@ mod tests {
     }
 
     #[test]
+    fn skipped_when_wallet_balance_bootstrap_is_pending_is_successful_and_non_mutating() {
+        reset_runtime(AgentState::Sleeping, true, false, 9);
+        stable::set_wallet_balance_bootstrap_pending(true);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "bootstrap gate should skip turn execution without failing"
+        );
+
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(snapshot.turn_counter, 9);
+        assert_eq!(snapshot.state, AgentState::Sleeping);
+        assert!(!snapshot.turn_in_flight);
+        assert!(snapshot.wallet_balance_bootstrap_pending);
+    }
+
+    #[test]
     fn invalid_start_state_faults_turn_and_releases_lock() {
         reset_runtime(AgentState::Inferring, true, false, 0);
 
@@ -1377,13 +1422,20 @@ mod tests {
             "0x1234567890abcdef1234567890abcdef12345678".to_string(),
         ))
         .expect("evm address should be accepted");
-        stable::set_memory_fact(&MemoryFact {
-            key: "balance.eth".to_string(),
-            value: "0.42".to_string(),
-            created_at_ns: 1,
-            updated_at_ns: 10,
-            source_turn_id: "turn-10".to_string(),
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x42".to_string()),
+            usdc_balance_raw_hex: Some("0x2a".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(10),
+            last_synced_block: None,
+            last_error: None,
         });
+        stable::set_wallet_balance_sync_config(crate::domain::types::WalletBalanceSyncConfig {
+            freshness_window_secs: 600,
+            ..crate::domain::types::WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet balance sync config should persist");
 
         let memory = vec![MemoryFact {
             key: "strategy".to_string(),
@@ -1413,10 +1465,13 @@ mod tests {
         assert!(context.contains("### Current State"));
         assert!(context.contains("- survival_tier: LowCycles"));
         assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
-        assert!(context.contains("- eth_balance: 0.42"));
-        assert!(context.contains("- eth_balance_last_checked_ns: 10"));
-        assert!(context.contains("- eth_balance_freshness_window_secs: 3600"));
-        assert!(context.contains("- eth_balance_is_stale: true"));
+        assert!(context.contains("- eth_balance: 0x42"));
+        assert!(context.contains("- usdc_balance: 0x2a"));
+        assert!(context.contains("- wallet_balance_last_synced_at_ns: 10"));
+        assert!(context.contains("- wallet_balance_freshness_window_secs: 600"));
+        assert!(context.contains("- wallet_balance_is_stale: true"));
+        assert!(context.contains("- wallet_balance_status: Stale"));
+        assert!(context.contains("- wallet_balance_last_error: none"));
         assert!(context.contains("### Pending Obligations"));
         assert!(context.contains("- staged_count: 2"));
         assert!(context.contains("### Recent Memory"));
@@ -1425,27 +1480,28 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_context_marks_eth_balance_fresh_with_recent_check() {
+    fn dynamic_context_marks_wallet_balance_fresh_with_recent_sync() {
         reset_runtime(AgentState::Sleeping, true, false, 12);
         let now_ns = current_time_ns();
-        stable::set_memory_fact(&MemoryFact {
-            key: "balance.eth".to_string(),
-            value: "0x10".to_string(),
-            created_at_ns: now_ns,
-            updated_at_ns: now_ns,
-            source_turn_id: "turn-11".to_string(),
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x10".to_string()),
+            usdc_balance_raw_hex: Some("0x20".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(now_ns),
+            last_synced_block: None,
+            last_error: None,
         });
-        stable::set_memory_fact(&MemoryFact {
-            key: "balance.eth.last_checked_ns".to_string(),
-            value: now_ns.to_string(),
-            created_at_ns: now_ns,
-            updated_at_ns: now_ns,
-            source_turn_id: "turn-11".to_string(),
-        });
+        stable::set_wallet_balance_sync_config(crate::domain::types::WalletBalanceSyncConfig {
+            freshness_window_secs: 600,
+            ..crate::domain::types::WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet balance sync config should persist");
 
         let snapshot = stable::runtime_snapshot();
         let context = build_dynamic_context(&snapshot, &[], 0, &[], "turn-12", 5);
-        assert!(context.contains("- eth_balance_is_stale: false"));
+        assert!(context.contains("- wallet_balance_is_stale: false"));
+        assert!(context.contains("- wallet_balance_status: Fresh"));
     }
 
     #[test]
