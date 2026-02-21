@@ -113,6 +113,8 @@ pub struct RuntimeSnapshot {
     pub ecdsa_key_name: String,
     #[serde(default)]
     pub evm_address: Option<String>,
+    #[serde(default)]
+    pub inbox_contract_address: Option<String>,
     #[serde(default = "default_evm_rpc_url")]
     pub evm_rpc_url: String,
     #[serde(default)]
@@ -142,6 +144,7 @@ impl Default for RuntimeSnapshot {
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
             ecdsa_key_name: String::new(),
             evm_address: None,
+            inbox_contract_address: None,
             evm_rpc_url: default_evm_rpc_url(),
             evm_rpc_fallback_url: None,
             evm_rpc_max_response_bytes: default_evm_rpc_max_response_bytes(),
@@ -160,6 +163,16 @@ pub struct TransitionLogRecord {
     pub occurred_at_ns: u64,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ContinuationStopReason {
+    #[default]
+    None,
+    MaxRounds,
+    MaxDuration,
+    InferenceError,
+    MaxToolCalls,
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct TurnRecord {
     pub id: String,
@@ -171,6 +184,10 @@ pub struct TurnRecord {
     pub input_summary: String,
     #[serde(default)]
     pub inner_dialogue: Option<String>,
+    #[serde(default)]
+    pub inference_round_count: u32,
+    #[serde(default)]
+    pub continuation_stop_reason: ContinuationStopReason,
     pub error: Option<String>,
 }
 
@@ -594,7 +611,7 @@ fn default_openrouter_max_response_bytes() -> u64 {
 }
 
 fn default_evm_rpc_url() -> String {
-    String::new()
+    "https://mainnet.base.org".to_string()
 }
 
 fn default_evm_rpc_max_response_bytes() -> u64 {

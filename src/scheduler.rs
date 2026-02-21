@@ -5,10 +5,12 @@ use crate::domain::cycle_admission::{
     DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    JobStatus, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    EvmEvent, JobStatus, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
 };
+use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
+use serde_json::json;
 
 const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
 const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
@@ -163,21 +165,70 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
 async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
     match job.kind {
         TaskKind::AgentTurn => run_scheduled_turn_job().await,
-        TaskKind::PollInbox => {
-            let staged = stable::stage_pending_inbox_messages(
-                POLL_INBOX_STAGE_BATCH_SIZE,
-                current_time_ns(),
-            );
-            log!(
-                SchedulerLogPriority::Info,
-                "scheduler_poll_inbox_staged count={}",
-                staged
-            );
-            Ok(())
-        }
+        TaskKind::PollInbox => run_poll_inbox_job(current_time_ns()).await,
         TaskKind::CheckCycles => run_check_cycles().await,
         TaskKind::Reconcile => Ok(()),
     }
+}
+
+fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
+    json!({
+        "source": "evm_log",
+        "chain_id": event.chain_id,
+        "block_number": event.block_number,
+        "log_index": event.log_index,
+        "address": event.source,
+        "data": event.payload,
+    })
+    .to_string()
+}
+
+async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
+    let snapshot = stable::runtime_snapshot();
+    let mut fetched_events = 0usize;
+
+    if snapshot.evm_rpc_url.trim().is_empty() {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_poll_inbox_rpc_unconfigured skipping_evm_rpc=true"
+        );
+    } else if snapshot.inbox_contract_address.is_none() {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_poll_inbox_contract_unconfigured skipping_evm_rpc=true"
+        );
+    } else if snapshot.evm_address.is_none() {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_poll_inbox_agent_address_unavailable skipping_evm_rpc=true"
+        );
+    } else {
+        let poller = HttpEvmPoller::from_snapshot(&snapshot)?;
+        let poll = poller.poll(&snapshot.evm_cursor).await.inspect_err(|_| {
+            stable::record_survival_operation_failure(
+                &SurvivalOperationClass::EvmPoll,
+                now_ns,
+                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+            );
+        })?;
+
+        fetched_events = poll.events.len();
+        for event in &poll.events {
+            stable::post_inbox_message(evm_event_to_inbox_body(event), event.source.clone())?;
+        }
+        stable::set_evm_cursor(&poll.cursor);
+        stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
+    }
+
+    let staged =
+        stable::stage_pending_inbox_messages(POLL_INBOX_STAGE_BATCH_SIZE, current_time_ns());
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_poll_inbox_staged count={} evm_events_fetched={}",
+        staged,
+        fetched_events
+    );
+    Ok(())
 }
 
 async fn run_check_cycles() -> Result<(), String> {
@@ -688,5 +739,91 @@ mod tests {
             .expect("reconcile job should be present");
         assert_eq!(poll.status, JobStatus::Succeeded);
         assert_eq!(reconcile.status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn poll_inbox_job_skips_evm_poll_when_inbox_contract_is_unset() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        stable::set_evm_cursor(&crate::domain::types::EvmPollCursor {
+            chain_id: 8453,
+            next_block: 0,
+            next_log_index: 0,
+        });
+
+        let poll_job = stable::enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "PollInbox:evm-cursor".to_string(),
+            0,
+            0,
+        );
+        assert!(poll_job.is_some(), "poll job should enqueue");
+
+        block_on_with_spin(scheduler_tick());
+
+        let cursor = stable::runtime_snapshot().evm_cursor;
+        assert_eq!(cursor.next_block, 0);
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::EvmPoll),
+            0
+        );
+
+        let jobs = stable::list_recent_jobs(10);
+        let poll = jobs
+            .iter()
+            .find(|job| job.dedupe_key == "PollInbox:evm-cursor")
+            .expect("poll job should be present");
+        assert_eq!(poll.status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn poll_inbox_job_advances_evm_cursor_when_filters_are_configured() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should be configurable");
+        stable::set_evm_cursor(&crate::domain::types::EvmPollCursor {
+            chain_id: 8453,
+            next_block: 0,
+            next_log_index: 0,
+        });
+
+        let poll_job = stable::enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "PollInbox:evm-cursor".to_string(),
+            0,
+            0,
+        );
+        assert!(poll_job.is_some(), "poll job should enqueue");
+
+        block_on_with_spin(scheduler_tick());
+
+        let cursor = stable::runtime_snapshot().evm_cursor;
+        assert_eq!(cursor.next_block, 1);
+
+        let jobs = stable::list_recent_jobs(10);
+        let poll = jobs
+            .iter()
+            .find(|job| job.dedupe_key == "PollInbox:evm-cursor")
+            .expect("poll job should be present");
+        assert_eq!(poll.status, JobStatus::Succeeded);
     }
 }

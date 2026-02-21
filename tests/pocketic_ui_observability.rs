@@ -34,6 +34,7 @@ struct SnapshotEnvelope {
 #[derive(CandidType, Clone, Debug)]
 struct InitArgs {
     ecdsa_key_name: String,
+    inbox_contract_address: Option<String>,
 }
 
 fn assert_wasm_artifact_present() -> Vec<u8> {
@@ -56,6 +57,7 @@ fn with_backend_canister() -> (PocketIc, Principal) {
     let wasm = assert_wasm_artifact_present();
     let init_args = encode_args((InitArgs {
         ecdsa_key_name: "dfx_test_key".to_string(),
+        inbox_contract_address: None,
     },))
     .expect("failed to encode init args");
 

@@ -5,7 +5,7 @@ pub mod signer;
 pub mod skills;
 pub mod threshold_signer;
 
-pub use evm::{EvmPoller, HttpEvmPoller, MockEvmPoller};
+pub use evm::{EvmPoller, HttpEvmPoller};
 pub use inference::{
     infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
 };

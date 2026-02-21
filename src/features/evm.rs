@@ -24,6 +24,7 @@ const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
 const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
+const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str = "MessageQueued(address,address,string)";
 
 pub struct EvmPollResult {
     pub cursor: EvmPollCursor,
@@ -50,16 +51,30 @@ pub trait EvmPoller {
 pub struct HttpEvmPoller {
     rpc: HttpEvmRpcClient,
     max_logs_per_poll: usize,
-    log_filter_address: Option<String>,
+    log_filter_address: String,
+    log_filter_topics: Vec<String>,
 }
 
 impl HttpEvmPoller {
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
         let rpc = HttpEvmRpcClient::from_snapshot(snapshot)?;
+        let log_filter_address = snapshot
+            .inbox_contract_address
+            .as_deref()
+            .ok_or_else(|| "inbox contract address is not configured".to_string())
+            .and_then(normalize_address)?;
+        let agent_evm_address = snapshot
+            .evm_address
+            .as_deref()
+            .ok_or_else(|| "evm address is not configured".to_string())?;
         Ok(Self {
             rpc,
             max_logs_per_poll: DEFAULT_MAX_LOGS_PER_POLL,
-            log_filter_address: snapshot.evm_address.clone(),
+            log_filter_address,
+            log_filter_topics: vec![
+                inbox_message_queued_topic0(),
+                address_to_topic(agent_evm_address)?,
+            ],
         })
     }
 }
@@ -83,7 +98,8 @@ impl EvmPoller for HttpEvmPoller {
             .eth_get_logs(
                 from_block,
                 to_block,
-                self.log_filter_address.as_deref(),
+                Some(self.log_filter_address.as_str()),
+                Some(self.log_filter_topics.as_slice()),
                 self.rpc.max_response_bytes,
             )
             .await?;
@@ -120,6 +136,7 @@ impl EvmPoller for HttpEvmPoller {
     }
 }
 
+#[allow(dead_code)]
 pub struct MockEvmPoller;
 
 #[async_trait(?Send)]
@@ -203,6 +220,7 @@ impl HttpEvmRpcClient {
         from_block: u64,
         to_block: u64,
         address_filter: Option<&str>,
+        topics_filter: Option<&[String]>,
         max_response_bytes: u64,
     ) -> Result<Vec<RpcLog>, String> {
         let mut filter = serde_json::Map::new();
@@ -216,6 +234,17 @@ impl HttpEvmRpcClient {
         );
         if let Some(address) = address_filter {
             filter.insert("address".to_string(), Value::String(address.to_string()));
+        }
+        if let Some(topics) = topics_filter {
+            filter.insert(
+                "topics".to_string(),
+                Value::Array(
+                    topics
+                        .iter()
+                        .map(|topic| Value::String(topic.clone()))
+                        .collect(),
+                ),
+            );
         }
 
         let response = self
@@ -528,6 +557,17 @@ fn normalize_address(raw: &str) -> Result<String, String> {
         return Err("address must be a 0x-prefixed 20-byte hex string".to_string());
     }
     Ok(trimmed)
+}
+
+fn inbox_message_queued_topic0() -> String {
+    let hash = keccak256(INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE.as_bytes());
+    format!("0x{}", hex::encode(hash.as_slice()))
+}
+
+fn address_to_topic(raw: &str) -> Result<String, String> {
+    let normalized = normalize_address(raw)?;
+    let bytes = normalized.trim_start_matches("0x");
+    Ok(format!("0x{:0>64}", bytes))
 }
 
 fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String> {
@@ -1045,6 +1085,33 @@ mod tests {
             r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn poll_filter_topic_is_derived_from_agent_evm_address() {
+        let topic = address_to_topic("0x1111111111111111111111111111111111111111")
+            .expect("topic derivation should succeed");
+        assert_eq!(
+            topic,
+            "0x0000000000000000000000001111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn http_evm_poller_requires_inbox_contract_and_agent_address() {
+        let missing_contract = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            ..RuntimeSnapshot::default()
+        };
+        assert!(HttpEvmPoller::from_snapshot(&missing_contract).is_err());
+
+        let missing_agent = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            inbox_contract_address: Some("0x2222222222222222222222222222222222222222".to_string()),
+            ..RuntimeSnapshot::default()
+        };
+        assert!(HttpEvmPoller::from_snapshot(&missing_agent).is_err());
     }
 
     #[test]
