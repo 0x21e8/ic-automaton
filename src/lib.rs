@@ -27,6 +27,8 @@ const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 #[derive(CandidType, Deserialize)]
 struct InitArgs {
     ecdsa_key_name: String,
+    #[serde(default)]
+    inbox_contract_address: Option<String>,
 }
 
 fn ensure_controller() -> Result<(), String> {
@@ -59,6 +61,8 @@ fn init(args: InitArgs) {
     let _ = stable::set_ecdsa_key_name(args.ecdsa_key_name)
         .unwrap_or_else(|error| ic_cdk::trap(&error));
     let _ = stable::set_evm_address(None).unwrap_or_else(|error| ic_cdk::trap(&error));
+    let _ = stable::set_inbox_contract_address(args.inbox_contract_address)
+        .unwrap_or_else(|error| ic_cdk::trap(&error));
     crate::features::MockSkillLoader::install_defaults();
     crate::http::init_certification();
     arm_timer();

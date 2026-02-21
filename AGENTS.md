@@ -33,6 +33,9 @@ Follow the KISS principle. Clarify with the human if you need to introduce compl
   - linter passes
   - clippy passes
 
+## Init args
+- If you add new canister init arguments. Make sure to add defaults to `icp.yml`.
+
 ## Skills
 A skill is a set of local instructions to follow that is stored in a `SKILL.md` file.
 Use the one relevant to your task.

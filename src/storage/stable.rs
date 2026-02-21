@@ -769,6 +769,21 @@ fn normalize_https_url(raw: &str, field: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_evm_hex_address(raw: &str, field: &str) -> Result<String, String> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let valid_len = trimmed.len() == 42;
+    let valid_prefix = trimmed.starts_with("0x");
+    let valid_hex = trimmed
+        .as_bytes()
+        .iter()
+        .skip(2)
+        .all(|byte| byte.is_ascii_hexdigit());
+    if !(valid_len && valid_prefix && valid_hex) {
+        return Err(format!("{field} must be a 0x-prefixed 20-byte hex string"));
+    }
+    Ok(trimmed)
+}
+
 pub fn set_ecdsa_key_name(key_name: String) -> Result<String, String> {
     let trimmed = key_name.trim();
     if trimmed.is_empty() {
@@ -790,20 +805,7 @@ pub fn get_ecdsa_key_name() -> String {
 
 pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String> {
     let normalized = match address {
-        Some(raw) => {
-            let trimmed = raw.trim().to_ascii_lowercase();
-            let valid_len = trimmed.len() == 42;
-            let valid_prefix = trimmed.starts_with("0x");
-            let valid_hex = trimmed
-                .as_bytes()
-                .iter()
-                .skip(2)
-                .all(|byte| byte.is_ascii_hexdigit());
-            if !(valid_len && valid_prefix && valid_hex) {
-                return Err("evm address must be a 0x-prefixed 20-byte hex string".to_string());
-            }
-            Some(trimmed)
-        }
+        Some(raw) => Some(normalize_evm_hex_address(&raw, "evm address")?),
         None => None,
     };
 
@@ -816,6 +818,19 @@ pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String
 
 pub fn get_evm_address() -> Option<String> {
     runtime_snapshot().evm_address
+}
+
+pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<String>, String> {
+    let normalized = match address {
+        Some(raw) => Some(normalize_evm_hex_address(&raw, "inbox contract address")?),
+        None => None,
+    };
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.inbox_contract_address = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
 }
 
 pub fn set_memory_fact(fact: &MemoryFact) {
@@ -2709,6 +2724,30 @@ mod tests {
     }
 
     #[test]
+    fn inbox_contract_address_validation_enforces_hex_format() {
+        init_storage();
+        assert!(set_inbox_contract_address(Some("bad".to_string())).is_err());
+
+        let stored = set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("valid inbox contract address should store");
+        assert_eq!(
+            stored.as_deref().unwrap_or_default(),
+            "0x2222222222222222222222222222222222222222"
+        );
+
+        let snapshot = runtime_snapshot();
+        assert_eq!(
+            snapshot
+                .inbox_contract_address
+                .as_deref()
+                .unwrap_or_default(),
+            "0x2222222222222222222222222222222222222222"
+        );
+    }
+
+    #[test]
     fn evm_rpc_config_validates_and_persists() {
         init_storage();
 
@@ -2737,6 +2776,13 @@ mod tests {
             "https://base.publicnode.com"
         );
         assert_eq!(snapshot.evm_rpc_max_response_bytes, 65_536);
+    }
+
+    #[test]
+    fn runtime_snapshot_uses_mainnet_base_as_default_evm_rpc_url() {
+        init_storage();
+        let snapshot = runtime_snapshot();
+        assert_eq!(snapshot.evm_rpc_url, "https://mainnet.base.org");
     }
 
     #[test]

@@ -221,12 +221,14 @@ impl InferenceAdapter for StubInferenceAdapter {
 
 pub struct IcLlmInferenceAdapter {
     model: String,
+    evm_tools_enabled: bool,
 }
 
 impl IcLlmInferenceAdapter {
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Self {
         Self {
             model: snapshot.inference_model.clone(),
+            evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
         }
     }
 }
@@ -250,7 +252,8 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
         transcript: &[InferenceTranscriptMessage],
     ) -> Result<InferenceOutput, String> {
         let model = parse_ic_llm_model(&self.model)?;
-        let request = build_ic_llm_request_with_transcript(input, model, transcript);
+        let request =
+            build_ic_llm_request_with_transcript(input, model, transcript, self.evm_tools_enabled);
 
         log!(
             InferenceLogPriority::Info,
@@ -283,13 +286,14 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
 
 #[allow(dead_code)]
 fn build_ic_llm_request(input: &InferenceInput, model: IcLlmModel) -> IcLlmRequest {
-    build_ic_llm_request_with_transcript(input, model, &[])
+    build_ic_llm_request_with_transcript(input, model, &[], true)
 }
 
 fn build_ic_llm_request_with_transcript(
     input: &InferenceInput,
     model: IcLlmModel,
     transcript: &[InferenceTranscriptMessage],
+    evm_tools_enabled: bool,
 ) -> IcLlmRequest {
     let mut messages = vec![
         IcLlmChatMessage::System {
@@ -304,7 +308,7 @@ fn build_ic_llm_request_with_transcript(
     IcLlmRequest {
         model: model.to_string(),
         messages,
-        tools: Some(ic_llm_tools()),
+        tools: Some(ic_llm_tools_with_capabilities(evm_tools_enabled)),
     }
 }
 
@@ -555,6 +559,20 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
     ]
 }
 
+fn ic_llm_tool_name(tool: &IcLlmTool) -> &str {
+    match tool {
+        IcLlmTool::Function(function) => function.name.as_str(),
+    }
+}
+
+fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
+    let mut tools = ic_llm_tools();
+    if !evm_tools_enabled {
+        tools.retain(|tool| !matches!(ic_llm_tool_name(tool), "evm_read" | "send_eth"));
+    }
+    tools
+}
+
 fn parse_ic_llm_response(response: IcLlmResponse) -> Result<InferenceOutput, String> {
     let mut tool_calls = Vec::new();
     for tool_call in response.message.tool_calls {
@@ -687,6 +705,7 @@ pub struct OpenRouterInferenceAdapter {
     base_url: String,
     api_key: Option<String>,
     max_response_bytes: u64,
+    evm_tools_enabled: bool,
 }
 
 impl OpenRouterInferenceAdapter {
@@ -716,6 +735,7 @@ impl OpenRouterInferenceAdapter {
             base_url: snapshot.openrouter_base_url.clone(),
             api_key: snapshot.openrouter_api_key.clone(),
             max_response_bytes: snapshot.openrouter_max_response_bytes,
+            evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
         }
     }
 
@@ -751,23 +771,18 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
         input: &InferenceInput,
         transcript: &[InferenceTranscriptMessage],
     ) -> Result<InferenceOutput, String> {
-        let now_ns = current_time_ns();
-        if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
-            return Ok(InferenceOutput {
-                tool_calls: Vec::new(),
-                explanation: "inference skipped due to survival policy".to_string(),
-            });
-        }
-
         self.validate_config()?;
 
+        let now_ns = current_time_ns();
         let api_key = self.api_key.clone().unwrap_or_default();
-        let payload = serde_json::to_vec(&build_openrouter_request_body_with_transcript(
-            input,
-            &self.model,
-            transcript,
-        ))
-        .map_err(|error| format!("failed to build openrouter request payload: {error}"))?;
+        let payload =
+            serde_json::to_vec(&build_openrouter_request_body_with_transcript_capabilities(
+                input,
+                &self.model,
+                transcript,
+                self.evm_tools_enabled,
+            ))
+            .map_err(|error| format!("failed to build openrouter request payload: {error}"))?;
         let request_size_bytes = Self::estimate_request_size_bytes(&payload);
         let requirements =
             Self::affordability_requirements(request_size_bytes, self.max_response_bytes)?;
@@ -891,6 +906,30 @@ fn parse_openrouter_http_response(response: HttpRequestResult) -> Result<Inferen
 #[allow(dead_code)]
 fn build_openrouter_request_body(input: &InferenceInput, model: &str) -> Value {
     build_openrouter_request_body_with_transcript(input, model, &[])
+}
+
+fn build_openrouter_request_body_with_transcript_capabilities(
+    input: &InferenceInput,
+    model: &str,
+    transcript: &[InferenceTranscriptMessage],
+    evm_tools_enabled: bool,
+) -> Value {
+    let mut body = build_openrouter_request_body_with_transcript(input, model, transcript);
+    if evm_tools_enabled {
+        return body;
+    }
+
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            let function_name = tool
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str);
+            !matches!(function_name, Some("evm_read" | "send_eth"))
+        });
+    }
+
+    body
 }
 
 fn build_openrouter_request_body_with_transcript(
@@ -1424,6 +1463,7 @@ mod tests {
             base_url: "https://openrouter.ai/api/v1".to_string(),
             api_key: None,
             max_response_bytes: 1_024,
+            evm_tools_enabled: true,
         };
 
         let error = adapter
@@ -1559,8 +1599,12 @@ mod tests {
             },
         ];
 
-        let request =
-            build_ic_llm_request_with_transcript(&input, IcLlmModel::Llama3_1_8B, &transcript);
+        let request = build_ic_llm_request_with_transcript(
+            &input,
+            IcLlmModel::Llama3_1_8B,
+            &transcript,
+            true,
+        );
         assert_eq!(request.messages.len(), 4);
         assert!(matches!(
             request.messages[0],
@@ -1736,6 +1780,47 @@ mod tests {
         assert!(names.contains(&"forget"));
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
+    }
+
+    #[test]
+    fn ic_llm_tool_caps_exclude_evm_tools_when_rpc_is_unconfigured() {
+        let names = ic_llm_tools_with_capabilities(false)
+            .into_iter()
+            .map(|tool| match tool {
+                IcLlmTool::Function(function) => function.name,
+            })
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"evm_read".to_string()));
+        assert!(!names.contains(&"send_eth".to_string()));
+        assert!(names.contains(&"remember".to_string()));
+    }
+
+    #[test]
+    fn openrouter_request_body_caps_exclude_evm_tools_when_rpc_is_unconfigured() {
+        let body = build_openrouter_request_body_with_transcript_capabilities(
+            &InferenceInput {
+                input: "hello".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+            "openai/gpt-4o-mini",
+            &[],
+            false,
+        );
+
+        let tools = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .expect("tools array must exist");
+        let names = tools
+            .iter()
+            .filter_map(|entry| entry.get("function"))
+            .filter_map(|function| function.get("name"))
+            .filter_map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"evm_read"));
+        assert!(!names.contains(&"send_eth"));
+        assert!(names.contains(&"remember"));
     }
 
     #[test]
