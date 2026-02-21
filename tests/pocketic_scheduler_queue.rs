@@ -129,15 +129,32 @@ fn with_backend_canister() -> (PocketIc, Principal) {
     (pic, canister_id)
 }
 
-fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
+fn non_controller_principal() -> Principal {
+    Principal::self_authenticating(b"non-controller-scheduler-queue")
+}
+
+fn call_update_as<T>(
+    pic: &PocketIc,
+    canister_id: Principal,
+    caller: Principal,
+    method: &str,
+    payload: Vec<u8>,
+) -> T
 where
     T: for<'de> Deserialize<'de> + CandidType,
 {
     let response = pic
-        .update_call(canister_id, Principal::anonymous(), method, payload)
+        .update_call(canister_id, caller, method, payload)
         .unwrap_or_else(|error| panic!("update call {method} failed: {error:?}"));
     decode_one(&response)
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
+}
+
+fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
+where
+    T: for<'de> Deserialize<'de> + CandidType,
+{
+    call_update_as(pic, canister_id, Principal::anonymous(), method, payload)
 }
 
 fn call_query<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
@@ -457,4 +474,52 @@ fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
         "agent-turn lease ttl regression: expected 240 seconds"
     );
     assert_eq!(lease.lane, TaskLane::Mutating);
+}
+
+#[cfg(feature = "pocketic_tests")]
+#[test]
+fn non_controller_cannot_mutate_scheduler_control_plane() {
+    let (pic, canister_id) = with_backend_canister();
+    let outsider = non_controller_principal();
+
+    let set_enabled_payload = encode_args((TaskKind::PollInbox, false))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let set_enabled_result = pic.update_call(
+        canister_id,
+        outsider,
+        "set_task_enabled",
+        set_enabled_payload,
+    );
+    assert!(
+        set_enabled_result.is_err(),
+        "set_task_enabled should reject non-controller callers"
+    );
+
+    let set_interval_payload = encode_args((TaskKind::PollInbox, 30u64))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let set_interval_result: Result<String, String> = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "set_task_interval_secs",
+        set_interval_payload,
+    );
+    assert_eq!(
+        set_interval_result,
+        Err("caller is not a controller".to_string()),
+        "set_task_interval_secs should enforce controller authorization"
+    );
+
+    let low_cycles_payload =
+        encode_args((true,)).unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let low_cycles_result = pic.update_call(
+        canister_id,
+        outsider,
+        "set_scheduler_low_cycles_mode",
+        low_cycles_payload,
+    );
+    assert!(
+        low_cycles_result.is_err(),
+        "set_scheduler_low_cycles_mode should reject non-controller callers"
+    );
 }
