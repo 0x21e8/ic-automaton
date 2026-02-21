@@ -117,7 +117,7 @@ Measurable success:
       - Dependencies: Task 1, Task 2
       - Notes: Replace bespoke wallet-sync policy branch, unify backoff/tuning accounting, and resolve `max_attempts` semantics (enforce or deprecate).
 
-- [ ] **Task 4: Integration coverage, observability, and final validation**
+- [x] **Task 4: Integration coverage, observability, and final validation**
       - Files: `tests/pocketic_wallet_balance_sync.rs`, `tests/pocketic_agent_autonomy.rs`, `tests/pocketic_evm_polling.rs`, `src/http.rs` (if adding recovery view)
       - Validation: `icp build && cargo test --features pocketic_tests --test pocketic_wallet_balance_sync -- --nocapture && cargo fmt --all -- --check && cargo clippy --all-targets --all-features && cargo test && icp build`
       - Dependencies: Task 1, Task 2, Task 3
@@ -207,6 +207,7 @@ _Dev agent writes here during execution._
 - Task 1 complete: added typed recovery domain model, added pure recovery policy engine, and validated with targeted unit tests plus strict repo checks (`bash .githooks/pre-commit`, `cargo test`).
 - Task 2 complete: added typed feature-layer error classification in EVM and inference adapters and validated with targeted unit tests (`cargo test --lib features::evm::tests::`, `cargo test --lib features::inference::tests::`).
 - Task 3 complete: consolidated scheduler/storage recovery handling around typed policy decisions, replaced bespoke wallet-sync size-recovery branching with policy-driven classification/actions, enforced `ScheduledJob.max_attempts` through queued retries, and validated with targeted suites (`cargo test --lib scheduler::tests::`, `cargo test --lib storage::stable::tests::`).
+- Task 4 complete: added PocketIC oversized-response integration coverage for wallet sync policy tuning and autonomous recovery in `tests/pocketic_wallet_balance_sync.rs`, then ran full strict validation (`icp build && cargo test --features pocketic_tests --test pocketic_wallet_balance_sync -- --nocapture && cargo fmt --all -- --check && cargo clippy --all-targets --all-features && cargo test && icp build`).
 
 ### Blockers
 - None.
@@ -218,7 +219,7 @@ _Dev agent writes here during execution._
 
 ## Ship Checklist (non-negotiable final step)
 
-- [ ] Run full verification suite.
-- [ ] Confirm no secret-bearing error payloads are exposed in queries/logs.
-- [ ] Confirm stable-state migration safety for any new typed recovery fields.
-- [ ] Confirm Candid remains generated from Rust exports.
+- [x] Run full verification suite.
+- [x] Confirm no secret-bearing error payloads are exposed in queries/logs.
+- [x] Confirm stable-state migration safety for any new typed recovery fields.
+- [x] Confirm Candid remains generated from Rust exports.

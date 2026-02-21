@@ -6,7 +6,8 @@ use std::time::Duration;
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_http_certification::{HttpRequest, HttpUpdateRequest, HttpUpdateResponse};
 use pocket_ic::common::rest::{
-    CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse,
+    CanisterHttpReject, CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse,
+    MockCanisterHttpResponse,
 };
 use pocket_ic::PocketIc;
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,7 @@ struct OutboxStats {
 enum WalletRpcMode {
     Success,
     FailWalletSync,
+    RejectOversizedUntilTuned,
 }
 
 fn assert_wasm_artifact_present() -> Vec<u8> {
@@ -318,6 +320,7 @@ fn wallet_rpc_response(
     latest_block: u64,
 ) -> CanisterHttpResponse {
     let (method, body) = decode_rpc_request(request);
+    let max_response_bytes = request.max_response_bytes.unwrap_or_default();
 
     let fail_wallet_sync = matches!(mode, WalletRpcMode::FailWalletSync)
         && matches!(method.as_str(), "eth_getBalance" | "eth_call");
@@ -326,6 +329,16 @@ fn wallet_rpc_response(
             status: 500,
             headers: vec![],
             body: b"{}".to_vec(),
+        });
+    }
+
+    let reject_oversized = matches!(mode, WalletRpcMode::RejectOversizedUntilTuned)
+        && matches!(method.as_str(), "eth_getBalance" | "eth_call")
+        && max_response_bytes <= 256;
+    if reject_oversized {
+        return CanisterHttpResponse::CanisterHttpReject(CanisterHttpReject {
+            reject_code: 1,
+            message: "Http body exceeds size limit of 256 bytes.".to_string(),
         });
     }
 
@@ -556,6 +569,62 @@ fn wallet_sync_refreshes_on_due_window_transitions_to_stale_and_degrades_non_fat
     let latest =
         latest_poll_job(&jobs).expect("latest poll job should be present after failure cycle");
     assert_eq!(latest.status, JobStatus::Succeeded);
+}
+
+#[test]
+fn wallet_sync_oversized_outcall_tunes_response_limit_and_recovers_without_manual_reset() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_task_set(&pic, canister_id, false, true, 30);
+    set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
+    set_automaton_evm_address_admin(&pic, canister_id, AUTOMATON_ADDRESS);
+    set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
+
+    let before = get_wallet_balance_sync_config(&pic, canister_id);
+    assert_eq!(before.max_response_bytes, 256);
+
+    advance_and_run_due_poll_inbox(&pic, canister_id, WalletRpcMode::RejectOversizedUntilTuned);
+
+    let after = get_wallet_balance_sync_config(&pic, canister_id);
+    assert_eq!(after.max_response_bytes, 512);
+
+    let synced = get_wallet_balance_telemetry(&pic, canister_id);
+    assert!(!synced.bootstrap_pending);
+    assert_eq!(synced.last_error, None);
+    assert_eq!(synced.status, WalletBalanceStatus::Fresh);
+    assert_eq!(
+        synced.eth_balance_wei_hex.as_deref(),
+        Some(ETH_BALANCE_WEI_HEX)
+    );
+    assert_eq!(
+        synced.usdc_balance_raw_hex.as_deref(),
+        Some(USDC_BALANCE_RAW_HEX)
+    );
+    assert_eq!(
+        synced.usdc_contract_address.as_deref(),
+        Some(USDC_CONTRACT_ADDRESS)
+    );
+
+    let jobs = list_scheduler_jobs(&pic, canister_id);
+    let latest =
+        latest_poll_job(&jobs).expect("latest poll job should be present after recovery cycle");
+    assert_eq!(latest.status, JobStatus::Succeeded);
+    let failed_poll_jobs = jobs
+        .iter()
+        .filter(|job| job.kind == TaskKind::PollInbox && job.status == JobStatus::Failed)
+        .count();
+    assert_eq!(failed_poll_jobs, 0);
+
+    pic.advance_time(Duration::from_secs(301));
+    drive_due_poll_inbox_with_wallet_rpc_mocks(
+        &pic,
+        canister_id,
+        WalletRpcMode::RejectOversizedUntilTuned,
+    );
+    let stable_config = get_wallet_balance_sync_config(&pic, canister_id);
+    assert_eq!(
+        stable_config.max_response_bytes, 512,
+        "response limit should stay tuned without additional manual intervention"
+    );
 }
 
 #[test]
