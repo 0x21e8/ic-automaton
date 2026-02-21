@@ -111,7 +111,7 @@ Measurable success:
       - Dependencies: Task 1
       - Notes: Keep adapters responsible for classification input, not policy decisions.
 
-- [ ] **Task 3: Consolidate scheduler/storage execution semantics**
+- [x] **Task 3: Consolidate scheduler/storage execution semantics**
       - Files: `src/scheduler.rs`, `src/storage/stable.rs`, `src/domain/types.rs`
       - Validation: `cargo test --lib scheduler::tests:: storage::stable::tests::`
       - Dependencies: Task 1, Task 2
@@ -206,6 +206,7 @@ _Dev agent writes here during execution._
 - Spec locked.
 - Task 1 complete: added typed recovery domain model, added pure recovery policy engine, and validated with targeted unit tests plus strict repo checks (`bash .githooks/pre-commit`, `cargo test`).
 - Task 2 complete: added typed feature-layer error classification in EVM and inference adapters and validated with targeted unit tests (`cargo test --lib features::evm::tests::`, `cargo test --lib features::inference::tests::`).
+- Task 3 complete: consolidated scheduler/storage recovery handling around typed policy decisions, replaced bespoke wallet-sync size-recovery branching with policy-driven classification/actions, enforced `ScheduledJob.max_attempts` through queued retries, and validated with targeted suites (`cargo test --lib scheduler::tests::`, `cargo test --lib storage::stable::tests::`).
 
 ### Blockers
 - None.

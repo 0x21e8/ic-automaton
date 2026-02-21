@@ -4,11 +4,16 @@ use crate::domain::cycle_admission::{
     AffordabilityRequirements, OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES,
     DEFAULT_SAFETY_MARGIN_BPS,
 };
+use crate::domain::recovery_policy::decide_recovery_action;
 use crate::domain::types::{
-    EvmEvent, JobStatus, RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier,
-    TaskKind, TaskLane,
+    EvmEvent, JobStatus, OperationFailure, OperationFailureKind, RecoveryContext, RecoveryFailure,
+    RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy,
+    RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
 };
-use crate::features::evm::fetch_wallet_balance_sync_read;
+use crate::features::evm::{
+    classify_evm_failure, decode_message_queued_payload, fetch_wallet_balance_sync_read,
+};
+use crate::features::inference::classify_inference_failure;
 use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -19,6 +24,10 @@ const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
 const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 4;
 const MAX_MUTATING_JOBS_PER_TICK: u8 = 4;
 const EMPTY_POLL_BACKOFF_SCHEDULE_SECS: &[u64] = &[30, 60, 120, 300];
+const EVM_RPC_MAX_RESPONSE_BYTES_POLICY_MAX: u64 = 2 * 1024 * 1024;
+const RESPONSE_BYTES_POLICY_MIN: u64 = 256;
+const RECOVERY_BACKOFF_BASE_SECS: u64 = 1;
+const WALLET_SYNC_MAX_RESPONSE_BYTES_RECOVERY_MAX: u64 = 4 * 1024;
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -127,6 +136,7 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
             JobStatus::Failed,
             Some(format!("lease acquire failed: {error}")),
             current_time_ns(),
+            None,
         );
         return Err(error);
     }
@@ -139,6 +149,7 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
                 JobStatus::Skipped,
                 Some(reason.to_string()),
                 current_time_ns(),
+                None,
             );
             log!(
                 SchedulerLogPriority::Info,
@@ -153,13 +164,10 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
 
     let result = dispatch_job(&job).await;
     match result {
-        Ok(()) => stable::complete_job(&job.id, JobStatus::Succeeded, None, current_time_ns()),
-        Err(error) => stable::complete_job(
-            &job.id,
-            JobStatus::Failed,
-            Some(error.clone()),
-            current_time_ns(),
-        ),
+        Ok(()) => {
+            stable::complete_job(&job.id, JobStatus::Succeeded, None, current_time_ns(), None)
+        }
+        Err(error) => apply_recovery_policy_for_failed_job(&job, error, current_time_ns()),
     }
 
     Ok(true)
@@ -174,6 +182,120 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
     }
 }
 
+fn classify_failure_for_task(kind: &TaskKind, error: &str) -> RecoveryFailure {
+    match kind {
+        TaskKind::AgentTurn => classify_inference_failure(error),
+        TaskKind::PollInbox => classify_evm_failure(error),
+        TaskKind::CheckCycles | TaskKind::Reconcile => {
+            RecoveryFailure::Operation(OperationFailure {
+                kind: OperationFailureKind::Unknown,
+            })
+        }
+    }
+}
+
+fn recovery_operation_for_task(kind: &TaskKind) -> RecoveryOperation {
+    match kind {
+        TaskKind::AgentTurn => RecoveryOperation::Inference,
+        TaskKind::PollInbox => RecoveryOperation::EvmPoll,
+        TaskKind::CheckCycles | TaskKind::Reconcile => RecoveryOperation::Unknown,
+    }
+}
+
+fn recovery_context_for_task_job(job: &ScheduledJob) -> RecoveryContext {
+    let task_runtime = stable::get_task_runtime(&job.kind);
+    let task_config = stable::get_task_config(&job.kind)
+        .unwrap_or_else(|| crate::domain::types::TaskScheduleConfig::default_for(&job.kind));
+    let snapshot = stable::runtime_snapshot();
+
+    let response_limit = if job.kind == TaskKind::PollInbox {
+        Some(ResponseLimitPolicy {
+            current_bytes: snapshot.evm_rpc_max_response_bytes,
+            min_bytes: RESPONSE_BYTES_POLICY_MIN,
+            max_bytes: EVM_RPC_MAX_RESPONSE_BYTES_POLICY_MAX,
+            tune_multiplier: 2,
+        })
+    } else {
+        None
+    };
+
+    RecoveryContext {
+        operation: recovery_operation_for_task(&job.kind),
+        consecutive_failures: task_runtime.consecutive_failures,
+        backoff_base_secs: RECOVERY_BACKOFF_BASE_SECS,
+        backoff_max_secs: task_config.max_backoff_secs,
+        response_limit,
+    }
+}
+
+fn apply_response_limit_tuning(
+    operation: &RecoveryOperation,
+    adjustment: &ResponseLimitAdjustment,
+) -> Result<(), String> {
+    match operation {
+        RecoveryOperation::EvmPoll => {
+            stable::set_evm_rpc_max_response_bytes(adjustment.to_bytes).map(|_| ())
+        }
+        RecoveryOperation::WalletBalanceSync => {
+            let mut config = stable::wallet_balance_sync_config();
+            config.max_response_bytes = adjustment.to_bytes;
+            stable::set_wallet_balance_sync_config(config).map(|_| ())
+        }
+        _ => Err("response limit tuning is not supported for this operation".to_string()),
+    }
+}
+
+fn apply_recovery_policy_for_failed_job(job: &ScheduledJob, error: String, now_ns: u64) {
+    let failure = classify_failure_for_task(&job.kind, &error);
+    let context = recovery_context_for_task_job(job);
+    let decision = decide_recovery_action(&failure, &context);
+
+    let mut status = JobStatus::Failed;
+    let mut retry_after_secs = None;
+    let mut final_error = error;
+
+    match decision.action {
+        RecoveryPolicyAction::Skip => {
+            status = JobStatus::Skipped;
+        }
+        RecoveryPolicyAction::RetryImmediate => {
+            retry_after_secs = Some(0);
+        }
+        RecoveryPolicyAction::Backoff => {
+            retry_after_secs = decision.backoff_secs.or(Some(1));
+        }
+        RecoveryPolicyAction::TuneResponseLimit => {
+            if let Some(adjustment) = decision.response_limit_adjustment.as_ref() {
+                if let Err(tune_error) = apply_response_limit_tuning(&context.operation, adjustment)
+                {
+                    final_error = format!(
+                        "{final_error}; response_limit_tune_failed {}->{}: {tune_error}",
+                        adjustment.from_bytes, adjustment.to_bytes
+                    );
+                } else {
+                    retry_after_secs = Some(0);
+                }
+            } else {
+                final_error = format!("{final_error}; response limit adjustment missing");
+            }
+        }
+        RecoveryPolicyAction::EscalateFault => {}
+    }
+
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_job_recovery_decision job_id={} kind={:?} action={:?} reason={:?} retry_after_secs={:?} backoff_secs={:?}",
+        job.id,
+        job.kind,
+        decision.action,
+        decision.reason,
+        retry_after_secs,
+        decision.backoff_secs
+    );
+
+    stable::complete_job(&job.id, status, Some(final_error), now_ns, retry_after_secs);
+}
+
 fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
     json!({
         "source": "evm_log",
@@ -185,6 +307,22 @@ fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
         "data": event.payload,
     })
     .to_string()
+}
+
+fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
+    match decode_message_queued_payload(&event.payload) {
+        Ok(decoded) => (decoded.message, decoded.sender),
+        Err(error) => {
+            log!(
+                SchedulerLogPriority::Error,
+                "scheduler_poll_inbox_decode_failed tx_hash={} log_index={} error={}",
+                event.tx_hash,
+                event.log_index,
+                error
+            );
+            (evm_event_to_inbox_body(event), event.source.clone())
+        }
+    }
 }
 
 fn empty_poll_backoff_delay_ns(consecutive_empty_polls: u32) -> u64 {
@@ -229,6 +367,22 @@ fn wallet_balance_sync_due(snapshot: &RuntimeSnapshot, now_ns: u64, interval_sec
     };
     let due_ns = interval_secs.saturating_mul(1_000_000_000);
     now_ns >= last_synced_at_ns.saturating_add(due_ns)
+}
+
+fn wallet_sync_recovery_context(snapshot: &RuntimeSnapshot) -> RecoveryContext {
+    let consecutive_failures = u32::from(snapshot.wallet_balance.last_error.is_some());
+    RecoveryContext {
+        operation: RecoveryOperation::WalletBalanceSync,
+        consecutive_failures,
+        backoff_base_secs: RECOVERY_BACKOFF_BASE_SECS,
+        backoff_max_secs: stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+        response_limit: Some(ResponseLimitPolicy {
+            current_bytes: snapshot.wallet_balance_sync.max_response_bytes,
+            min_bytes: RESPONSE_BYTES_POLICY_MIN,
+            max_bytes: WALLET_SYNC_MAX_RESPONSE_BYTES_RECOVERY_MAX,
+            tune_multiplier: 2,
+        }),
+    }
 }
 
 async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
@@ -297,11 +451,83 @@ async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
             );
         }
         Err(error) => {
-            stable::record_wallet_balance_sync_error(error.clone());
+            let failure = classify_evm_failure(&error);
+            let decision =
+                decide_recovery_action(&failure, &wallet_sync_recovery_context(&sync_snapshot));
+            let mut retry_snapshot: Option<RuntimeSnapshot> = None;
+            let mut retry_reason = "none";
+            let mut final_error = error;
+
+            match decision.action {
+                RecoveryPolicyAction::TuneResponseLimit => {
+                    if let Some(adjustment) = decision.response_limit_adjustment.as_ref() {
+                        if let Err(tune_error) = apply_response_limit_tuning(
+                            &RecoveryOperation::WalletBalanceSync,
+                            adjustment,
+                        ) {
+                            final_error = format!(
+                                "{final_error}; wallet_sync_response_limit_tune_failed {}->{}: {tune_error}",
+                                adjustment.from_bytes, adjustment.to_bytes
+                            );
+                        } else {
+                            let mut updated = sync_snapshot.clone();
+                            updated.wallet_balance_sync.max_response_bytes = adjustment.to_bytes;
+                            retry_snapshot = Some(updated);
+                            retry_reason = "tune_response_limit";
+                        }
+                    } else {
+                        final_error =
+                            format!("{final_error}; wallet sync tune action missing adjustment");
+                    }
+                }
+                RecoveryPolicyAction::RetryImmediate => {
+                    retry_snapshot = Some(sync_snapshot.clone());
+                    retry_reason = "retry_immediate";
+                }
+                RecoveryPolicyAction::Backoff
+                | RecoveryPolicyAction::EscalateFault
+                | RecoveryPolicyAction::Skip => {}
+            }
+
+            log!(
+                SchedulerLogPriority::Info,
+                "scheduler_wallet_balance_sync_recovery_decision action={:?} reason={:?} retry_reason={} backoff_secs={:?}",
+                decision.action,
+                decision.reason,
+                retry_reason,
+                decision.backoff_secs
+            );
+
+            if let Some(retry_snapshot) = retry_snapshot {
+                match fetch_wallet_balance_sync_read(&retry_snapshot).await {
+                    Ok(read) => {
+                        stable::record_wallet_balance_sync_success(
+                            now_ns,
+                            read.eth_balance_wei_hex,
+                            read.usdc_balance_raw_hex,
+                            read.usdc_contract_address,
+                        );
+                        log!(
+                            SchedulerLogPriority::Info,
+                            "scheduler_wallet_balance_sync_recovered now_ns={} retry_reason={} bootstrap_pending_cleared={}",
+                            now_ns,
+                            retry_reason,
+                            snapshot.wallet_balance_bootstrap_pending
+                        );
+                        return;
+                    }
+                    Err(retry_error) => {
+                        final_error =
+                            format!("{final_error}; retry({retry_reason}) failed: {retry_error}");
+                    }
+                }
+            }
+
+            stable::record_wallet_balance_sync_error(final_error.clone());
             log!(
                 SchedulerLogPriority::Error,
                 "scheduler_wallet_balance_sync_error stage=fetch_balances error={}",
-                error
+                final_error
             );
         }
     }
@@ -364,7 +590,8 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
                 skipped_duplicate_events = skipped_duplicate_events.saturating_add(1);
                 continue;
             }
-            stable::post_inbox_message(evm_event_to_inbox_body(event), event.source.clone())?;
+            let (body, sender) = evm_event_to_inbox_message(event);
+            stable::post_inbox_message(body, sender)?;
             ingested_events = ingested_events.saturating_add(1);
         }
 
@@ -538,6 +765,7 @@ fn lease_ttl_ns(kind: &TaskKind) -> u64 {
 mod tests {
     use super::*;
     use crate::domain::types::{
+        EvmEvent, RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment,
         SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime, WalletBalanceSnapshot,
         WalletBalanceSyncConfig,
     };
@@ -595,6 +823,82 @@ mod tests {
         stable::upsert_task_config(config);
     }
 
+    fn encode_message_queued_payload_for_test(
+        sender: &str,
+        message: &str,
+        usdc_amount: u128,
+        eth_amount: u128,
+    ) -> String {
+        let sender_hex = sender.trim().to_ascii_lowercase();
+        let sender_hex = sender_hex.trim_start_matches("0x");
+        let message_hex = hex::encode(message.as_bytes());
+        let padded_message = if message_hex.len().is_multiple_of(64) {
+            message_hex.clone()
+        } else {
+            format!(
+                "{}{}",
+                message_hex,
+                "0".repeat(64 - (message_hex.len() % 64))
+            )
+        };
+
+        format!(
+            "0x{:0>64}{:064x}{:064x}{:064x}{:064x}{}",
+            sender_hex,
+            128u128,
+            usdc_amount,
+            eth_amount,
+            message.len(),
+            padded_message
+        )
+    }
+
+    #[test]
+    fn evm_event_to_inbox_message_decodes_sender_and_message_payload() {
+        let event = EvmEvent {
+            tx_hash: "0xfab6ba6ed49ad8b578b64692b324c5935d3216185eddc30411a0f29ba9485c6f"
+                .to_string(),
+            chain_id: 31_337,
+            block_number: 9,
+            log_index: 0,
+            source: "0x5fc8d32690cc91d4c39d9d3abcbd16989f875707".to_string(),
+            payload: encode_message_queued_payload_for_test(
+                "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "message=who are you?",
+                0,
+                500_000_000_000_000,
+            ),
+        };
+
+        let (body, sender) = evm_event_to_inbox_message(&event);
+        assert_eq!(body, "message=who are you?");
+        assert_eq!(sender, "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+    }
+
+    #[test]
+    fn evm_event_to_inbox_message_falls_back_to_raw_event_body_on_decode_error() {
+        let event = EvmEvent {
+            tx_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            chain_id: 31_337,
+            block_number: 7,
+            log_index: 1,
+            source: "0x5fc8d32690cc91d4c39d9d3abcbd16989f875707".to_string(),
+            payload: "0x1234".to_string(),
+        };
+
+        let (body, sender) = evm_event_to_inbox_message(&event);
+        assert_eq!(sender, event.source);
+        assert!(
+            body.contains("\"source\":\"evm_log\""),
+            "fallback body should preserve raw evm event envelope"
+        );
+        assert!(
+            body.contains(&event.tx_hash),
+            "fallback body should preserve transaction hash for debugging"
+        );
+    }
+
     #[test]
     fn refresh_due_jobs_advances_single_interval_once() {
         init_scheduler_scope();
@@ -642,6 +946,7 @@ mod tests {
             JobStatus::Succeeded,
             None,
             now_ns.saturating_add(1),
+            None,
         );
 
         let burst_check_now_ns = now_ns.saturating_add(3 * interval_ns);
@@ -1110,6 +1415,51 @@ mod tests {
             !stable::wallet_balance_bootstrap_pending(),
             "successful first sync should clear bootstrap gate"
         );
+    }
+
+    #[test]
+    fn wallet_sync_recovery_policy_tunes_response_limit_for_oversized_errors() {
+        let snapshot = RuntimeSnapshot {
+            wallet_balance_sync: WalletBalanceSyncConfig {
+                max_response_bytes: 256,
+                ..WalletBalanceSyncConfig::default()
+            },
+            ..RuntimeSnapshot::default()
+        };
+        let failure = classify_evm_failure(
+            "eth_call failed: evm rpc outcall failed: call rejected: 1 - Http body exceeds size limit of 256 bytes.",
+        );
+        let decision = decide_recovery_action(&failure, &wallet_sync_recovery_context(&snapshot));
+
+        assert_eq!(decision.action, RecoveryPolicyAction::TuneResponseLimit);
+        assert_eq!(
+            decision
+                .response_limit_adjustment
+                .as_ref()
+                .map(|adjustment| (adjustment.from_bytes, adjustment.to_bytes)),
+            Some((256, 512))
+        );
+    }
+
+    #[test]
+    fn wallet_sync_response_limit_recovery_persists_in_runtime_config() {
+        stable::init_storage();
+        let config = WalletBalanceSyncConfig {
+            max_response_bytes: 256,
+            ..WalletBalanceSyncConfig::default()
+        };
+        stable::set_wallet_balance_sync_config(config).expect("wallet sync config should persist");
+
+        apply_response_limit_tuning(
+            &RecoveryOperation::WalletBalanceSync,
+            &ResponseLimitAdjustment {
+                from_bytes: 256,
+                to_bytes: 512,
+            },
+        )
+        .expect("wallet sync max response bytes should tune");
+
+        assert_eq!(stable::wallet_balance_sync_config().max_response_bytes, 512);
     }
 
     #[test]
