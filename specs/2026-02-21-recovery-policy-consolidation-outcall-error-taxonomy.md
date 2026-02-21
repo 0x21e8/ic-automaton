@@ -105,7 +105,7 @@ Measurable success:
       - Validation: `cargo test --lib domain::types::tests:: recovery_policy::tests::`
       - Notes: Add typed failure taxonomy and pure policy mapping from failure + context to action.
 
-- [ ] **Task 2: Translate feature-layer errors into typed failures**
+- [x] **Task 2: Translate feature-layer errors into typed failures**
       - Files: `src/features/evm.rs`, `src/features/inference.rs`, `src/features/http_fetch.rs` (if touched)
       - Validation: `cargo test --lib features::evm::tests:: features::inference::tests::`
       - Dependencies: Task 1
@@ -205,6 +205,7 @@ _Dev agent writes here during execution._
 ### Completed
 - Spec locked.
 - Task 1 complete: added typed recovery domain model, added pure recovery policy engine, and validated with targeted unit tests plus strict repo checks (`bash .githooks/pre-commit`, `cargo test`).
+- Task 2 complete: added typed feature-layer error classification in EVM and inference adapters and validated with targeted unit tests (`cargo test --lib features::evm::tests::`, `cargo test --lib features::inference::tests::`).
 
 ### Blockers
 - None.

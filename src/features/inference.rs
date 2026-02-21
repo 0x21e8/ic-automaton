@@ -3,7 +3,8 @@ use crate::domain::cycle_admission::{
     OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    InferenceInput, InferenceProvider, RuntimeSnapshot, SurvivalOperationClass, ToolCall,
+    InferenceInput, InferenceProvider, OperationFailure, OperationFailureKind, OutcallFailure,
+    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot, SurvivalOperationClass, ToolCall,
 };
 use crate::prompt;
 use crate::storage::stable;
@@ -891,6 +892,107 @@ fn is_insufficient_cycles_error(error: &str) -> bool {
     indicates_insufficient_cycles || indicates_depleted
 }
 
+#[allow(dead_code)]
+pub fn classify_inference_failure(error: &str) -> RecoveryFailure {
+    let normalized = error.to_ascii_lowercase();
+    if is_insufficient_cycles_error(&normalized) {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::InsufficientCycles,
+        });
+    }
+    if normalized.contains("is not configured") {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::MissingConfiguration,
+        });
+    }
+    if normalized.contains("cannot be empty")
+        || normalized.contains("must be > 0")
+        || normalized.contains("unsupported ic_llm model")
+        || normalized.contains("invalid ic_llm canister principal")
+    {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::InvalidConfiguration,
+        });
+    }
+    if normalized.contains("unauthorized") || normalized.contains("forbidden") {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::Unauthorized,
+        });
+    }
+    RecoveryFailure::Outcall(OutcallFailure {
+        kind: classify_inference_outcall_failure_kind(&normalized),
+        retry_after_secs: None,
+        observed_response_bytes: None,
+    })
+}
+
+#[allow(dead_code)]
+fn classify_inference_outcall_failure_kind(normalized_error: &str) -> OutcallFailureKind {
+    if normalized_error.contains("http body exceeds size limit")
+        || normalized_error.contains("response exceeded max_response_bytes")
+        || (normalized_error.contains("max_response_bytes") && normalized_error.contains("exceed"))
+    {
+        return OutcallFailureKind::ResponseTooLarge;
+    }
+    if normalized_error.contains("status 429")
+        || normalized_error.contains("http 429")
+        || normalized_error.contains("rate limit")
+        || normalized_error.contains("too many requests")
+    {
+        return OutcallFailureKind::RateLimited;
+    }
+    if normalized_error.contains("timeout")
+        || normalized_error.contains("timed out")
+        || normalized_error.contains("deadline exceeded")
+    {
+        return OutcallFailureKind::Timeout;
+    }
+    if normalized_error.contains("status 503")
+        || normalized_error.contains("status 502")
+        || normalized_error.contains("status 504")
+        || normalized_error.contains("http 503")
+        || normalized_error.contains("http 502")
+        || normalized_error.contains("http 504")
+        || normalized_error.contains("service unavailable")
+    {
+        return OutcallFailureKind::UpstreamUnavailable;
+    }
+    if normalized_error.contains("status 401")
+        || normalized_error.contains("status 403")
+        || normalized_error.contains("http 401")
+        || normalized_error.contains("http 403")
+        || normalized_error.contains("rejected by policy")
+    {
+        return OutcallFailureKind::RejectedByPolicy;
+    }
+    if normalized_error.contains("status 400")
+        || normalized_error.contains("status 404")
+        || normalized_error.contains("status 422")
+        || normalized_error.contains("http 400")
+        || normalized_error.contains("http 404")
+        || normalized_error.contains("http 422")
+    {
+        return OutcallFailureKind::InvalidRequest;
+    }
+    if normalized_error.contains("failed to parse")
+        || normalized_error.contains("response decode failed")
+        || normalized_error.contains("response was not valid utf-8")
+        || normalized_error.contains("contained no choices")
+        || normalized_error.contains("must be a json object")
+    {
+        return OutcallFailureKind::InvalidResponse;
+    }
+    if normalized_error.contains("outcall failed")
+        || normalized_error.contains("transport")
+        || normalized_error.contains("connection refused")
+        || normalized_error.contains("connection reset")
+        || normalized_error.contains("network is unreachable")
+    {
+        return OutcallFailureKind::Transport;
+    }
+    OutcallFailureKind::Unknown
+}
+
 fn parse_openrouter_http_response(response: HttpRequestResult) -> Result<InferenceOutput, String> {
     let status = nat_to_status_code(&response.status)?;
     let body = String::from_utf8(response.body)
@@ -1504,6 +1606,61 @@ mod tests {
         assert!(!is_insufficient_cycles_error(
             "openrouter returned status 500"
         ));
+    }
+
+    #[test]
+    fn classify_inference_failure_maps_missing_configuration_errors() {
+        let failure = classify_inference_failure("openrouter api key is not configured");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Operation(
+                crate::domain::types::OperationFailure {
+                    kind: crate::domain::types::OperationFailureKind::MissingConfiguration,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn classify_inference_failure_maps_insufficient_cycles_errors() {
+        let failure =
+            classify_inference_failure("openrouter http outcall failed: insufficient cycles");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Operation(
+                crate::domain::types::OperationFailure {
+                    kind: crate::domain::types::OperationFailureKind::InsufficientCycles,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn classify_inference_failure_maps_rate_limit_errors() {
+        let failure = classify_inference_failure("openrouter returned status 429: slow down");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::RateLimited,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_inference_failure_maps_invalid_response_errors() {
+        let failure = classify_inference_failure(
+            "failed to parse openrouter response json: expected value at line 1 column 1",
+        );
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::InvalidResponse,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
     }
 
     #[test]

@@ -2,7 +2,10 @@ use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, OperationClass,
     DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
-use crate::domain::types::{EvmEvent, EvmPollCursor, RuntimeSnapshot};
+use crate::domain::types::{
+    EvmEvent, EvmPollCursor, OperationFailure, OperationFailureKind, OutcallFailure,
+    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
+};
 use crate::storage::stable;
 use crate::tools::SignerPort;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
@@ -565,6 +568,112 @@ fn ensure_http_affordable(request_size_bytes: u64, max_response_bytes: u64) -> R
         ));
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+pub fn classify_evm_failure(error: &str) -> RecoveryFailure {
+    let normalized = error.to_ascii_lowercase();
+    if indicates_insufficient_cycles_error(&normalized) {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::InsufficientCycles,
+        });
+    }
+    if normalized.contains("is not configured") {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::MissingConfiguration,
+        });
+    }
+    if normalized.contains("must be 0x-prefixed")
+        || normalized.contains("must be valid hex")
+        || normalized.contains("must be a 32-byte topic")
+        || normalized.contains("must be one of")
+    {
+        return RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::InvalidConfiguration,
+        });
+    }
+    RecoveryFailure::Outcall(OutcallFailure {
+        kind: classify_evm_outcall_failure_kind(&normalized),
+        retry_after_secs: None,
+        observed_response_bytes: None,
+    })
+}
+
+#[allow(dead_code)]
+fn classify_evm_outcall_failure_kind(normalized_error: &str) -> OutcallFailureKind {
+    if normalized_error.contains("http body exceeds size limit")
+        || normalized_error.contains("response exceeded max_response_bytes")
+        || (normalized_error.contains("max_response_bytes") && normalized_error.contains("exceed"))
+    {
+        return OutcallFailureKind::ResponseTooLarge;
+    }
+    if normalized_error.contains("status 429")
+        || normalized_error.contains("http 429")
+        || normalized_error.contains("rate limit")
+        || normalized_error.contains("too many requests")
+    {
+        return OutcallFailureKind::RateLimited;
+    }
+    if normalized_error.contains("timeout")
+        || normalized_error.contains("timed out")
+        || normalized_error.contains("deadline exceeded")
+    {
+        return OutcallFailureKind::Timeout;
+    }
+    if normalized_error.contains("status 503")
+        || normalized_error.contains("status 502")
+        || normalized_error.contains("status 504")
+        || normalized_error.contains("http 503")
+        || normalized_error.contains("http 502")
+        || normalized_error.contains("http 504")
+        || normalized_error.contains("service unavailable")
+    {
+        return OutcallFailureKind::UpstreamUnavailable;
+    }
+    if normalized_error.contains("status 401")
+        || normalized_error.contains("status 403")
+        || normalized_error.contains("http 401")
+        || normalized_error.contains("http 403")
+        || normalized_error.contains("forbidden")
+        || normalized_error.contains("rejected by policy")
+    {
+        return OutcallFailureKind::RejectedByPolicy;
+    }
+    if normalized_error.contains("status 400")
+        || normalized_error.contains("status 404")
+        || normalized_error.contains("status 422")
+        || normalized_error.contains("http 400")
+        || normalized_error.contains("http 404")
+        || normalized_error.contains("http 422")
+        || normalized_error.contains("rpc returned error")
+    {
+        return OutcallFailureKind::InvalidRequest;
+    }
+    if normalized_error.contains("failed to parse")
+        || normalized_error.contains("result was missing")
+        || normalized_error.contains("response decode failed")
+        || normalized_error.contains("response was not valid utf-8")
+    {
+        return OutcallFailureKind::InvalidResponse;
+    }
+    if normalized_error.contains("transport failed")
+        || normalized_error.contains("connection reset")
+        || normalized_error.contains("connection refused")
+        || normalized_error.contains("network is unreachable")
+        || normalized_error.contains("dns")
+        || normalized_error.contains("outcall failed")
+    {
+        return OutcallFailureKind::Transport;
+    }
+    OutcallFailureKind::Unknown
+}
+
+#[allow(dead_code)]
+fn indicates_insufficient_cycles_error(normalized_error: &str) -> bool {
+    normalized_error.contains("insufficient cycles")
+        || normalized_error.contains("not enough cycles")
+        || normalized_error.contains("out of cycles")
+        || normalized_error.contains("cycles depleted")
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1732,6 +1841,58 @@ mod tests {
         };
         let rpc = HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should build");
         assert_eq!(rpc.control_plane_max_response_bytes(), 4_096);
+    }
+
+    #[test]
+    fn classify_evm_failure_maps_response_too_large_errors() {
+        let failure = classify_evm_failure("HTTP body exceeds size limit");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::ResponseTooLarge,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_evm_failure_maps_rate_limit_status_errors() {
+        let failure = classify_evm_failure("evm rpc returned status 429");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::RateLimited,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_evm_failure_maps_missing_configuration_errors() {
+        let failure = classify_evm_failure("evm rpc url is not configured");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Operation(
+                crate::domain::types::OperationFailure {
+                    kind: crate::domain::types::OperationFailureKind::MissingConfiguration,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn classify_evm_failure_maps_decode_errors_to_invalid_response() {
+        let failure = classify_evm_failure("failed to parse eth_getLogs response JSON: bad json");
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::InvalidResponse,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
     }
 
     struct FixedSignatureSigner;
