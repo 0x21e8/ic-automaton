@@ -199,7 +199,7 @@ Hard truth on empty polls:
       - Validation: `cargo test`
       - Notes: Filter by contract + automaton-address topic; ingest only validated route matches; update poller event signature/topic handling to match the finalized contract ABI.
 
-- [ ] **Task 5: Enforce admin authorization on mutable control-plane endpoints**
+- [x] **Task 5: Enforce admin authorization on mutable control-plane endpoints**
       - Files: `src/lib.rs`, `tests/pocketic_agent_autonomy.rs`, `tests/pocketic_scheduler_queue.rs`
       - Validation: `cargo test`
       - Notes: Controller-only controls should cover scheduler/runtime/inference/RPC config mutation endpoints while preserving intended public ingress endpoints.
@@ -310,6 +310,7 @@ _Dev agent writes here during execution._
 - Task 2 complete: route-aware cursor fields, controller-gated route config setters, and safe route-state query view implemented with passing validation.
 - Task 3 complete: added `evm/` Foundry workspace with `Inbox.sol` forwarding logic, per-automaton min-price defaults/overrides, and passing Forge tests for forwarding and no-registration behavior.
 - Task 4 complete: updated poller ABI/topic handling and route validation, added `(tx_hash, log_index)` ingest idempotency, and implemented adaptive empty-poll backoff with passing unit/integration validation.
+- Task 5 complete: added controller authorization checks for mutable runtime/scheduler/inference/RPC control-plane endpoints and PocketIC coverage for non-controller rejection with public inbox ingress preserved.
 
 ### Blockers
 

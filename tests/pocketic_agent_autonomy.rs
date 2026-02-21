@@ -158,15 +158,32 @@ fn with_backend_canister() -> (PocketIc, Principal) {
     })
 }
 
-fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
+fn non_controller_principal() -> Principal {
+    Principal::self_authenticating(b"non-controller-agent-autonomy")
+}
+
+fn call_update_as<T>(
+    pic: &PocketIc,
+    canister_id: Principal,
+    caller: Principal,
+    method: &str,
+    payload: Vec<u8>,
+) -> T
 where
     T: for<'de> Deserialize<'de> + CandidType,
 {
     let response = pic
-        .update_call(canister_id, Principal::anonymous(), method, payload)
+        .update_call(canister_id, caller, method, payload)
         .unwrap_or_else(|error| panic!("update call {method} failed: {error:?}"));
     decode_one(&response)
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
+}
+
+fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
+where
+    T: for<'de> Deserialize<'de> + CandidType,
+{
+    call_update_as(pic, canister_id, Principal::anonymous(), method, payload)
 }
 
 fn call_query<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
@@ -642,4 +659,56 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
         "expected one materialized agent-turn job"
     );
     assert_eq!(agent_turn_jobs[0].status, JobStatus::Succeeded);
+}
+
+#[test]
+fn non_controller_cannot_mutate_control_plane_but_can_post_inbox_messages() {
+    let (pic, canister_id) = with_backend_canister();
+    let outsider = non_controller_principal();
+
+    let set_loop_payload =
+        encode_args((false,)).unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let set_loop_result =
+        pic.update_call(canister_id, outsider, "set_loop_enabled", set_loop_payload);
+    assert!(
+        set_loop_result.is_err(),
+        "set_loop_enabled should reject non-controller callers"
+    );
+
+    let inference_payload = encode_args((InferenceProvider::OpenRouter,))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let inference_result = pic.update_call(
+        canister_id,
+        outsider,
+        "set_inference_provider",
+        inference_payload,
+    );
+    assert!(
+        inference_result.is_err(),
+        "set_inference_provider should reject non-controller callers"
+    );
+
+    let rpc_payload = encode_args(("https://mainnet.base.org".to_string(),))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let rpc_result: Result<String, String> =
+        call_update_as(&pic, canister_id, outsider, "set_evm_rpc_url", rpc_payload);
+    assert_eq!(
+        rpc_result,
+        Err("caller is not a controller".to_string()),
+        "set_evm_rpc_url should enforce controller authorization"
+    );
+
+    let post_payload = encode_args(("public ingress".to_string(),))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let post_result: Result<String, String> = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "post_inbox_message",
+        post_payload,
+    );
+    assert!(
+        post_result.is_ok(),
+        "post_inbox_message should remain public ingress"
+    );
 }

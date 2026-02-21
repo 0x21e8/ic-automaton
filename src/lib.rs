@@ -49,6 +49,12 @@ fn ensure_controller() -> Result<(), String> {
     }
 }
 
+fn ensure_controller_or_trap() {
+    if let Err(error) = ensure_controller() {
+        ic_cdk::trap(&error);
+    }
+}
+
 fn caller_for_audit() -> String {
     #[cfg(target_arch = "wasm32")]
     return ic_cdk::api::msg_caller().to_text();
@@ -82,44 +88,52 @@ fn post_upgrade() {
 
 #[ic_cdk::update]
 fn set_loop_enabled(enabled: bool) -> String {
+    ensure_controller_or_trap();
     stable::set_loop_enabled(enabled);
     format!("loop_enabled={enabled}")
 }
 
 #[ic_cdk::update]
 fn set_inference_provider(provider: InferenceProvider) -> String {
+    ensure_controller_or_trap();
     stable::set_inference_provider(provider.clone());
     format!("inference_provider={provider:?}")
 }
 
 #[ic_cdk::update]
 fn set_inference_model(model: String) -> Result<String, String> {
+    ensure_controller()?;
     stable::set_inference_model(model)
 }
 
 #[ic_cdk::update]
 fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
+    ensure_controller()?;
     stable::set_openrouter_base_url(base_url)
 }
 
 #[ic_cdk::update]
 fn set_openrouter_api_key(api_key: Option<String>) -> String {
+    ensure_controller_or_trap();
     stable::set_openrouter_api_key(api_key);
     "openrouter_api_key_updated".to_string()
 }
 
 #[ic_cdk::update]
 fn set_evm_rpc_url(url: String) -> Result<String, String> {
+    ensure_controller()?;
     stable::set_evm_rpc_url(url)
 }
 
 #[ic_cdk::update]
 fn set_evm_rpc_fallback_url(url: Option<String>) -> Result<Option<String>, String> {
+    ensure_controller()?;
     stable::set_evm_rpc_fallback_url(url)
 }
 
 #[ic_cdk::update]
 fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, String> {
+    ensure_controller()?;
     stable::set_evm_rpc_max_response_bytes(max_response_bytes)
 }
 
@@ -149,6 +163,7 @@ fn set_evm_confirmation_depth_admin(confirmation_depth: u64) -> Result<u64, Stri
 
 #[ic_cdk::update]
 fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
+    ensure_controller()?;
     stable::set_http_allowed_domains(domains)
 }
 
@@ -234,22 +249,26 @@ fn get_outbox_stats() -> OutboxStats {
 
 #[ic_cdk::update]
 fn set_scheduler_enabled(enabled: bool) -> String {
+    ensure_controller_or_trap();
     stable::set_scheduler_enabled(enabled)
 }
 
 #[ic_cdk::update]
 fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
+    ensure_controller_or_trap();
     stable::set_scheduler_low_cycles_mode(enabled)
 }
 
 #[ic_cdk::update]
 fn set_task_interval_secs(kind: TaskKind, interval_secs: u64) -> Result<String, String> {
+    ensure_controller()?;
     stable::set_task_interval_secs(&kind, interval_secs)?;
     Ok("task_interval_updated".to_string())
 }
 
 #[ic_cdk::update]
 fn set_task_enabled(kind: TaskKind, enabled: bool) -> String {
+    ensure_controller_or_trap();
     stable::set_task_enabled(&kind, enabled);
     "task_enabled_updated".to_string()
 }
@@ -266,6 +285,7 @@ fn get_soul() -> String {
 
 #[ic_cdk::update]
 fn update_soul(new_soul: String) -> Result<String, String> {
+    ensure_controller()?;
     if new_soul.trim().is_empty() {
         return Err("soul cannot be empty".to_string());
     }
