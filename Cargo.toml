@@ -26,6 +26,10 @@ sha3 = { version = "0.10", default-features = false }
 [features]
 default = []
 pocketic_tests = []
+anvil_e2e = []
 
 [dev-dependencies]
 pocket-ic = { version = "9.0.2" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = "2.12.1"
