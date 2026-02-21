@@ -26,7 +26,8 @@ const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
 const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
-const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str = "MessageQueued(address,address,string)";
+const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
+    "MessageQueued(address,uint64,address,string,uint256,uint256)";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
 
@@ -63,22 +64,27 @@ impl HttpEvmPoller {
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
         let rpc = HttpEvmRpcClient::from_snapshot(snapshot)?;
         let log_filter_address = snapshot
-            .inbox_contract_address
+            .evm_cursor
+            .contract_address
             .as_deref()
+            .or(snapshot.inbox_contract_address.as_deref())
             .ok_or_else(|| "inbox contract address is not configured".to_string())
             .and_then(normalize_address)?;
-        let agent_evm_address = snapshot
-            .evm_address
-            .as_deref()
-            .ok_or_else(|| "evm address is not configured".to_string())?;
+        let log_filter_topic1 = match snapshot.evm_cursor.automaton_address_topic.as_deref() {
+            Some(topic) => normalize_topic(topic, "automaton address topic")?,
+            None => {
+                let agent_evm_address = snapshot
+                    .evm_address
+                    .as_deref()
+                    .ok_or_else(|| "evm address is not configured".to_string())?;
+                address_to_topic(agent_evm_address)?
+            }
+        };
         Ok(Self {
             rpc,
             max_logs_per_poll: DEFAULT_MAX_LOGS_PER_POLL,
             log_filter_address,
-            log_filter_topics: vec![
-                inbox_message_queued_topic0(),
-                address_to_topic(agent_evm_address)?,
-            ],
+            log_filter_topics: vec![inbox_message_queued_topic0(), log_filter_topic1],
         })
     }
 }
@@ -87,8 +93,9 @@ impl HttpEvmPoller {
 impl EvmPoller for HttpEvmPoller {
     async fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String> {
         let latest_block = self.rpc.eth_block_number().await?;
+        let confirmed_head = latest_block.saturating_sub(cursor.confirmation_depth);
         let from_block = cursor.next_block;
-        let to_block = latest_block.min(from_block.saturating_add(MAX_BLOCK_RANGE_PER_POLL));
+        let to_block = confirmed_head.min(from_block.saturating_add(MAX_BLOCK_RANGE_PER_POLL));
 
         if from_block > to_block {
             return Ok(EvmPollResult {
@@ -108,34 +115,34 @@ impl EvmPoller for HttpEvmPoller {
             )
             .await?;
 
-        let mut events = Vec::new();
-        for log in logs.into_iter().take(self.max_logs_per_poll) {
-            events.push(EvmEvent {
-                chain_id: cursor.chain_id,
-                block_number: parse_hex_u64(
-                    log.block_number
-                        .as_deref()
-                        .ok_or_else(|| "rpc log missing blockNumber".to_string())?,
-                    "blockNumber",
-                )?,
-                log_index: parse_hex_u64(
-                    log.log_index
-                        .as_deref()
-                        .ok_or_else(|| "rpc log missing logIndex".to_string())?,
-                    "logIndex",
-                )?,
-                source: normalize_address(&log.address)?,
-                payload: normalize_hex_blob(&log.data, "data")?,
-            });
-        }
+        let events = filter_route_matched_logs(
+            logs,
+            cursor,
+            self.log_filter_address.as_str(),
+            self.log_filter_topics
+                .get(1)
+                .map(String::as_str)
+                .ok_or_else(|| "log filter topic1 is missing".to_string())?,
+            self.max_logs_per_poll,
+        )?;
+
+        let (next_block, next_log_index) = if let Some(last) = events.last() {
+            if events.len() == self.max_logs_per_poll {
+                (last.block_number, last.log_index.saturating_add(1))
+            } else {
+                (to_block.saturating_add(1), 0)
+            }
+        } else {
+            (to_block.saturating_add(1), 0)
+        };
 
         Ok(EvmPollResult {
             cursor: EvmPollCursor {
                 chain_id: cursor.chain_id,
                 contract_address: cursor.contract_address.clone(),
                 automaton_address_topic: cursor.automaton_address_topic.clone(),
-                next_block: to_block.saturating_add(1),
-                next_log_index: 0,
+                next_block,
+                next_log_index,
                 confirmation_depth: cursor.confirmation_depth,
                 last_poll_at_ns: cursor.last_poll_at_ns,
                 consecutive_empty_polls: cursor.consecutive_empty_polls,
@@ -155,6 +162,7 @@ impl EvmPoller for MockEvmPoller {
         let next_log_index = cursor.next_log_index.saturating_add(1);
 
         let events = vec![EvmEvent {
+            tx_hash: format!("0x{:0>64}", next_log_index),
             chain_id: cursor.chain_id,
             block_number: next_block,
             log_index: next_log_index,
@@ -628,6 +636,14 @@ fn address_to_topic(raw: &str) -> Result<String, String> {
     Ok(format!("0x{:0>64}", bytes))
 }
 
+fn normalize_topic(raw: &str, field: &str) -> Result<String, String> {
+    let normalized = normalize_hex_blob(raw, field)?;
+    if normalized.len() != 66 {
+        return Err(format!("{field} must be a 32-byte topic"));
+    }
+    Ok(normalized)
+}
+
 fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let without_prefix = trimmed
@@ -667,8 +683,99 @@ struct RpcLog {
     block_number: Option<String>,
     #[serde(rename = "logIndex")]
     log_index: Option<String>,
+    #[serde(rename = "transactionHash")]
+    tx_hash: Option<String>,
+    #[serde(default)]
+    topics: Vec<String>,
     address: String,
     data: String,
+}
+
+fn filter_route_matched_logs(
+    logs: Vec<RpcLog>,
+    cursor: &EvmPollCursor,
+    expected_contract: &str,
+    expected_topic1: &str,
+    max_logs_per_poll: usize,
+) -> Result<Vec<EvmEvent>, String> {
+    let expected_contract = normalize_address(expected_contract)?;
+    let expected_topic0 = inbox_message_queued_topic0();
+    let expected_topic1 = normalize_topic(expected_topic1, "topic1")?;
+
+    let mut events = Vec::new();
+    for log in logs {
+        let block_number = match log
+            .block_number
+            .as_deref()
+            .map(|value| parse_hex_u64(value, "blockNumber"))
+        {
+            Some(Ok(value)) => value,
+            _ => continue,
+        };
+        let log_index = match log
+            .log_index
+            .as_deref()
+            .map(|value| parse_hex_u64(value, "logIndex"))
+        {
+            Some(Ok(value)) => value,
+            _ => continue,
+        };
+        if block_number < cursor.next_block {
+            continue;
+        }
+        if block_number == cursor.next_block && log_index < cursor.next_log_index {
+            continue;
+        }
+
+        let source = match normalize_address(&log.address) {
+            Ok(value) if value == expected_contract => value,
+            _ => continue,
+        };
+        if !matches!(
+            log.topics
+                .first()
+                .map(|value| normalize_topic(value, "topic0")),
+            Some(Ok(topic)) if topic == expected_topic0
+        ) {
+            continue;
+        }
+        if !matches!(
+            log.topics
+                .get(1)
+                .map(|value| normalize_topic(value, "topic1")),
+            Some(Ok(topic)) if topic == expected_topic1
+        ) {
+            continue;
+        }
+
+        let tx_hash = match log
+            .tx_hash
+            .as_deref()
+            .map(|value| normalize_hex_blob(value, "transactionHash"))
+        {
+            Some(Ok(value)) if value.len() == 66 => value,
+            _ => continue,
+        };
+        let payload = match normalize_hex_blob(&log.data, "data") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        events.push(EvmEvent {
+            tx_hash,
+            chain_id: cursor.chain_id,
+            block_number,
+            log_index,
+            source,
+            payload,
+        });
+    }
+
+    events.sort_by_key(|event| (event.block_number, event.log_index));
+    if events.len() > max_logs_per_poll {
+        events.truncate(max_logs_per_poll);
+    }
+    Ok(events)
 }
 
 #[derive(Deserialize)]
@@ -1163,6 +1270,146 @@ mod tests {
             topic,
             "0x0000000000000000000000001111111111111111111111111111111111111111"
         );
+    }
+
+    #[test]
+    fn message_queued_topic_signature_matches_finalized_inbox_abi() {
+        assert_eq!(
+            INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE,
+            "MessageQueued(address,uint64,address,string,uint256,uint256)"
+        );
+    }
+
+    #[test]
+    fn filter_route_matched_logs_requires_address_topic_and_tx_hash() {
+        let cursor = EvmPollCursor {
+            chain_id: 8453,
+            next_block: 100,
+            next_log_index: 2,
+            ..EvmPollCursor::default()
+        };
+        let contract = "0x2222222222222222222222222222222222222222";
+        let topic0 = inbox_message_queued_topic0();
+        let topic1 = address_to_topic("0x1111111111111111111111111111111111111111")
+            .expect("topic derivation should succeed");
+
+        let logs = vec![
+            RpcLog {
+                block_number: Some("0x64".to_string()),
+                log_index: Some("0x1".to_string()),
+                address: contract.to_string(),
+                topics: vec![topic0.clone(), topic1.clone()],
+                data: "0x1234".to_string(),
+                tx_hash: Some(
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+            },
+            RpcLog {
+                block_number: Some("0x64".to_string()),
+                log_index: Some("0x2".to_string()),
+                address: "0x3333333333333333333333333333333333333333".to_string(),
+                topics: vec![topic0.clone(), topic1.clone()],
+                data: "0x1234".to_string(),
+                tx_hash: Some(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                ),
+            },
+            RpcLog {
+                block_number: Some("0x64".to_string()),
+                log_index: Some("0x3".to_string()),
+                address: contract.to_string(),
+                topics: vec![topic0.clone(), topic1],
+                data: "0x1234".to_string(),
+                tx_hash: None,
+            },
+            RpcLog {
+                block_number: Some("0x64".to_string()),
+                log_index: Some("0x4".to_string()),
+                address: contract.to_string(),
+                topics: vec![
+                    topic0,
+                    "0x000000000000000000000000ffffffffffffffffffffffffffffffffffffffff"
+                        .to_string(),
+                ],
+                data: "0x1234".to_string(),
+                tx_hash: Some(
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        .to_string(),
+                ),
+            },
+        ];
+
+        let filtered = filter_route_matched_logs(
+            logs,
+            &cursor,
+            contract,
+            &address_to_topic("0x1111111111111111111111111111111111111111")
+                .expect("topic derivation should succeed"),
+            DEFAULT_MAX_LOGS_PER_POLL,
+        )
+        .expect("filtering should succeed");
+
+        assert_eq!(
+            filtered.len(),
+            0,
+            "all logs should be dropped in this fixture"
+        );
+    }
+
+    #[test]
+    fn filter_route_matched_logs_orders_by_block_and_log_index() {
+        let cursor = EvmPollCursor {
+            chain_id: 8453,
+            next_block: 100,
+            next_log_index: 0,
+            ..EvmPollCursor::default()
+        };
+        let contract = "0x2222222222222222222222222222222222222222";
+        let topic0 = inbox_message_queued_topic0();
+        let topic1 = address_to_topic("0x1111111111111111111111111111111111111111")
+            .expect("topic derivation should succeed");
+
+        let logs = vec![
+            RpcLog {
+                block_number: Some("0x65".to_string()),
+                log_index: Some("0x2".to_string()),
+                address: contract.to_string(),
+                topics: vec![topic0.clone(), topic1.clone()],
+                data: "0x1234".to_string(),
+                tx_hash: Some(
+                    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                        .to_string(),
+                ),
+            },
+            RpcLog {
+                block_number: Some("0x65".to_string()),
+                log_index: Some("0x1".to_string()),
+                address: contract.to_string(),
+                topics: vec![topic0, topic1],
+                data: "0x5678".to_string(),
+                tx_hash: Some(
+                    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        .to_string(),
+                ),
+            },
+        ];
+
+        let filtered = filter_route_matched_logs(
+            logs,
+            &cursor,
+            contract,
+            &address_to_topic("0x1111111111111111111111111111111111111111")
+                .expect("topic derivation should succeed"),
+            DEFAULT_MAX_LOGS_PER_POLL,
+        )
+        .expect("filtering should succeed");
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].block_number, 101);
+        assert_eq!(filtered[0].log_index, 1);
+        assert_eq!(filtered[1].log_index, 2);
     }
 
     #[test]

@@ -16,6 +16,7 @@ const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
 const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
 const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 4;
 const MAX_MUTATING_JOBS_PER_TICK: u8 = 4;
+const EMPTY_POLL_BACKOFF_SCHEDULE_SECS: &[u64] = &[30, 60, 120, 300];
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -174,6 +175,7 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
 fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
     json!({
         "source": "evm_log",
+        "tx_hash": event.tx_hash,
         "chain_id": event.chain_id,
         "block_number": event.block_number,
         "log_index": event.log_index,
@@ -183,9 +185,28 @@ fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
     .to_string()
 }
 
+fn empty_poll_backoff_delay_ns(consecutive_empty_polls: u32) -> u64 {
+    let idx = usize::try_from(consecutive_empty_polls).unwrap_or(usize::MAX);
+    let secs = EMPTY_POLL_BACKOFF_SCHEDULE_SECS
+        .get(idx)
+        .copied()
+        .unwrap_or(*EMPTY_POLL_BACKOFF_SCHEDULE_SECS.last().unwrap_or(&300));
+    secs.saturating_mul(1_000_000_000)
+}
+
+fn poll_inbox_rpc_due(now_ns: u64, last_poll_at_ns: u64, consecutive_empty_polls: u32) -> bool {
+    if last_poll_at_ns == 0 {
+        return true;
+    }
+    let min_delay_ns = empty_poll_backoff_delay_ns(consecutive_empty_polls);
+    now_ns >= last_poll_at_ns.saturating_add(min_delay_ns)
+}
+
 async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
     let mut fetched_events = 0usize;
+    let mut ingested_events = 0usize;
+    let mut skipped_duplicate_events = 0usize;
 
     if snapshot.evm_rpc_url.trim().is_empty() {
         log!(
@@ -202,6 +223,26 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
             SchedulerLogPriority::Info,
             "scheduler_poll_inbox_agent_address_unavailable skipping_evm_rpc=true"
         );
+    } else if !poll_inbox_rpc_due(
+        now_ns,
+        snapshot.evm_cursor.last_poll_at_ns,
+        snapshot.evm_cursor.consecutive_empty_polls,
+    ) {
+        let next_due_ns =
+            snapshot
+                .evm_cursor
+                .last_poll_at_ns
+                .saturating_add(empty_poll_backoff_delay_ns(
+                    snapshot.evm_cursor.consecutive_empty_polls,
+                ));
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_poll_inbox_backoff_skip now_ns={} last_poll_at_ns={} empty_polls={} next_due_ns={}",
+            now_ns,
+            snapshot.evm_cursor.last_poll_at_ns,
+            snapshot.evm_cursor.consecutive_empty_polls,
+            next_due_ns
+        );
     } else {
         let poller = HttpEvmPoller::from_snapshot(&snapshot)?;
         let poll = poller.poll(&snapshot.evm_cursor).await.inspect_err(|_| {
@@ -214,9 +255,25 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
 
         fetched_events = poll.events.len();
         for event in &poll.events {
+            if !stable::try_mark_evm_event_ingested(&event.tx_hash, event.log_index) {
+                skipped_duplicate_events = skipped_duplicate_events.saturating_add(1);
+                continue;
+            }
             stable::post_inbox_message(evm_event_to_inbox_body(event), event.source.clone())?;
+            ingested_events = ingested_events.saturating_add(1);
         }
-        stable::set_evm_cursor(&poll.cursor);
+
+        let mut next_cursor = poll.cursor.clone();
+        next_cursor.last_poll_at_ns = now_ns;
+        if ingested_events > 0 {
+            next_cursor.consecutive_empty_polls = 0;
+        } else {
+            next_cursor.consecutive_empty_polls = snapshot
+                .evm_cursor
+                .consecutive_empty_polls
+                .saturating_add(1);
+        }
+        stable::set_evm_cursor(&next_cursor);
         stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
     }
 
@@ -224,9 +281,11 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
         stable::stage_pending_inbox_messages(POLL_INBOX_STAGE_BATCH_SIZE, current_time_ns());
     log!(
         SchedulerLogPriority::Info,
-        "scheduler_poll_inbox_staged count={} evm_events_fetched={}",
+        "scheduler_poll_inbox_staged count={} evm_events_fetched={} evm_events_ingested={} evm_events_duplicate_skipped={}",
         staged,
-        fetched_events
+        fetched_events,
+        ingested_events,
+        skipped_duplicate_events
     );
     Ok(())
 }
@@ -862,6 +921,8 @@ mod tests {
 
         let cursor = stable::runtime_snapshot().evm_cursor;
         assert_eq!(cursor.next_block, 1);
+        assert_eq!(cursor.consecutive_empty_polls, 1);
+        assert!(cursor.last_poll_at_ns > 0);
 
         let jobs = stable::list_recent_jobs(10);
         let poll = jobs
@@ -869,5 +930,42 @@ mod tests {
             .find(|job| job.dedupe_key == "PollInbox:evm-cursor")
             .expect("poll job should be present");
         assert_eq!(poll.status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn poll_inbox_job_skips_rpc_outcall_until_empty_poll_backoff_expires() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should be configurable");
+
+        let now_ns = 500_000_000_000u64;
+        stable::set_evm_cursor(&crate::domain::types::EvmPollCursor {
+            chain_id: 8453,
+            next_block: 10,
+            next_log_index: 0,
+            last_poll_at_ns: now_ns.saturating_sub(30_000_000_000),
+            consecutive_empty_polls: 2,
+            ..crate::domain::types::EvmPollCursor::default()
+        });
+
+        block_on_with_spin(run_poll_inbox_job(now_ns)).expect("poll job should not fail");
+        let after = stable::runtime_snapshot().evm_cursor;
+        assert_eq!(
+            after.next_block, 10,
+            "cursor must not advance when backoff window is active"
+        );
+        assert_eq!(
+            after.last_poll_at_ns,
+            now_ns.saturating_sub(30_000_000_000),
+            "last poll timestamp must stay unchanged when skipping rpc outcall"
+        );
     }
 }
