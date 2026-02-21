@@ -10,6 +10,8 @@ use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Read;
 use std::str::FromStr;
 
 #[cfg(target_arch = "wasm32")]
@@ -25,6 +27,8 @@ const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
 const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
 const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str = "MessageQueued(address,address,string)";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
 
 pub struct EvmPollResult {
     pub cursor: EvmPollCursor,
@@ -455,39 +459,39 @@ impl HttpEvmRpcClient {
     #[cfg(not(target_arch = "wasm32"))]
     async fn try_http_post(
         &self,
-        _url: &str,
+        url: &str,
         body: &[u8],
-        _max_response_bytes: u64,
+        max_response_bytes: u64,
     ) -> Result<Vec<u8>, String> {
-        let request: Value = serde_json::from_slice(body)
-            .map_err(|error| format!("host rpc stub could not parse request JSON: {error}"))?;
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "host rpc stub request is missing method".to_string())?;
+        if !host_rpc_real_mode_enabled() {
+            return host_rpc_stub_response(body);
+        }
 
-        let response = match method {
-            "eth_blockNumber" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
-            "eth_getLogs" => json!({"jsonrpc":"2.0","id":1,"result":[]}),
-            "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
-            "eth_call" => json!({"jsonrpc":"2.0","id":1,"result":"0x"}),
-            "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
-            "eth_gasPrice" => json!({"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}),
-            "eth_estimateGas" => json!({"jsonrpc":"2.0","id":1,"result":"0x5208"}),
-            "eth_sendRawTransaction" => json!({
-                "jsonrpc":"2.0",
-                "id":1,
-                "result":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            }),
-            unsupported => {
-                return Err(format!(
-                    "host rpc stub does not support method {unsupported}"
-                ));
-            }
-        };
+        let normalized_max = clamp_response_bytes(max_response_bytes);
+        let response = ureq::post(url)
+            .set("content-type", "application/json")
+            .send_bytes(body)
+            .map_err(|error| match error {
+                ureq::Error::Status(status, _) => {
+                    format!("evm rpc returned status {status}")
+                }
+                ureq::Error::Transport(transport) => {
+                    format!("evm rpc host transport failed: {transport}")
+                }
+            })?;
 
-        serde_json::to_vec(&response)
-            .map_err(|error| format!("host rpc stub failed to serialize response: {error}"))
+        let mut raw = Vec::new();
+        response
+            .into_reader()
+            .take(normalized_max.saturating_add(1))
+            .read_to_end(&mut raw)
+            .map_err(|error| format!("failed to read host rpc response body: {error}"))?;
+        if u64::try_from(raw.len()).unwrap_or(u64::MAX) > normalized_max {
+            return Err(format!(
+                "host rpc response exceeded max_response_bytes={normalized_max}"
+            ));
+        }
+        Ok(raw)
     }
 }
 
@@ -532,6 +536,50 @@ fn liquid_cycle_balance() -> u128 {
 #[cfg(not(target_arch = "wasm32"))]
 fn liquid_cycle_balance() -> u128 {
     u128::MAX
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_real_mode_enabled() -> bool {
+    std::env::var(HOST_EVM_RPC_MODE_ENV)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "real" | "1" | "true" | "yes")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
+    let request: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("host rpc stub could not parse request JSON: {error}"))?;
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "host rpc stub request is missing method".to_string())?;
+
+    let response = match method {
+        "eth_blockNumber" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
+        "eth_getLogs" => json!({"jsonrpc":"2.0","id":1,"result":[]}),
+        "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
+        "eth_call" => json!({"jsonrpc":"2.0","id":1,"result":"0x"}),
+        "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
+        "eth_gasPrice" => json!({"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}),
+        "eth_estimateGas" => json!({"jsonrpc":"2.0","id":1,"result":"0x5208"}),
+        "eth_sendRawTransaction" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }),
+        unsupported => {
+            return Err(format!(
+                "host rpc stub does not support method {unsupported}"
+            ));
+        }
+    };
+
+    serde_json::to_vec(&response)
+        .map_err(|error| format!("host rpc stub failed to serialize response: {error}"))
 }
 
 fn parse_hex_u64(raw: &str, field: &str) -> Result<u64, String> {
@@ -1036,7 +1084,17 @@ mod tests {
     use crate::tools::SignerPort;
     use async_trait::async_trait;
     use std::future::Future;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::net::TcpListener;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::process::{Child, Command, Stdio};
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::sync::{Mutex, OnceLock};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::thread;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    use std::time::Duration;
 
     fn block_on_with_spin<F: Future>(future: F) -> F::Output {
         unsafe fn clone(_ptr: *const ()) -> RawWaker {
@@ -1170,5 +1228,171 @@ mod tests {
             tx_hash,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[cfg(all(not(feature = "anvil_e2e"), not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "Enable feature `anvil_e2e` and ensure `anvil` is installed to run this E2E test"]
+    fn placeholder_http_evm_poller_e2e_against_anvil() {}
+
+    #[cfg(all(feature = "anvil_e2e", not(target_arch = "wasm32")))]
+    #[test]
+    fn http_evm_poller_e2e_against_anvil() {
+        let port = find_free_local_port();
+        let _anvil = start_anvil(port).expect("anvil must start for E2E test");
+
+        with_host_rpc_mode_real(|| {
+            let snapshot = RuntimeSnapshot {
+                evm_rpc_url: format!("http://127.0.0.1:{port}"),
+                evm_rpc_max_response_bytes: 65_536,
+                evm_address: Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string()),
+                inbox_contract_address: Some(
+                    "0x1000000000000000000000000000000000000001".to_string(),
+                ),
+                evm_cursor: EvmPollCursor {
+                    chain_id: 31_337,
+                    next_block: 0,
+                    next_log_index: 0,
+                },
+                ..RuntimeSnapshot::default()
+            };
+
+            let rpc =
+                HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should initialize");
+            let chain_id = block_on_with_spin(rpc.rpc_call(
+                "eth_chainId",
+                json!([]),
+                rpc.control_plane_max_response_bytes(),
+            ))
+            .expect("host rpc call should reach anvil");
+            assert_eq!(
+                chain_id
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "0x7a69"
+            );
+
+            let poller = HttpEvmPoller::from_snapshot(&snapshot).expect("poller should initialize");
+            let result = block_on_with_spin(poller.poll(&snapshot.evm_cursor))
+                .expect("poll should succeed against anvil");
+            assert!(
+                result.cursor.next_block >= 1,
+                "cursor should advance after polling anvil head"
+            );
+            assert!(
+                result.events.is_empty(),
+                "no matching MessageQueued logs are expected in this fixture"
+            );
+        });
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn find_free_local_port() -> u16 {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("ephemeral port binding should work");
+        listener
+            .local_addr()
+            .expect("listener local addr should be available")
+            .port()
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn start_anvil(port: u16) -> Result<ChildProcessGuard, String> {
+        let child = Command::new("anvil")
+            .args([
+                "--chain-id",
+                "31337",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--silent",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start anvil process: {error}"))?;
+        let mut guard = ChildProcessGuard { child };
+        wait_for_anvil_rpc(port).inspect_err(|_error| {
+            let _ = guard.child.kill();
+        })?;
+        Ok(guard)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn wait_for_anvil_rpc(port: u16) -> Result<(), String> {
+        let url = format!("http://127.0.0.1:{port}");
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_chainId",
+            "params": [],
+            "id": 1
+        })
+        .to_string();
+
+        for _ in 0..50 {
+            let response = ureq::post(&url)
+                .set("content-type", "application/json")
+                .send_string(&request_body);
+            if let Ok(response) = response {
+                if response.status() == 200 {
+                    return Ok(());
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        Err("anvil rpc did not become ready in time".to_string())
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    struct ChildProcessGuard {
+        child: Child,
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    impl Drop for ChildProcessGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    fn with_host_rpc_mode_real<T>(f: impl FnOnce() -> T) -> T {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("host rpc mode lock should not be poisoned");
+
+        let previous = std::env::var_os(HOST_EVM_RPC_MODE_ENV);
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(HOST_EVM_RPC_MODE_ENV, "real");
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        match previous {
+            Some(value) => {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    std::env::set_var(HOST_EVM_RPC_MODE_ENV, value);
+                }
+            }
+            None => {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    std::env::remove_var(HOST_EVM_RPC_MODE_ENV);
+                }
+            }
+        }
+
+        match result {
+            Ok(output) => output,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
