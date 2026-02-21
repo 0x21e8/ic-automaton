@@ -95,6 +95,7 @@ struct SchedulerRuntime {
 struct InitArgs {
     ecdsa_key_name: String,
     inbox_contract_address: Option<String>,
+    evm_chain_id: Option<u64>,
 }
 
 fn assert_wasm_artifact_present() -> Vec<u8> {
@@ -118,6 +119,7 @@ fn with_backend_canister() -> (PocketIc, Principal) {
     let init_args = encode_args((InitArgs {
         ecdsa_key_name: "dfx_test_key".to_string(),
         inbox_contract_address: None,
+        evm_chain_id: None,
     },))
     .expect("failed to encode init args");
 

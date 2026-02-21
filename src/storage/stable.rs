@@ -833,6 +833,20 @@ pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<Stri
     Ok(normalized)
 }
 
+pub fn set_evm_chain_id(chain_id: u64) -> Result<u64, String> {
+    if chain_id == 0 {
+        return Err("evm chain id must be greater than 0".to_string());
+    }
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_cursor.chain_id = chain_id;
+    snapshot.evm_cursor.next_block = 0;
+    snapshot.evm_cursor.next_log_index = 0;
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(chain_id)
+}
+
 pub fn set_memory_fact(fact: &MemoryFact) {
     MEMORY_FACTS_MAP.with(|map| {
         map.borrow_mut().insert(fact.key.clone(), encode_json(fact));
@@ -2745,6 +2759,25 @@ mod tests {
                 .unwrap_or_default(),
             "0x2222222222222222222222222222222222222222"
         );
+    }
+
+    #[test]
+    fn evm_chain_id_validation_and_cursor_reset() {
+        init_storage();
+        assert!(set_evm_chain_id(0).is_err());
+
+        set_evm_cursor(&EvmPollCursor {
+            chain_id: 8453,
+            next_block: 123,
+            next_log_index: 7,
+        });
+        let stored = set_evm_chain_id(84532).expect("valid chain id should store");
+        assert_eq!(stored, 84532);
+
+        let snapshot = runtime_snapshot();
+        assert_eq!(snapshot.evm_cursor.chain_id, 84532);
+        assert_eq!(snapshot.evm_cursor.next_block, 0);
+        assert_eq!(snapshot.evm_cursor.next_log_index, 0);
     }
 
     #[test]

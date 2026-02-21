@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://github.com/dfinity/icp-cli/raw/refs/tags/v0.1.0/docs/schemas/icp-yaml-schema.json
 canisters:
   - name: backend 
-    init_args: '(record { ecdsa_key_name = "dfx_test_key" })'
+    init_args: '(record { ecdsa_key_name = "dfx_test_key"; evm_chain_id = opt 8453 })'
     recipe:
       type: "@dfinity/rust@v3.0.0"
       configuration:
@@ -13,4 +13,3 @@ canisters:
         metadata:
           - name: "crate:version"
             value: 1.0.0
-
