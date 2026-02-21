@@ -8,10 +8,10 @@ mod storage;
 mod tools;
 
 use crate::domain::types::{
-    ConversationLog, ConversationSummary, InboxMessage, InboxStats, InferenceConfigView,
-    InferenceProvider, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer,
-    PromptLayerView, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord, TaskKind,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    ConversationLog, ConversationSummary, EvmRouteStateView, InboxMessage, InboxStats,
+    InferenceConfigView, InferenceProvider, ObservabilitySnapshot, OutboxMessage, OutboxStats,
+    PromptLayer, PromptLayerView, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord,
+    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
 };
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
@@ -124,6 +124,30 @@ fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, String
 }
 
 #[ic_cdk::update]
+fn set_automaton_evm_address_admin(address: Option<String>) -> Result<Option<String>, String> {
+    ensure_controller()?;
+    stable::set_automaton_evm_address(address)
+}
+
+#[ic_cdk::update]
+fn set_inbox_contract_address_admin(address: Option<String>) -> Result<Option<String>, String> {
+    ensure_controller()?;
+    stable::set_inbox_contract_address(address)
+}
+
+#[ic_cdk::update]
+fn set_evm_chain_id_admin(chain_id: u64) -> Result<u64, String> {
+    ensure_controller()?;
+    stable::set_evm_chain_id(chain_id)
+}
+
+#[ic_cdk::update]
+fn set_evm_confirmation_depth_admin(confirmation_depth: u64) -> Result<u64, String> {
+    ensure_controller()?;
+    stable::set_evm_confirmation_depth(confirmation_depth)
+}
+
+#[ic_cdk::update]
 fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
     stable::set_http_allowed_domains(domains)
 }
@@ -131,6 +155,11 @@ fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String>
 #[ic_cdk::query]
 fn get_runtime_view() -> RuntimeView {
     stable::snapshot_to_view()
+}
+
+#[ic_cdk::query]
+fn get_evm_route_state_view() -> EvmRouteStateView {
+    stable::evm_route_state_view()
 }
 
 #[ic_cdk::query]

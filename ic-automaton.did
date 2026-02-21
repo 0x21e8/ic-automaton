@@ -1,3 +1,318 @@
-service : {
-  greet : (name : text) -> (text) query
+type AgentState = variant {
+  Idle;
+  Bootstrapping;
+  ExecutingActions;
+  Inferring;
+  LoadingContext;
+  Faulted;
+  Sleeping;
+  Persisting;
+};
+type ContinuationStopReason = variant {
+  None;
+  MaxDuration;
+  InferenceError;
+  MaxRounds;
+  MaxToolCalls;
+};
+type ConversationEntry = record {
+  timestamp_ns : nat64;
+  turn_id : text;
+  sender_body : text;
+  agent_reply : text;
+  inbox_message_id : text;
+};
+type ConversationLog = record {
+  sender : text;
+  last_activity_ns : nat64;
+  entries : vec ConversationEntry;
+};
+type ConversationSummary = record {
+  sender : text;
+  last_activity_ns : nat64;
+  entry_count : nat32;
+};
+type CycleTelemetry = record {
+  burn_rate_cycles_per_day : opt nat;
+  usd_per_trillion_cycles : float64;
+  freezing_threshold_cycles : nat;
+  burn_rate_usd_per_day : opt float64;
+  window_sample_count : nat32;
+  burn_rate_cycles_per_hour : opt nat;
+  estimated_seconds_until_freezing_threshold : opt nat64;
+  window_duration_seconds : nat64;
+  burn_rate_usd_per_hour : opt float64;
+  total_cycles : nat;
+  estimated_freeze_time_ns : opt nat64;
+  moving_window_seconds : nat64;
+  liquid_cycles : nat;
+};
+type EvmRouteStateView = record {
+  next_block : nat64;
+  automaton_address_topic : opt text;
+  automaton_evm_address : opt text;
+  chain_id : nat64;
+  confirmation_depth : nat64;
+  inbox_contract_address : opt text;
+  consecutive_empty_polls : nat32;
+  last_poll_at_ns : nat64;
+  next_log_index : nat64;
+};
+type HttpRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+  certificate_version : opt nat16;
+};
+type HttpResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  upgrade : opt bool;
+  status_code : nat16;
+};
+type HttpUpdateRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+};
+type HttpUpdateResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  status_code : nat16;
+};
+type InboxMessage = record {
+  id : text;
+  seq : nat64;
+  status : InboxMessageStatus;
+  body : text;
+  consumed_at_ns : opt nat64;
+  posted_at_ns : nat64;
+  posted_by : text;
+  staged_at_ns : opt nat64;
+};
+type InboxMessageStatus = variant { Staged; Consumed; Pending };
+type InboxStats = record {
+  pending_count : nat64;
+  consumed_count : nat64;
+  total_messages : nat64;
+  staged_count : nat64;
+};
+type InferenceConfigView = record {
+  model : text;
+  openrouter_max_response_bytes : nat64;
+  openrouter_has_api_key : bool;
+  provider : InferenceProvider;
+  openrouter_base_url : text;
+};
+type InferenceProvider = variant { OpenRouter; Mock; IcLlm };
+type InitArgs = record {
+  evm_chain_id : opt nat64;
+  ecdsa_key_name : text;
+  inbox_contract_address : opt text;
+};
+type JobStatus = variant {
+  Skipped;
+  Failed;
+  Succeeded;
+  InFlight;
+  TimedOut;
+  Pending;
+};
+type ObservabilitySnapshot = record {
+  inbox_stats : InboxStats;
+  scheduler : SchedulerRuntime;
+  outbox_stats : OutboxStats;
+  conversation_summaries : vec ConversationSummary;
+  recent_turns : vec TurnRecord;
+  inbox_messages : vec InboxMessage;
+  cycles : CycleTelemetry;
+  prompt_layers : vec PromptLayerView;
+  recent_transitions : vec TransitionLogRecord;
+  recent_jobs : vec ScheduledJob;
+  captured_at_ns : nat64;
+  outbox_messages : vec OutboxMessage;
+  runtime : RuntimeView;
+};
+type OutboxMessage = record {
+  id : text;
+  seq : nat64;
+  body : text;
+  source_inbox_ids : vec text;
+  created_at_ns : nat64;
+  turn_id : text;
+};
+type OutboxStats = record { total_messages : nat64 };
+type PromptLayer = record {
+  content : text;
+  updated_at_ns : nat64;
+  version : nat32;
+  updated_by_turn : text;
+  layer_id : nat8;
+};
+type PromptLayerView = record {
+  content : text;
+  updated_at_ns : opt nat64;
+  is_mutable : bool;
+  version : opt nat32;
+  updated_by_turn : opt text;
+  layer_id : nat8;
+};
+type Result = variant { Ok : text; Err : text };
+type Result_1 = variant { Ok : opt text; Err : text };
+type Result_2 = variant { Ok : nat64; Err : text };
+type Result_3 = variant { Ok : vec text; Err : text };
+type Result_4 = variant { Ok : PromptLayer; Err : text };
+type RuntimeView = record {
+  last_error : opt text;
+  evm_chain_id : nat64;
+  last_transition_at_ns : nat64;
+  soul : text;
+  turn_counter : nat64;
+  last_turn_id : opt text;
+  state : AgentState;
+  inference_provider : InferenceProvider;
+  evm_next_log_index : nat64;
+  turn_in_flight : bool;
+  inference_model : text;
+  evm_next_block : nat64;
+  loop_enabled : bool;
+};
+type ScheduledJob = record {
+  id : text;
+  last_error : opt text;
+  status : JobStatus;
+  started_at_ns : opt nat64;
+  kind : TaskKind;
+  lane : TaskLane;
+  finished_at_ns : opt nat64;
+  attempts : nat32;
+  scheduled_for_ns : nat64;
+  created_at_ns : nat64;
+  max_attempts : nat32;
+  priority : nat8;
+  dedupe_key : text;
+};
+type SchedulerLease = record {
+  lane : TaskLane;
+  acquired_at_ns : nat64;
+  job_id : text;
+  expires_at_ns : nat64;
+};
+type SchedulerRuntime = record {
+  last_tick_finished_ns : nat64;
+  last_tick_error : opt text;
+  last_tick_started_ns : nat64;
+  survival_tier : SurvivalTier;
+  survival_tier_recovery_checks : nat32;
+  active_mutating_lease : opt SchedulerLease;
+  next_job_seq : nat64;
+  enabled : bool;
+  paused_reason : opt text;
+  low_cycles_mode : bool;
+};
+type SkillRecord = record {
+  name : text;
+  description : text;
+  instructions : text;
+  enabled : bool;
+  mutable : bool;
+};
+type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
+type TaskKind = variant { Reconcile; CheckCycles; PollInbox; AgentTurn };
+type TaskLane = variant { ReadOnly; Mutating };
+type TaskScheduleConfig = record {
+  max_backoff_secs : nat64;
+  kind : TaskKind;
+  interval_secs : nat64;
+  enabled : bool;
+  essential : bool;
+  priority : nat8;
+};
+type TaskScheduleRuntime = record {
+  backoff_until_ns : opt nat64;
+  last_error : opt text;
+  next_due_ns : nat64;
+  kind : TaskKind;
+  last_started_ns : opt nat64;
+  pending_job_id : opt text;
+  consecutive_failures : nat32;
+  last_finished_ns : opt nat64;
+};
+type ToolCallRecord = record {
+  output : text;
+  args_json : text;
+  tool : text;
+  error : opt text;
+  turn_id : text;
+  success : bool;
+};
+type TransitionLogRecord = record {
+  id : text;
+  occurred_at_ns : nat64;
+  to_state : AgentState;
+  error : opt text;
+  event : text;
+  turn_id : text;
+  from_state : AgentState;
+};
+type TurnRecord = record {
+  id : text;
+  inference_round_count : nat32;
+  continuation_stop_reason : ContinuationStopReason;
+  state_to : AgentState;
+  input_summary : text;
+  error : opt text;
+  inner_dialogue : opt text;
+  created_at_ns : nat64;
+  source_events : nat32;
+  state_from : AgentState;
+  tool_call_count : nat32;
+};
+service : (InitArgs) -> {
+  get_conversation : (text) -> (opt ConversationLog) query;
+  get_evm_route_state_view : () -> (EvmRouteStateView) query;
+  get_inbox_stats : () -> (InboxStats) query;
+  get_inference_config : () -> (InferenceConfigView) query;
+  get_observability_snapshot : (nat32) -> (ObservabilitySnapshot) query;
+  get_outbox_stats : () -> (OutboxStats) query;
+  get_prompt_layers : () -> (vec PromptLayerView) query;
+  get_runtime_view : () -> (RuntimeView) query;
+  get_scheduler_view : () -> (SchedulerRuntime) query;
+  get_soul : () -> (text) query;
+  get_tool_calls_for_turn : (text) -> (vec ToolCallRecord) query;
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
+  list_conversations : () -> (vec ConversationSummary) query;
+  list_inbox_messages : (nat32) -> (vec InboxMessage) query;
+  list_outbox_messages : (nat32) -> (vec OutboxMessage) query;
+  list_recent_events : (nat32) -> (vec text) query;
+  list_scheduler_jobs : (nat32) -> (vec ScheduledJob) query;
+  list_skills : () -> (vec SkillRecord) query;
+  list_task_schedules : () -> (
+      vec record { TaskScheduleConfig; TaskScheduleRuntime },
+    ) query;
+  list_tool_policies : () -> (vec text) query;
+  list_turns : (nat32) -> (vec text) query;
+  post_inbox_message : (text) -> (Result);
+  set_automaton_evm_address_admin : (opt text) -> (Result_1);
+  set_evm_chain_id_admin : (nat64) -> (Result_2);
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_2);
+  set_evm_rpc_fallback_url : (opt text) -> (Result_1);
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_2);
+  set_evm_rpc_url : (text) -> (Result);
+  set_http_allowed_domains : (vec text) -> (Result_3);
+  set_inbox_contract_address_admin : (opt text) -> (Result_1);
+  set_inference_model : (text) -> (Result);
+  set_inference_provider : (InferenceProvider) -> (text);
+  set_loop_enabled : (bool) -> (text);
+  set_openrouter_api_key : (opt text) -> (text);
+  set_openrouter_base_url : (text) -> (Result);
+  set_scheduler_enabled : (bool) -> (text);
+  set_scheduler_low_cycles_mode : (bool) -> (text);
+  set_task_enabled : (TaskKind, bool) -> (text);
+  set_task_interval_secs : (TaskKind, nat64) -> (Result);
+  update_prompt_layer_admin : (nat8, text) -> (Result_4);
+  update_soul : (text) -> (Result);
 }

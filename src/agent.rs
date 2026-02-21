@@ -1914,6 +1914,7 @@ mod tests {
             chain_id: 8453,
             next_block: 0,
             next_log_index: 7,
+            ..EvmPollCursor::default()
         });
 
         let before = stable::runtime_snapshot().evm_cursor;

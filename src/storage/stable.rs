@@ -1,6 +1,6 @@
 use crate::domain::types::{
     AgentEvent, AgentState, ConversationEntry, ConversationLog, ConversationSummary,
-    CycleTelemetry, EvmPollCursor, InboxMessage, InboxMessageStatus, InboxStats,
+    CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage, InboxMessageStatus, InboxStats,
     InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
     OutboxMessage, OutboxStats, PromptLayer, PromptLayerView, RuntimeSnapshot, RuntimeView,
     ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, SurvivalOperationClass,
@@ -47,6 +47,7 @@ const MAX_CONVERSATION_ENTRIES_PER_SENDER: usize = 20;
 const MAX_CONVERSATION_SENDERS: usize = 200;
 const MAX_CONVERSATION_BODY_CHARS: usize = 500;
 const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
+const MAX_EVM_CONFIRMATION_DEPTH: u64 = 100;
 const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
@@ -298,7 +299,23 @@ thread_local! {
 }
 
 pub fn init_storage() {
-    let _ = runtime_snapshot();
+    let mut snapshot = runtime_snapshot();
+    let mut snapshot_changed = false;
+    if snapshot.evm_cursor.contract_address.is_none() {
+        if let Some(contract_address) = snapshot.inbox_contract_address.clone() {
+            snapshot.evm_cursor.contract_address = Some(contract_address);
+            snapshot_changed = true;
+        }
+    }
+    if snapshot.evm_cursor.automaton_address_topic.is_none() {
+        if let Some(address) = snapshot.evm_address.as_deref() {
+            snapshot.evm_cursor.automaton_address_topic = Some(evm_address_to_topic(address));
+            snapshot_changed = true;
+        }
+    }
+    if snapshot_changed {
+        save_runtime_snapshot(&snapshot);
+    }
     seed_default_prompt_layers();
     if runtime_u64(INBOX_SEQ_KEY).is_none() {
         save_runtime_u64(INBOX_SEQ_KEY, 0);
@@ -784,6 +801,11 @@ fn normalize_evm_hex_address(raw: &str, field: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
+fn evm_address_to_topic(address: &str) -> String {
+    let suffix = address.strip_prefix("0x").unwrap_or(address);
+    format!("0x{:0>64}", suffix)
+}
+
 pub fn set_ecdsa_key_name(key_name: String) -> Result<String, String> {
     let trimmed = key_name.trim();
     if trimmed.is_empty() {
@@ -811,6 +833,7 @@ pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String
 
     let mut snapshot = runtime_snapshot();
     snapshot.evm_address = normalized.clone();
+    snapshot.evm_cursor.automaton_address_topic = normalized.as_deref().map(evm_address_to_topic);
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(normalized)
@@ -818,6 +841,15 @@ pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String
 
 pub fn get_evm_address() -> Option<String> {
     runtime_snapshot().evm_address
+}
+
+pub fn set_automaton_evm_address(address: Option<String>) -> Result<Option<String>, String> {
+    set_evm_address(address)
+}
+
+#[allow(dead_code)]
+pub fn get_automaton_evm_address() -> Option<String> {
+    get_evm_address()
 }
 
 pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<String>, String> {
@@ -828,6 +860,7 @@ pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<Stri
 
     let mut snapshot = runtime_snapshot();
     snapshot.inbox_contract_address = normalized.clone();
+    snapshot.evm_cursor.contract_address = normalized.clone();
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(normalized)
@@ -842,9 +875,24 @@ pub fn set_evm_chain_id(chain_id: u64) -> Result<u64, String> {
     snapshot.evm_cursor.chain_id = chain_id;
     snapshot.evm_cursor.next_block = 0;
     snapshot.evm_cursor.next_log_index = 0;
+    snapshot.evm_cursor.last_poll_at_ns = 0;
+    snapshot.evm_cursor.consecutive_empty_polls = 0;
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(chain_id)
+}
+
+pub fn set_evm_confirmation_depth(confirmation_depth: u64) -> Result<u64, String> {
+    if confirmation_depth > MAX_EVM_CONFIRMATION_DEPTH {
+        return Err(format!(
+            "evm confirmation depth must be <= {MAX_EVM_CONFIRMATION_DEPTH}"
+        ));
+    }
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_cursor.confirmation_depth = confirmation_depth;
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(confirmation_depth)
 }
 
 pub fn set_memory_fact(fact: &MemoryFact) {
@@ -1109,6 +1157,10 @@ pub fn snapshot_to_view() -> RuntimeView {
     RuntimeView::from(&runtime_snapshot())
 }
 
+pub fn evm_route_state_view() -> EvmRouteStateView {
+    EvmRouteStateView::from(&runtime_snapshot())
+}
+
 pub fn inference_config_view() -> InferenceConfigView {
     InferenceConfigView::from(&runtime_snapshot())
 }
@@ -1248,7 +1300,15 @@ pub fn get_tools_for_turn(turn_id: &str) -> Vec<ToolCallRecord> {
 
 pub fn set_evm_cursor(cursor: &EvmPollCursor) {
     let mut snapshot = runtime_snapshot();
-    snapshot.evm_cursor = cursor.clone();
+    let mut next_cursor = cursor.clone();
+    if next_cursor.contract_address.is_none() {
+        next_cursor.contract_address = snapshot.inbox_contract_address.clone();
+    }
+    if next_cursor.automaton_address_topic.is_none() {
+        next_cursor.automaton_address_topic =
+            snapshot.evm_address.as_deref().map(evm_address_to_topic);
+    }
+    snapshot.evm_cursor = next_cursor;
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
 }
@@ -2750,6 +2810,12 @@ mod tests {
             get_evm_address().as_deref().unwrap_or_default(),
             "0x1111111111111111111111111111111111111111"
         );
+
+        let route = evm_route_state_view();
+        assert_eq!(
+            route.automaton_address_topic.as_deref().unwrap_or_default(),
+            "0x0000000000000000000000001111111111111111111111111111111111111111"
+        );
     }
 
     #[test]
@@ -2774,6 +2840,14 @@ mod tests {
                 .unwrap_or_default(),
             "0x2222222222222222222222222222222222222222"
         );
+        assert_eq!(
+            snapshot
+                .evm_cursor
+                .contract_address
+                .as_deref()
+                .unwrap_or_default(),
+            "0x2222222222222222222222222222222222222222"
+        );
     }
 
     #[test]
@@ -2785,6 +2859,9 @@ mod tests {
             chain_id: 8453,
             next_block: 123,
             next_log_index: 7,
+            last_poll_at_ns: 55,
+            consecutive_empty_polls: 4,
+            ..EvmPollCursor::default()
         });
         let stored = set_evm_chain_id(84532).expect("valid chain id should store");
         assert_eq!(stored, 84532);
@@ -2793,6 +2870,61 @@ mod tests {
         assert_eq!(snapshot.evm_cursor.chain_id, 84532);
         assert_eq!(snapshot.evm_cursor.next_block, 0);
         assert_eq!(snapshot.evm_cursor.next_log_index, 0);
+        assert_eq!(snapshot.evm_cursor.last_poll_at_ns, 0);
+        assert_eq!(snapshot.evm_cursor.consecutive_empty_polls, 0);
+    }
+
+    #[test]
+    fn evm_route_state_view_reports_binding_and_cursor() {
+        init_storage();
+        set_automaton_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("automaton address should store");
+        set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should store");
+        set_evm_chain_id(84532).expect("chain id should store");
+        set_evm_confirmation_depth(12).expect("confirmation depth should store");
+        set_evm_cursor(&EvmPollCursor {
+            chain_id: 84532,
+            next_block: 123,
+            next_log_index: 7,
+            confirmation_depth: 12,
+            last_poll_at_ns: 9,
+            consecutive_empty_polls: 2,
+            ..EvmPollCursor::default()
+        });
+
+        let route = evm_route_state_view();
+        assert_eq!(route.chain_id, 84532);
+        assert_eq!(
+            route.automaton_evm_address.as_deref().unwrap_or_default(),
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            route.inbox_contract_address.as_deref().unwrap_or_default(),
+            "0x2222222222222222222222222222222222222222"
+        );
+        assert_eq!(
+            route.automaton_address_topic.as_deref().unwrap_or_default(),
+            "0x0000000000000000000000001111111111111111111111111111111111111111"
+        );
+        assert_eq!(route.next_block, 123);
+        assert_eq!(route.next_log_index, 7);
+        assert_eq!(route.confirmation_depth, 12);
+        assert_eq!(route.last_poll_at_ns, 9);
+        assert_eq!(route.consecutive_empty_polls, 2);
+    }
+
+    #[test]
+    fn evm_confirmation_depth_validation_enforces_upper_bound() {
+        init_storage();
+        assert!(set_evm_confirmation_depth(MAX_EVM_CONFIRMATION_DEPTH + 1).is_err());
+        let stored =
+            set_evm_confirmation_depth(MAX_EVM_CONFIRMATION_DEPTH).expect("depth should store");
+        assert_eq!(stored, MAX_EVM_CONFIRMATION_DEPTH);
     }
 
     #[test]

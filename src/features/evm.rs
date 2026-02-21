@@ -132,8 +132,13 @@ impl EvmPoller for HttpEvmPoller {
         Ok(EvmPollResult {
             cursor: EvmPollCursor {
                 chain_id: cursor.chain_id,
+                contract_address: cursor.contract_address.clone(),
+                automaton_address_topic: cursor.automaton_address_topic.clone(),
                 next_block: to_block.saturating_add(1),
                 next_log_index: 0,
+                confirmation_depth: cursor.confirmation_depth,
+                last_poll_at_ns: cursor.last_poll_at_ns,
+                consecutive_empty_polls: cursor.consecutive_empty_polls,
             },
             events,
         })
@@ -160,8 +165,13 @@ impl EvmPoller for MockEvmPoller {
         Ok(EvmPollResult {
             cursor: EvmPollCursor {
                 chain_id: cursor.chain_id,
+                contract_address: cursor.contract_address.clone(),
+                automaton_address_topic: cursor.automaton_address_topic.clone(),
                 next_block,
                 next_log_index,
+                confirmation_depth: cursor.confirmation_depth,
+                last_poll_at_ns: cursor.last_poll_at_ns,
+                consecutive_empty_polls: cursor.consecutive_empty_polls,
             },
             events,
         })
@@ -1253,6 +1263,7 @@ mod tests {
                     chain_id: 31_337,
                     next_block: 0,
                     next_log_index: 0,
+                    ..EvmPollCursor::default()
                 },
                 ..RuntimeSnapshot::default()
             };

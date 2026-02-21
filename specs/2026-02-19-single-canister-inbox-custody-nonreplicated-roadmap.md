@@ -184,7 +184,7 @@ Hard truth on empty polls:
       - Validation: `cargo test scheduler::tests --lib && cargo test agent::tests --lib`
       - Notes: Keep EVM ingress in `PollInbox`; keep `AgentTurn` a staged-input consumer only; add regression assertions so this boundary cannot drift.
 
-- [ ] **Task 2: Add EVM-address route-binding and route-aware cursor model**
+- [x] **Task 2: Add EVM-address route-binding and route-aware cursor model**
       - Files: `src/domain/types.rs`, `src/storage/stable.rs`, `src/lib.rs`
       - Validation: `cargo test`
       - Notes: Add config + admin setters; expose safe query view.
@@ -307,6 +307,7 @@ _Dev agent writes here during execution._
 ### Completed
 
 - Spec revised to align with shared-inbox EVM-address routing, forwarding semantics, per-automaton min pricing, and no-registration requirements.
+- Task 2 complete: route-aware cursor fields, controller-gated route config setters, and safe route-state query view implemented with passing validation.
 
 ### Blockers
 

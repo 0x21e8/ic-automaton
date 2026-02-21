@@ -753,6 +753,7 @@ mod tests {
             chain_id: 8453,
             next_block: 0,
             next_log_index: 0,
+            ..crate::domain::types::EvmPollCursor::default()
         });
 
         let poll_job = stable::enqueue_job_if_absent(
@@ -845,6 +846,7 @@ mod tests {
             chain_id: 8453,
             next_block: 0,
             next_log_index: 0,
+            ..crate::domain::types::EvmPollCursor::default()
         });
 
         let poll_job = stable::enqueue_job_if_absent(
