@@ -662,7 +662,7 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
 }
 
 #[test]
-fn non_controller_cannot_mutate_control_plane_but_can_post_inbox_messages() {
+fn non_controller_can_mutate_inference_config_but_not_control_plane() {
     let (pic, canister_id) = with_backend_canister();
     let outsider = non_controller_principal();
 
@@ -677,15 +677,60 @@ fn non_controller_cannot_mutate_control_plane_but_can_post_inbox_messages() {
 
     let inference_payload = encode_args((InferenceProvider::OpenRouter,))
         .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
-    let inference_result = pic.update_call(
+    let inference_result: String = call_update_as(
+        &pic,
         canister_id,
         outsider,
         "set_inference_provider",
         inference_payload,
     );
-    assert!(
-        inference_result.is_err(),
-        "set_inference_provider should reject non-controller callers"
+    assert_eq!(
+        inference_result, "inference_provider=OpenRouter",
+        "set_inference_provider should allow non-controller callers"
+    );
+
+    let model_payload = encode_args(("openai/gpt-4o-mini".to_string(),))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let model_result: Result<String, String> = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "set_inference_model",
+        model_payload,
+    );
+    assert_eq!(
+        model_result,
+        Ok("openai/gpt-4o-mini".to_string()),
+        "set_inference_model should allow non-controller callers"
+    );
+
+    let base_url_payload = encode_args(("https://openrouter.ai/api/v1/".to_string(),))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let base_url_result: Result<String, String> = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "set_openrouter_base_url",
+        base_url_payload,
+    );
+    assert_eq!(
+        base_url_result,
+        Ok("https://openrouter.ai/api/v1".to_string()),
+        "set_openrouter_base_url should allow non-controller callers"
+    );
+
+    let api_key_payload = encode_args((Some("test-openrouter-key".to_string()),))
+        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let api_key_result: String = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "set_openrouter_api_key",
+        api_key_payload,
+    );
+    assert_eq!(
+        api_key_result, "openrouter_api_key_updated",
+        "set_openrouter_api_key should allow non-controller callers"
     );
 
     let rpc_payload = encode_args(("https://mainnet.base.org".to_string(),))
