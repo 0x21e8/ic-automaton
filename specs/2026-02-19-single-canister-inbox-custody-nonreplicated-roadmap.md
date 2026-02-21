@@ -189,7 +189,7 @@ Hard truth on empty polls:
       - Validation: `cargo test`
       - Notes: Add config + admin setters; expose safe query view.
 
-- [ ] **Task 3: Contract payment forwarding + min-price map/defaults**
+- [x] **Task 3: Contract payment forwarding + min-price map/defaults**
       - Files: `evm/src/Inbox.sol`, `evm/test/Inbox.t.sol` (if/when `evm/` is introduced in this repo)
       - Validation: `cd evm && forge test`
       - Notes: Event must use indexed automaton address; accepted payments forward USDC and ETH; no registration gate.
@@ -308,6 +308,7 @@ _Dev agent writes here during execution._
 
 - Spec revised to align with shared-inbox EVM-address routing, forwarding semantics, per-automaton min pricing, and no-registration requirements.
 - Task 2 complete: route-aware cursor fields, controller-gated route config setters, and safe route-state query view implemented with passing validation.
+- Task 3 complete: added `evm/` Foundry workspace with `Inbox.sol` forwarding logic, per-automaton min-price defaults/overrides, and passing Forge tests for forwarding and no-registration behavior.
 
 ### Blockers
 
