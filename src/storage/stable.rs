@@ -798,10 +798,39 @@ fn normalize_https_url(raw: &str, field: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err(format!("{field} cannot be empty"));
     }
-    if !trimmed.starts_with("https://") {
-        return Err(format!("{field} must be an https:// URL"));
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("https://") {
+        return Ok(trimmed.to_string());
     }
-    Ok(trimmed.to_string())
+    if lowered.starts_with("http://") && is_local_http_url(&lowered) {
+        return Ok(trimmed.to_string());
+    }
+    Err(format!(
+        "{field} must be an https:// URL or localhost http:// URL"
+    ))
+}
+
+fn is_local_http_url(url: &str) -> bool {
+    let without_scheme = match url.strip_prefix("http://") {
+        Some(value) => value,
+        None => return false,
+    };
+    let authority = without_scheme.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = if authority.starts_with('[') {
+        authority
+            .split(']')
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
 }
 
 fn normalize_evm_hex_address(raw: &str, field: &str) -> Result<String, String> {
@@ -2070,45 +2099,80 @@ pub fn acquire_mutating_lease(job_id: &str, now_ns: u64, ttl_ns: u64) -> Result<
     Ok(())
 }
 
-pub fn complete_job(job_id: &str, status: JobStatus, error: Option<String>, now_ns: u64) {
+pub fn complete_job(
+    job_id: &str,
+    status: JobStatus,
+    error: Option<String>,
+    now_ns: u64,
+    retry_after_secs: Option<u64>,
+) {
     let mut job = match get_job_by_id(job_id) {
         Some(job) => job,
         None => return,
     };
     let old_status = job.status.clone();
-    job.status = status.clone();
-    job.finished_at_ns = Some(now_ns);
+    let started_at_ns = job.started_at_ns;
     job.last_error = error.clone();
     job.attempts = job.attempts.saturating_add(1);
-    save_job(&job);
+    let should_retry = matches!(status, JobStatus::Failed | JobStatus::TimedOut)
+        && retry_after_secs.is_some()
+        && job.attempts < job.max_attempts;
+    let mut retry_at_ns = None;
+    let mut retried = false;
+
+    if should_retry {
+        let retry_delay_secs = retry_after_secs.unwrap_or_default();
+        let scheduled_for_ns =
+            now_ns.saturating_add(retry_delay_secs.saturating_mul(1_000_000_000));
+        let queue_seq = parse_job_seq(&job.id).unwrap_or_default();
+        job.status = JobStatus::Pending;
+        job.scheduled_for_ns = scheduled_for_ns;
+        job.started_at_ns = None;
+        job.finished_at_ns = None;
+        save_job(&job);
+        JOB_QUEUE_MAP.with(|map| {
+            map.borrow_mut().insert(
+                queue_index_key(&job.lane, scheduled_for_ns, job.priority, queue_seq),
+                job.id.clone().into_bytes(),
+            );
+        });
+        retry_at_ns = Some(scheduled_for_ns);
+        retried = true;
+    } else {
+        job.status = status.clone();
+        job.finished_at_ns = Some(now_ns);
+        save_job(&job);
+    }
 
     let cfg =
         get_task_config(&job.kind).unwrap_or_else(|| TaskScheduleConfig::default_for(&job.kind));
     let mut task_runtime = get_task_runtime(&job.kind);
-    task_runtime.last_started_ns = job.started_at_ns;
+    task_runtime.last_started_ns = started_at_ns;
     task_runtime.last_finished_ns = Some(now_ns);
     task_runtime.last_error = error.clone();
 
-    match status {
-        JobStatus::Succeeded => {
-            task_runtime.consecutive_failures = 0;
-            task_runtime.backoff_until_ns = None;
-        }
-        JobStatus::Failed | JobStatus::TimedOut => {
-            task_runtime.consecutive_failures = task_runtime.consecutive_failures.saturating_add(1);
+    if status == JobStatus::Succeeded {
+        task_runtime.consecutive_failures = 0;
+        task_runtime.backoff_until_ns = None;
+    } else if retried {
+        task_runtime.consecutive_failures = task_runtime.consecutive_failures.saturating_add(1);
+        task_runtime.backoff_until_ns = retry_at_ns;
+        task_runtime.pending_job_id = Some(job.id.clone());
+    } else if matches!(status, JobStatus::Failed | JobStatus::TimedOut) {
+        task_runtime.consecutive_failures = task_runtime.consecutive_failures.saturating_add(1);
+        let capped = retry_after_secs.unwrap_or_else(|| {
             let exponent = task_runtime.consecutive_failures.min(20) as u32;
             let base_delay = 1u64 << exponent;
-            let capped = base_delay.min(cfg.max_backoff_secs.max(1));
-            task_runtime.backoff_until_ns =
-                now_ns.checked_add(capped.saturating_mul(1_000_000_000));
-        }
-        _ => {}
+            base_delay.min(cfg.max_backoff_secs.max(1))
+        });
+        task_runtime.backoff_until_ns = now_ns.checked_add(capped.saturating_mul(1_000_000_000));
     }
 
-    if task_runtime
-        .pending_job_id
-        .as_ref()
-        .is_some_and(|id| id == job_id)
+    if !retried
+        && task_runtime
+            .pending_job_id
+            .as_ref()
+            .is_some_and(|id| id == job_id)
     {
         task_runtime.pending_job_id = None;
     }
@@ -2131,11 +2195,14 @@ pub fn complete_job(job_id: &str, status: JobStatus, error: Option<String>, now_
 
     log!(
         SchedulerStorageLogPriority::Info,
-        "scheduler_job_complete job_id={} from={:?} to={:?} attempts={} error={:?}",
+        "scheduler_job_complete job_id={} from={:?} to={:?} attempts={} max_attempts={} retried={} retry_at_ns={:?} error={:?}",
         job_id,
         old_status,
-        status,
+        job.status,
         job.attempts,
+        job.max_attempts,
+        retried,
+        retry_at_ns,
         error
     );
 }
@@ -2156,6 +2223,7 @@ pub fn recover_stale_lease(now_ns: u64) {
             JobStatus::TimedOut,
             Some("mutating lease expired".to_string()),
             now_ns,
+            None,
         );
     }
 }
@@ -2247,6 +2315,14 @@ fn parse_queue_index_key(raw_key: &str) -> Option<u64> {
         return None;
     }
     parts[2].parse::<u64>().ok()
+}
+
+fn parse_job_seq(job_id: &str) -> Option<u64> {
+    let mut parts = job_id.split(':');
+    if parts.next() != Some("job") {
+        return None;
+    }
+    parts.next()?.parse::<u64>().ok()
 }
 
 fn get_job_by_id(job_id: &str) -> Option<ScheduledJob> {
@@ -2529,7 +2605,7 @@ mod tests {
         acquire_mutating_lease("lease:first", 1, ttl).expect("first lease acquired");
         assert!(acquire_mutating_lease("lease:second", 2, ttl).is_err());
 
-        complete_job("lease:first", JobStatus::Succeeded, None, 3);
+        complete_job("lease:first", JobStatus::Succeeded, None, 3, None);
         assert!(acquire_mutating_lease("lease:second", 3, ttl).is_ok());
     }
 
@@ -2546,6 +2622,70 @@ mod tests {
 
         let reloaded = get_job_by_id("lease:stale").expect("job still exists");
         assert!(matches!(reloaded.status, JobStatus::TimedOut));
+    }
+
+    #[test]
+    fn complete_job_retries_until_max_attempts_then_terminal_failure() {
+        init_storage();
+        seed_task_runtime(TaskKind::PollInbox, 0);
+
+        let job_id = enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "PollInbox:retry-policy".to_string(),
+            0,
+            0,
+        )
+        .expect("job should enqueue");
+        let _ = pop_next_pending_job(TaskLane::Mutating, 0).expect("job should dequeue");
+
+        complete_job(
+            &job_id,
+            JobStatus::Failed,
+            Some("rpc timeout".to_string()),
+            10,
+            Some(2),
+        );
+        let after_first = get_job_by_id(&job_id).expect("job should persist");
+        assert_eq!(after_first.status, JobStatus::Pending);
+        assert_eq!(after_first.attempts, 1);
+        assert_eq!(after_first.scheduled_for_ns, 2_000_000_010);
+        assert!(
+            pop_next_pending_job(TaskLane::Mutating, 2_000_000_009).is_none(),
+            "retry should respect backoff delay"
+        );
+        let _ = pop_next_pending_job(TaskLane::Mutating, 2_000_000_010)
+            .expect("retry should become due");
+
+        complete_job(
+            &job_id,
+            JobStatus::Failed,
+            Some("rpc timeout".to_string()),
+            20,
+            Some(0),
+        );
+        let after_second = get_job_by_id(&job_id).expect("job should persist");
+        assert_eq!(after_second.status, JobStatus::Pending);
+        assert_eq!(after_second.attempts, 2);
+        let _ =
+            pop_next_pending_job(TaskLane::Mutating, 20).expect("immediate retry should enqueue");
+
+        complete_job(
+            &job_id,
+            JobStatus::Failed,
+            Some("rpc timeout".to_string()),
+            30,
+            Some(0),
+        );
+        let final_job = get_job_by_id(&job_id).expect("job should persist");
+        assert_eq!(final_job.status, JobStatus::Failed);
+        assert_eq!(final_job.attempts, 3);
+        assert!(
+            pop_next_pending_job(TaskLane::Mutating, 30).is_none(),
+            "retry queue must be empty once max attempts are exhausted"
+        );
+        let runtime = get_task_runtime(&TaskKind::PollInbox);
+        assert!(runtime.pending_job_id.is_none());
     }
 
     #[test]
@@ -3096,6 +3236,10 @@ mod tests {
         assert!(set_evm_rpc_url("".to_string()).is_err());
         assert!(set_evm_rpc_url("http://example.com".to_string()).is_err());
         assert!(set_evm_rpc_max_response_bytes(0).is_err());
+
+        let local_http = set_evm_rpc_url("http://127.0.0.1:18545".to_string())
+            .expect("localhost http rpc should be accepted for local development");
+        assert_eq!(local_http, "http://127.0.0.1:18545");
 
         let primary = set_evm_rpc_url("https://mainnet.base.org".to_string())
             .expect("primary rpc should accept https");
