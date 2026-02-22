@@ -102,6 +102,20 @@ struct InitArgs {
     evm_chain_id: Option<u64>,
 }
 
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct RetentionConfig {
+    jobs_max_age_secs: u64,
+    jobs_max_records: u64,
+    dedupe_max_age_secs: u64,
+    turns_max_age_secs: u64,
+    transitions_max_age_secs: u64,
+    tools_max_age_secs: u64,
+    inbox_max_age_secs: u64,
+    outbox_max_age_secs: u64,
+    maintenance_batch_size: u32,
+    maintenance_interval_secs: u64,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -244,6 +258,13 @@ fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, addr
         result.is_ok(),
         "set_inbox_contract_address_admin failed: {result:?}"
     );
+}
+
+fn set_retention_config(pic: &PocketIc, canister_id: Principal, config: RetentionConfig) {
+    let payload = encode_args((config,)).expect("failed to encode set_retention_config args");
+    let result: Result<RetentionConfig, String> =
+        call_update(pic, canister_id, "set_retention_config", payload);
+    assert!(result.is_ok(), "set_retention_config failed: {result:?}");
 }
 
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
@@ -414,41 +435,6 @@ fn drive_poll_inbox_with_wallet_sync_mocks(pic: &PocketIc, canister_id: Principa
     }
 
     panic!("poll inbox did not complete with wallet sync mocks in expected ticks");
-}
-
-#[cfg(not(feature = "pocketic_tests"))]
-#[test]
-#[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
-fn placeholder_concurrent_ticks_still_serialized() {
-    let _wasm = assert_wasm_artifact_present();
-}
-
-#[cfg(not(feature = "pocketic_tests"))]
-#[test]
-#[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
-fn placeholder_duplicate_ticks_are_idempotent_for_single_slot() {
-    let _wasm = assert_wasm_artifact_present();
-}
-
-#[cfg(not(feature = "pocketic_tests"))]
-#[test]
-#[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
-fn placeholder_post_upgrade_rearms_timer() {
-    let _wasm = assert_wasm_artifact_present();
-}
-
-#[cfg(not(feature = "pocketic_tests"))]
-#[test]
-#[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
-fn placeholder_low_cycles_mode_suppresses_non_essential_jobs() {
-    let _wasm = assert_wasm_artifact_present();
-}
-
-#[cfg(not(feature = "pocketic_tests"))]
-#[test]
-#[ignore = "Enable feature `pocketic_tests` and add a PocketIC runtime dependency to run"]
-fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
-    let _wasm = assert_wasm_artifact_present();
 }
 
 #[cfg(feature = "pocketic_tests")]
@@ -682,5 +668,66 @@ fn non_controller_cannot_mutate_scheduler_control_plane() {
     assert!(
         low_cycles_result.is_err(),
         "set_scheduler_low_cycles_mode should reject non-controller callers"
+    );
+}
+
+#[cfg(feature = "pocketic_tests")]
+#[test]
+fn high_volume_poll_inbox_history_stays_bounded_with_active_retention() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_only_poll_inbox(&pic, canister_id, 1);
+    set_retention_config(
+        &pic,
+        canister_id,
+        RetentionConfig {
+            jobs_max_age_secs: 2,
+            jobs_max_records: 48,
+            dedupe_max_age_secs: 2,
+            turns_max_age_secs: 7 * 24 * 60 * 60,
+            transitions_max_age_secs: 7 * 24 * 60 * 60,
+            tools_max_age_secs: 7 * 24 * 60 * 60,
+            inbox_max_age_secs: 14 * 24 * 60 * 60,
+            outbox_max_age_secs: 14 * 24 * 60 * 60,
+            maintenance_batch_size: 96,
+            maintenance_interval_secs: 1,
+        },
+    );
+
+    for _ in 0..180 {
+        pic.advance_time(Duration::from_secs(2));
+        pic.tick();
+    }
+
+    let runtime = get_scheduler_view(&pic, canister_id);
+    assert!(
+        runtime.next_job_seq >= 10,
+        "scheduler should continue producing jobs under sustained load"
+    );
+    assert!(
+        runtime.last_tick_error.is_none(),
+        "scheduler tick should remain healthy under sustained retention activity"
+    );
+
+    let jobs = list_scheduler_jobs(&pic, canister_id);
+    let poll_jobs = jobs
+        .iter()
+        .filter(|job| job.kind == TaskKind::PollInbox)
+        .collect::<Vec<_>>();
+    assert!(
+        !poll_jobs.is_empty(),
+        "poll-inbox jobs should remain queryable after retention compaction"
+    );
+    assert!(
+        poll_jobs.len() <= 60,
+        "retention should keep historical job volume bounded"
+    );
+    assert!(
+        poll_jobs.iter().any(|job| {
+            matches!(
+                job.status,
+                JobStatus::Succeeded | JobStatus::Skipped | JobStatus::TimedOut
+            )
+        }),
+        "scheduler should continue reaching terminal job states while retention runs"
     );
 }

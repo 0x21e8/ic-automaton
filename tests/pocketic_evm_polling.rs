@@ -24,6 +24,22 @@ struct InitArgs {
     ecdsa_key_name: String,
     inbox_contract_address: Option<String>,
     evm_chain_id: Option<u64>,
+    evm_rpc_url: Option<String>,
+    evm_confirmation_depth: Option<u64>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct RetentionConfig {
+    jobs_max_age_secs: u64,
+    jobs_max_records: u64,
+    dedupe_max_age_secs: u64,
+    turns_max_age_secs: u64,
+    transitions_max_age_secs: u64,
+    tools_max_age_secs: u64,
+    inbox_max_age_secs: u64,
+    outbox_max_age_secs: u64,
+    maintenance_batch_size: u32,
+    maintenance_interval_secs: u64,
 }
 
 #[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
@@ -104,20 +120,44 @@ fn assert_wasm_artifact_present() -> Vec<u8> {
 }
 
 fn with_backend_canister() -> (PocketIc, Principal) {
-    let pic = PocketIc::new();
-    let canister_id = pic.create_canister();
-    let wasm = assert_wasm_artifact_present();
-    let init_args = encode_args((InitArgs {
+    with_backend_canister_with_init(InitArgs {
         ecdsa_key_name: "dfx_test_key".to_string(),
         inbox_contract_address: None,
         evm_chain_id: Some(8453),
-    },))
-    .expect("failed to encode init args");
+        evm_rpc_url: None,
+        evm_confirmation_depth: None,
+    })
+}
+
+fn with_backend_canister_with_init(init: InitArgs) -> (PocketIc, Principal) {
+    let pic = PocketIc::new();
+    let canister_id = pic.create_canister();
+    let wasm = assert_wasm_artifact_present();
+    let init_args = encode_args((init,)).expect("failed to encode init args");
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
     pic.install_canister(canister_id, wasm, init_args, None);
 
     (pic, canister_id)
+}
+
+#[test]
+fn init_args_apply_confirmation_depth_and_chain_for_evm_route_state() {
+    let (pic, canister_id) = with_backend_canister_with_init(InitArgs {
+        ecdsa_key_name: "dfx_test_key".to_string(),
+        inbox_contract_address: Some("0x2222222222222222222222222222222222222222".to_string()),
+        evm_chain_id: Some(31_337),
+        evm_rpc_url: Some("http://127.0.0.1:18545".to_string()),
+        evm_confirmation_depth: Some(0),
+    });
+
+    let route = get_evm_route_state_view(&pic, canister_id);
+    assert_eq!(route.chain_id, 31_337);
+    assert_eq!(route.confirmation_depth, 0);
+    assert_eq!(
+        route.inbox_contract_address.as_deref().unwrap_or_default(),
+        "0x2222222222222222222222222222222222222222"
+    );
 }
 
 fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload: Vec<u8>) -> T
@@ -193,6 +233,13 @@ fn configure_only_poll_inbox(pic: &PocketIc, canister_id: Principal, interval_se
     set_task_enabled(pic, canister_id, TaskKind::PollInbox, true);
 }
 
+fn set_retention_config(pic: &PocketIc, canister_id: Principal, config: RetentionConfig) {
+    let payload = encode_args((config,)).expect("failed to encode set_retention_config args");
+    let result: Result<RetentionConfig, String> =
+        call_update(pic, canister_id, "set_retention_config", payload);
+    assert!(result.is_ok(), "set_retention_config failed: {result:?}");
+}
+
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
     call_query(
         pic,
@@ -250,6 +297,46 @@ fn make_tx_hash(id: u64) -> String {
     format!("0x{id:064x}")
 }
 
+fn encode_u256_word(value: u128) -> String {
+    format!("{value:064x}")
+}
+
+fn encode_message_queued_payload(
+    sender: &str,
+    message: &str,
+    usdc_amount: u128,
+    eth_amount: u128,
+) -> String {
+    let sender = sender.trim().to_ascii_lowercase();
+    let sender_hex = sender.trim_start_matches("0x");
+    assert_eq!(sender_hex.len(), 40, "sender must be a 20-byte hex address");
+    assert!(
+        sender_hex
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit()),
+        "sender address must be hex"
+    );
+
+    let message_hex = hex::encode(message.as_bytes());
+    let padded_message_hex = if message_hex.len().is_multiple_of(64) {
+        message_hex.clone()
+    } else {
+        let padding = "0".repeat(64 - (message_hex.len() % 64));
+        format!("{message_hex}{padding}")
+    };
+
+    format!(
+        "0x{:0>64}{}{}{}{}{}",
+        sender_hex,
+        encode_u256_word(128),
+        encode_u256_word(usdc_amount),
+        encode_u256_word(eth_amount),
+        encode_u256_word(message.len() as u128),
+        padded_message_hex,
+    )
+}
+
 fn rpc_log(
     block_number: u64,
     log_index: u64,
@@ -290,6 +377,16 @@ fn rpc_response_body_for_request(
             "jsonrpc":"2.0",
             "id":1,
             "result": logs
+        }),
+        "eth_getBalance" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x0"
+        }),
+        "eth_call" => json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x0000000000000000000000000000000000000000000000000000000000000000"
         }),
         unsupported => {
             panic!("unsupported canister http method in test: {unsupported}");
@@ -367,6 +464,8 @@ fn poll_inbox_ignores_route_mismatch_and_accepts_match_without_registration() {
         configure_route_for_polling(&pic, canister_id);
     let other_topic = address_to_topic("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let other_contract = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let matched_sender = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+    let matched_message = "who are you?";
 
     let logs = vec![
         rpc_log(
@@ -391,7 +490,7 @@ fn poll_inbox_ignores_route_mismatch_and_accepts_match_without_registration() {
             &make_tx_hash(3),
             &contract_address,
             &automaton_topic,
-            "0x0a",
+            &encode_message_queued_payload(matched_sender, matched_message, 0, 500_000_000_000_000),
         ),
     ];
 
@@ -405,9 +504,13 @@ fn poll_inbox_ignores_route_mismatch_and_accepts_match_without_registration() {
     );
     let messages = list_inbox_messages(&pic, canister_id);
     assert_eq!(messages.len(), 1, "exactly one message should be staged");
-    assert!(
-        messages[0].body.contains(&make_tx_hash(3)),
-        "the matched log should be preserved as inbox body"
+    assert_eq!(
+        messages[0].body, matched_message,
+        "staged inbox body should contain decoded MessageQueued.message"
+    );
+    assert_eq!(
+        messages[0].posted_by, matched_sender,
+        "staged inbox sender should contain decoded MessageQueued.sender"
     );
 }
 
@@ -424,7 +527,12 @@ fn poll_inbox_dedupes_duplicate_tx_hash_and_log_index() {
         &duplicate_tx,
         &contract_address,
         &automaton_topic,
-        "0x1111",
+        &encode_message_queued_payload(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "duplicate-1",
+            0,
+            500_000_000_000_000,
+        ),
     )];
     pic.advance_time(Duration::from_secs(31));
     drive_poll_inbox_with_http_mocks(&pic, canister_id, 2, &first_logs);
@@ -438,7 +546,12 @@ fn poll_inbox_dedupes_duplicate_tx_hash_and_log_index() {
         &duplicate_tx,
         &contract_address,
         &automaton_topic,
-        "0x2222",
+        &encode_message_queued_payload(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "duplicate-2",
+            0,
+            500_000_000_000_000,
+        ),
     )];
     pic.advance_time(Duration::from_secs(31));
     drive_poll_inbox_with_http_mocks(&pic, canister_id, 3, &duplicate_logs);
@@ -492,8 +605,8 @@ fn poll_inbox_stages_default_and_override_pricing_payload_variants() {
     let (_automaton, contract_address, automaton_topic) =
         configure_route_for_polling(&pic, canister_id);
 
-    let default_payload = "0x64656661756c742d70726963696e67";
-    let override_payload = "0x6f766572726964652d70726963696e67";
+    let default_message = "default pricing";
+    let override_message = "override pricing";
     let logs = vec![
         rpc_log(
             0,
@@ -501,7 +614,12 @@ fn poll_inbox_stages_default_and_override_pricing_payload_variants() {
             &make_tx_hash(70),
             &contract_address,
             &automaton_topic,
-            default_payload,
+            &encode_message_queued_payload(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                default_message,
+                1_000_000,
+                500_000_000_000_000,
+            ),
         ),
         rpc_log(
             0,
@@ -509,7 +627,12 @@ fn poll_inbox_stages_default_and_override_pricing_payload_variants() {
             &make_tx_hash(71),
             &contract_address,
             &automaton_topic,
-            override_payload,
+            &encode_message_queued_payload(
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                override_message,
+                3_000_000,
+                2_000_000_000_000_000,
+            ),
         ),
     ];
 
@@ -524,11 +647,82 @@ fn poll_inbox_stages_default_and_override_pricing_payload_variants() {
         .map(|message| message.body)
         .collect::<Vec<_>>();
     assert!(
-        bodies.iter().any(|body| body.contains(default_payload)),
-        "default-pricing payload should be preserved in staged inbox body"
+        bodies.iter().any(|body| body == default_message),
+        "default-pricing payload should decode into staged inbox message body"
     );
     assert!(
-        bodies.iter().any(|body| body.contains(override_payload)),
-        "override-pricing payload should be preserved in staged inbox body"
+        bodies.iter().any(|body| body == override_message),
+        "override-pricing payload should decode into staged inbox message body"
+    );
+}
+
+#[test]
+fn poll_inbox_handles_high_volume_burst_with_retention_active() {
+    let (pic, canister_id) = with_backend_canister();
+    let (_automaton, contract_address, automaton_topic) =
+        configure_route_for_polling(&pic, canister_id);
+    set_retention_config(
+        &pic,
+        canister_id,
+        RetentionConfig {
+            jobs_max_age_secs: 2,
+            jobs_max_records: 64,
+            dedupe_max_age_secs: 2,
+            turns_max_age_secs: 7 * 24 * 60 * 60,
+            transitions_max_age_secs: 7 * 24 * 60 * 60,
+            tools_max_age_secs: 7 * 24 * 60 * 60,
+            inbox_max_age_secs: 14 * 24 * 60 * 60,
+            outbox_max_age_secs: 14 * 24 * 60 * 60,
+            maintenance_batch_size: 128,
+            maintenance_interval_secs: 1,
+        },
+    );
+
+    let burst_logs = (0..12u64)
+        .map(|idx| {
+            rpc_log(
+                0,
+                idx,
+                &make_tx_hash(1_000 + idx),
+                &contract_address,
+                &automaton_topic,
+                &encode_message_queued_payload(
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &format!("phase3-burst-message-{idx:03}"),
+                    0,
+                    500_000_000_000_000,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    pic.advance_time(Duration::from_secs(31));
+    drive_poll_inbox_with_http_mocks(&pic, canister_id, 5, &burst_logs);
+
+    for step in 0..30u64 {
+        pic.advance_time(Duration::from_secs(31));
+        drive_poll_inbox_with_http_mocks(&pic, canister_id, 6 + step, &[]);
+    }
+
+    let jobs = list_scheduler_jobs(&pic, canister_id);
+    let poll_jobs = jobs
+        .iter()
+        .filter(|job| job.kind == TaskKind::PollInbox)
+        .collect::<Vec<_>>();
+    assert!(
+        poll_jobs.len() <= 80,
+        "retention should bound high-volume poll job history"
+    );
+    assert!(
+        latest_poll_job(&jobs)
+            .map(|job| job.status == JobStatus::Succeeded)
+            .unwrap_or(false),
+        "polling should keep succeeding under sustained high-volume scheduling"
+    );
+
+    let stats = get_inbox_stats(&pic, canister_id);
+    assert_eq!(
+        stats.total_messages, 12,
+        "all burst logs should be ingested exactly once"
     );
 }

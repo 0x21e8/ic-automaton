@@ -180,6 +180,18 @@ pub fn handle_http_request(request: HttpRequest<'_>) -> HttpResponse<'static> {
     })
 }
 
+fn http_update_caller() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return ic_cdk::api::msg_caller().to_text();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "2vxsx-fae".to_string()
+    }
+}
+
 pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateResponse<'static> {
     let path = match request.get_path() {
         Ok(path) => path,
@@ -211,7 +223,7 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let payload = parse_inbox_post_request(request.body());
             match payload {
                 Ok(body) => {
-                    let caller = ic_cdk::api::msg_caller().to_text();
+                    let caller = http_update_caller();
                     match stable::post_inbox_message(body.message, caller) {
                         Ok(id) => {
                             log!(HttpLogPriority::Info, "http_inbox_posted id={}", id);
@@ -580,17 +592,14 @@ fn parse_inbox_post_request(body: &[u8]) -> Result<InboxPostRequest, String> {
     }
 
     if let Ok(parsed) = serde_json::from_slice::<InboxPostRequest>(body) {
-        return Ok(parsed);
+        return Ok(InboxPostRequest {
+            message: stable::normalize_inbox_body(&parsed.message)?,
+        });
     }
 
     let as_text = std::str::from_utf8(body).map_err(|_| "request body is not valid utf-8")?;
-    let message = as_text.trim();
-    if message.is_empty() {
-        return Err("message body cannot be empty".to_string());
-    }
-
     Ok(InboxPostRequest {
-        message: message.to_string(),
+        message: stable::normalize_inbox_body(as_text)?,
     })
 }
 
@@ -995,6 +1004,48 @@ mod tests {
                 .map(|entries| entries.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn post_inbox_accepts_oversized_burst_payloads_with_truncation() {
+        init_certification();
+        stable::init_storage();
+        let oversized = "z".repeat(stable::MAX_INBOX_BODY_CHARS.saturating_add(512));
+
+        for idx in 0..120usize {
+            let request: HttpUpdateRequest = HttpRequest::post("/api/inbox")
+                .with_headers(vec![(
+                    "content-type".to_string(),
+                    CONTENT_TYPE_JSON.to_string(),
+                )])
+                .with_body(
+                    serde_json::json!({
+                        "message": format!("{oversized}-{idx:03}"),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+                .build_update();
+            let response = handle_http_request_update(request);
+            assert_eq!(
+                response.status_code(),
+                StatusCode::OK,
+                "burst payload index {idx} should be accepted and normalized"
+            );
+        }
+
+        let stats = stable::inbox_stats();
+        assert_eq!(
+            stats.total_messages, 120,
+            "oversized burst ingress should be persisted without dropping requests"
+        );
+
+        let messages = stable::list_inbox_messages(120);
+        assert_eq!(messages.len(), 120);
+        assert!(messages.iter().all(|message| {
+            message.body.chars().count() <= stable::MAX_INBOX_BODY_CHARS
+                && message.body.contains("[truncated")
+        }));
     }
 
     #[test]

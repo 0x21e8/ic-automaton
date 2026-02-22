@@ -22,6 +22,7 @@ const WASM_PATHS: &[&str] = &[
 struct SnapshotEnvelope {
     runtime: Value,
     scheduler: Value,
+    storage_growth: Value,
     cycles: Value,
     inbox_stats: Value,
     inbox_messages: Vec<Value>,
@@ -311,6 +312,11 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
         .get("total_messages")
         .and_then(Value::as_u64)
         .unwrap_or_default();
+    let tracked_entries = snapshot
+        .storage_growth
+        .get("tracked_entry_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
     let cycle_total = snapshot
         .cycles
         .get("total_cycles")
@@ -328,6 +334,10 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
     assert!(
         total_messages >= 1,
         "snapshot should include at least one inbox message after posting"
+    );
+    assert!(
+        tracked_entries >= 1,
+        "snapshot should expose tracked storage entry trend metrics"
     );
     assert!(
         snapshot

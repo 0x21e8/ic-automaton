@@ -1,12 +1,14 @@
 use crate::domain::types::{
     AgentEvent, AgentState, ConversationEntry, ConversationLog, ConversationSummary,
     CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, ObservabilitySnapshot,
-    OutboxMessage, OutboxStats, PromptLayer, PromptLayerView, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SkillRecord, StorageGrowthMetrics,
-    SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
-    TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord, WalletBalanceSnapshot,
-    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, MemoryRollup,
+    ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
+    RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob,
+    SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StorageGrowthMetrics,
+    StoragePressureLevel, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 use crate::prompt;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -38,12 +40,22 @@ const INBOX_SEQ_KEY: &str = "inbox.seq";
 const OUTBOX_SEQ_KEY: &str = "outbox.seq";
 const HTTP_ALLOWLIST_INITIALIZED_KEY: &str = "http.allowlist.initialized";
 const CYCLE_BALANCE_SAMPLES_KEY: &str = "cycles.balance.samples";
+const STORAGE_GROWTH_SAMPLES_KEY: &str = "storage.growth.samples";
+const RETENTION_CONFIG_KEY: &str = "retention.config";
+const RETENTION_RUNTIME_KEY: &str = "retention.runtime";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
 const CYCLES_BURN_MOVING_WINDOW_SECONDS: u64 = 15 * 60;
 const CYCLES_BURN_MOVING_WINDOW_NS: u64 = CYCLES_BURN_MOVING_WINDOW_SECONDS * 1_000_000_000;
 const CYCLES_BURN_MAX_SAMPLES: usize = 450;
+const STORAGE_GROWTH_TREND_WINDOW_SECONDS: u64 = 6 * 60 * 60;
+const STORAGE_GROWTH_TREND_WINDOW_NS: u64 = STORAGE_GROWTH_TREND_WINDOW_SECONDS * 1_000_000_000;
+const STORAGE_GROWTH_MAX_SAMPLES: usize = 360;
+const STORAGE_PRESSURE_ELEVATED_PERCENT: u8 = 70;
+const STORAGE_PRESSURE_HIGH_PERCENT: u8 = 85;
+const STORAGE_PRESSURE_CRITICAL_PERCENT: u8 = 95;
+const STORAGE_GROWTH_WARNING_ENTRIES_PER_HOUR: i64 = 5_000;
 const CYCLES_USD_PER_TRILLION_ESTIMATE: f64 = 1.35;
 const MAX_CONVERSATION_ENTRIES_PER_SENDER: usize = 20;
 const MAX_CONVERSATION_SENDERS: usize = 200;
@@ -55,6 +67,17 @@ pub const MAX_INBOX_BODY_CHARS: usize = 4_096;
 const MAX_TURN_INNER_DIALOGUE_CHARS: usize = 12_000;
 const MAX_TOOL_ARGS_JSON_CHARS: usize = 4_000;
 const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
+const MIN_RETENTION_BATCH_SIZE: u32 = 1;
+const MAX_RETENTION_BATCH_SIZE: u32 = 1_000;
+const MIN_RETENTION_INTERVAL_SECS: u64 = 1;
+const SUMMARY_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+const MEMORY_ROLLUP_STALE_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+const MAX_SESSION_SUMMARIES: usize = 2_000;
+const MAX_TURN_WINDOW_SUMMARIES: usize = 1_000;
+const MAX_MEMORY_ROLLUPS: usize = 128;
+const MAX_TURN_SUMMARY_ERRORS: usize = 5;
+const MAX_MEMORY_ROLLUP_SOURCE_KEYS: usize = 10;
+const MAX_MEMORY_ROLLUP_FACTS_PER_NAMESPACE: usize = 5;
 #[cfg(test)]
 const MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS: usize = 120;
 const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
@@ -116,6 +139,12 @@ struct CycleBalanceSample {
     captured_at_ns: u64,
     total_cycles: u128,
     liquid_cycles: u128,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StorageGrowthSample {
+    captured_at_ns: u64,
+    tracked_entries: u64,
 }
 
 fn survival_operation_runtime_key(operation: &SurvivalOperationClass) -> String {
@@ -318,6 +347,26 @@ thread_local! {
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(19)))
     ));
+    static RETENTION_RUNTIME_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(20)))
+    ));
+    static SESSION_SUMMARY_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(21)))
+    ));
+    static TURN_WINDOW_SUMMARY_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(22)))
+    ));
+    static MEMORY_ROLLUP_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(23)))
+    ));
 }
 
 pub fn init_storage() {
@@ -354,6 +403,7 @@ pub fn init_storage() {
         save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, true);
     }
     init_scheduler_defaults(now_ns());
+    init_retention_defaults(now_ns());
 }
 
 pub fn init_scheduler_defaults(now_ns: u64) {
@@ -388,6 +438,336 @@ pub fn init_scheduler_defaults(now_ns: u64) {
             );
         }
     }
+}
+
+fn init_retention_defaults(now_ns: u64) {
+    if RETENTION_RUNTIME_MAP
+        .with(|map| map.borrow().get(&RETENTION_CONFIG_KEY.to_string()))
+        .is_none()
+    {
+        RETENTION_RUNTIME_MAP.with(|map| {
+            map.borrow_mut().insert(
+                RETENTION_CONFIG_KEY.to_string(),
+                encode_json(&RetentionConfig::default()),
+            );
+        });
+    }
+
+    if RETENTION_RUNTIME_MAP
+        .with(|map| map.borrow().get(&RETENTION_RUNTIME_KEY.to_string()))
+        .is_none()
+    {
+        RETENTION_RUNTIME_MAP.with(|map| {
+            map.borrow_mut().insert(
+                RETENTION_RUNTIME_KEY.to_string(),
+                encode_json(&RetentionMaintenanceRuntime {
+                    next_run_after_ns: now_ns,
+                    ..RetentionMaintenanceRuntime::default()
+                }),
+            );
+        });
+    }
+}
+
+pub fn retention_config() -> RetentionConfig {
+    RETENTION_RUNTIME_MAP
+        .with(|map| map.borrow().get(&RETENTION_CONFIG_KEY.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+        .unwrap_or_default()
+}
+
+pub fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, String> {
+    if !(MIN_RETENTION_BATCH_SIZE..=MAX_RETENTION_BATCH_SIZE)
+        .contains(&config.maintenance_batch_size)
+    {
+        return Err(format!(
+            "maintenance_batch_size must be in range {}..={}",
+            MIN_RETENTION_BATCH_SIZE, MAX_RETENTION_BATCH_SIZE
+        ));
+    }
+    if config.maintenance_interval_secs < MIN_RETENTION_INTERVAL_SECS {
+        return Err(format!(
+            "maintenance_interval_secs must be at least {}",
+            MIN_RETENTION_INTERVAL_SECS
+        ));
+    }
+
+    RETENTION_RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(RETENTION_CONFIG_KEY.to_string(), encode_json(&config));
+    });
+    Ok(config)
+}
+
+pub fn retention_maintenance_runtime() -> RetentionMaintenanceRuntime {
+    RETENTION_RUNTIME_MAP
+        .with(|map| map.borrow().get(&RETENTION_RUNTIME_KEY.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+        .unwrap_or_default()
+}
+
+fn save_retention_maintenance_runtime(runtime: &RetentionMaintenanceRuntime) {
+    RETENTION_RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(RETENTION_RUNTIME_KEY.to_string(), encode_json(runtime));
+    });
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionPruneStats {
+    pub deleted_jobs: u32,
+    pub deleted_dedupe: u32,
+    pub deleted_inbox: u32,
+    pub deleted_outbox: u32,
+    pub deleted_turns: u32,
+    pub deleted_transitions: u32,
+    pub deleted_tools: u32,
+    pub generated_session_summaries: u32,
+    pub generated_turn_window_summaries: u32,
+    pub generated_memory_rollups: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SessionSummaryAccumulator {
+    sender: String,
+    window_start_ns: u64,
+    window_end_ns: u64,
+    source_count: u32,
+    inbox_message_count: u32,
+    outbox_message_count: u32,
+    inbox_preview: String,
+    outbox_preview: String,
+}
+
+#[derive(Clone, Debug)]
+struct TurnSummaryAccumulator {
+    window_start_ns: u64,
+    window_end_ns: u64,
+    source_count: u32,
+    turn_count: u32,
+    transition_count: u32,
+    tool_call_count: u32,
+    succeeded_turn_count: u32,
+    failed_turn_count: u32,
+    tool_success_count: u32,
+    tool_failure_count: u32,
+    top_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct InboxCandidate {
+    key: String,
+    message: InboxMessage,
+}
+
+#[derive(Clone, Debug)]
+struct OutboxCandidate {
+    key: String,
+    message: OutboxMessage,
+}
+
+#[derive(Clone, Debug)]
+struct TurnCandidate {
+    key: String,
+    turn: TurnRecord,
+}
+
+#[derive(Clone, Debug)]
+struct TransitionCandidate {
+    key: String,
+    transition: TransitionLogRecord,
+}
+
+pub fn run_retention_maintenance_if_due(now_ns: u64) -> Option<RetentionPruneStats> {
+    let runtime = retention_maintenance_runtime();
+    if runtime.next_run_after_ns > now_ns {
+        return None;
+    }
+    Some(run_retention_maintenance_once(now_ns))
+}
+
+pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
+    let config = retention_config();
+    let mut runtime = retention_maintenance_runtime();
+    runtime.last_started_ns = Some(now_ns);
+    runtime.last_finished_ns = None;
+    runtime.last_error = None;
+    save_retention_maintenance_runtime(&runtime);
+
+    let keep_from_seq = oldest_job_seq_to_keep(config.jobs_max_records);
+    let jobs_budget = usize::try_from(config.maintenance_batch_size).unwrap_or(usize::MAX);
+    let jobs_cutoff_ns =
+        now_ns.saturating_sub(config.jobs_max_age_secs.saturating_mul(1_000_000_000));
+    let dedupe_cutoff_ns =
+        now_ns.saturating_sub(config.dedupe_max_age_secs.saturating_mul(1_000_000_000));
+    let inbox_cutoff_ns =
+        now_ns.saturating_sub(config.inbox_max_age_secs.saturating_mul(1_000_000_000));
+    let outbox_cutoff_ns =
+        now_ns.saturating_sub(config.outbox_max_age_secs.saturating_mul(1_000_000_000));
+    let turns_cutoff_ns =
+        now_ns.saturating_sub(config.turns_max_age_secs.saturating_mul(1_000_000_000));
+    let transitions_cutoff_ns = now_ns.saturating_sub(
+        config
+            .transitions_max_age_secs
+            .saturating_mul(1_000_000_000),
+    );
+    let tools_cutoff_ns =
+        now_ns.saturating_sub(config.tools_max_age_secs.saturating_mul(1_000_000_000));
+    let protected_inbox_ids = protected_conversation_inbox_ids();
+
+    let (job_candidates, next_job_cursor, jobs_reached_end) = collect_prunable_jobs(
+        runtime.job_scan_cursor.as_deref(),
+        jobs_budget,
+        jobs_cutoff_ns,
+        keep_from_seq,
+        config.jobs_max_records,
+    );
+    let deleted_jobs = delete_job_candidates(&job_candidates);
+
+    let (dedupe_candidates, next_dedupe_cursor, dedupe_reached_end) = collect_prunable_dedupe(
+        runtime.dedupe_scan_cursor.as_deref(),
+        jobs_budget,
+        dedupe_cutoff_ns,
+    );
+    let deleted_dedupe = delete_dedupe_candidates(&dedupe_candidates);
+
+    let (inbox_candidates, next_inbox_cursor, inbox_reached_end) = collect_prunable_inbox(
+        runtime.inbox_scan_cursor.as_deref(),
+        jobs_budget,
+        inbox_cutoff_ns,
+        &protected_inbox_ids,
+    );
+    let (outbox_candidates, next_outbox_cursor, outbox_reached_end) = collect_prunable_outbox(
+        runtime.outbox_scan_cursor.as_deref(),
+        jobs_budget,
+        outbox_cutoff_ns,
+        &protected_inbox_ids,
+    );
+
+    let generated_session_summaries =
+        summarize_inbox_outbox_candidates(&inbox_candidates, &outbox_candidates, now_ns);
+    let deleted_inbox = delete_inbox_candidates(&inbox_candidates);
+    let deleted_outbox = delete_outbox_candidates(&outbox_candidates);
+
+    let (turn_candidates, next_turn_cursor, turn_reached_end) = collect_prunable_turns(
+        runtime.turn_scan_cursor.as_deref(),
+        jobs_budget,
+        turns_cutoff_ns,
+    );
+    let (transition_candidates, next_transition_cursor, transition_reached_end) =
+        collect_prunable_transitions(
+            runtime.transition_scan_cursor.as_deref(),
+            jobs_budget,
+            transitions_cutoff_ns,
+        );
+
+    let (generated_turn_window_summaries, generated_tools_to_delete) =
+        summarize_turn_and_transition_candidates(
+            &turn_candidates,
+            &transition_candidates,
+            tools_cutoff_ns,
+            now_ns,
+        );
+    let deleted_turns = delete_turn_candidates(&turn_candidates);
+    let deleted_transitions = delete_transition_candidates(&transition_candidates);
+    let deleted_tools = delete_tool_candidates(&generated_tools_to_delete);
+
+    let generated_memory_rollups = update_memory_rollups(now_ns);
+
+    runtime.job_scan_cursor = if jobs_reached_end {
+        None
+    } else {
+        next_job_cursor
+    };
+    runtime.dedupe_scan_cursor = if dedupe_reached_end {
+        None
+    } else {
+        next_dedupe_cursor
+    };
+    runtime.inbox_scan_cursor = if inbox_reached_end {
+        None
+    } else {
+        next_inbox_cursor
+    };
+    runtime.outbox_scan_cursor = if outbox_reached_end {
+        None
+    } else {
+        next_outbox_cursor
+    };
+    runtime.turn_scan_cursor = if turn_reached_end {
+        None
+    } else {
+        next_turn_cursor
+    };
+    runtime.transition_scan_cursor = if transition_reached_end {
+        None
+    } else {
+        next_transition_cursor
+    };
+    runtime.last_deleted_jobs = deleted_jobs;
+    runtime.last_deleted_dedupe = deleted_dedupe;
+    runtime.last_deleted_inbox = deleted_inbox;
+    runtime.last_deleted_outbox = deleted_outbox;
+    runtime.last_deleted_turns = deleted_turns;
+    runtime.last_deleted_transitions = deleted_transitions;
+    runtime.last_deleted_tools = deleted_tools;
+    runtime.last_generated_session_summaries = generated_session_summaries;
+    runtime.last_generated_turn_window_summaries = generated_turn_window_summaries;
+    runtime.last_generated_memory_rollups = generated_memory_rollups;
+    runtime.last_finished_ns = Some(now_ns);
+    runtime.next_run_after_ns = now_ns.saturating_add(
+        config
+            .maintenance_interval_secs
+            .saturating_mul(1_000_000_000),
+    );
+    runtime.retention_progress_percent = retention_progress_percent(&runtime);
+    runtime.summarization_progress_percent = summarization_progress_percent(&runtime);
+    save_retention_maintenance_runtime(&runtime);
+
+    RetentionPruneStats {
+        deleted_jobs,
+        deleted_dedupe,
+        deleted_inbox,
+        deleted_outbox,
+        deleted_turns,
+        deleted_transitions,
+        deleted_tools,
+        generated_session_summaries,
+        generated_turn_window_summaries,
+        generated_memory_rollups,
+    }
+}
+
+fn retention_progress_percent(runtime: &RetentionMaintenanceRuntime) -> u8 {
+    if runtime.job_scan_cursor.is_none() && runtime.dedupe_scan_cursor.is_none() {
+        return 100;
+    }
+    if runtime.last_deleted_jobs > 0 || runtime.last_deleted_dedupe > 0 {
+        return 50;
+    }
+    0
+}
+
+fn summarization_progress_percent(runtime: &RetentionMaintenanceRuntime) -> u8 {
+    if runtime.inbox_scan_cursor.is_none()
+        && runtime.outbox_scan_cursor.is_none()
+        && runtime.turn_scan_cursor.is_none()
+        && runtime.transition_scan_cursor.is_none()
+    {
+        return 100;
+    }
+    if runtime.last_deleted_inbox > 0
+        || runtime.last_deleted_outbox > 0
+        || runtime.last_deleted_turns > 0
+        || runtime.last_deleted_transitions > 0
+        || runtime.last_deleted_tools > 0
+        || runtime.last_generated_session_summaries > 0
+        || runtime.last_generated_turn_window_summaries > 0
+        || runtime.last_generated_memory_rollups > 0
+    {
+        return 50;
+    }
+    0
 }
 
 fn seed_default_prompt_layers() {
@@ -536,6 +916,296 @@ pub fn list_conversation_summaries() -> Vec<ConversationSummary> {
             .then_with(|| left.sender.cmp(&right.sender))
     });
     summaries
+}
+
+fn summary_window_start_ns(timestamp_ns: u64) -> u64 {
+    timestamp_ns.saturating_sub(timestamp_ns % SUMMARY_WINDOW_NS)
+}
+
+fn session_summary_key(sender: &str, window_start_ns: u64) -> String {
+    format!(
+        "session:{window_start_ns:020}:{}",
+        normalize_conversation_sender(sender)
+    )
+}
+
+fn turn_window_summary_key(window_start_ns: u64) -> String {
+    format!("turn-window:{window_start_ns:020}")
+}
+
+fn accumulate_error(errors: &mut Vec<String>, error: Option<&str>) {
+    let Some(error) = error else {
+        return;
+    };
+    let normalized = error.trim();
+    if normalized.is_empty() {
+        return;
+    }
+    if errors.iter().any(|existing| existing == normalized) {
+        return;
+    }
+    if errors.len() >= MAX_TURN_SUMMARY_ERRORS {
+        return;
+    }
+    errors.push(normalized.to_string());
+}
+
+fn merge_top_errors(left: &mut Vec<String>, right: &[String]) {
+    for error in right {
+        accumulate_error(left, Some(error.as_str()));
+        if left.len() >= MAX_TURN_SUMMARY_ERRORS {
+            break;
+        }
+    }
+}
+
+fn upsert_session_summary(acc: SessionSummaryAccumulator, now_ns: u64) {
+    let key = session_summary_key(&acc.sender, acc.window_start_ns);
+    let mut merged = SESSION_SUMMARY_MAP
+        .with(|map| map.borrow().get(&key))
+        .and_then(|payload| read_json::<SessionSummary>(Some(payload.as_slice())))
+        .unwrap_or(SessionSummary {
+            sender: acc.sender.clone(),
+            window_start_ns: acc.window_start_ns,
+            window_end_ns: acc.window_end_ns,
+            source_count: 0,
+            inbox_message_count: 0,
+            outbox_message_count: 0,
+            inbox_preview: String::new(),
+            outbox_preview: String::new(),
+            generated_at_ns: now_ns,
+        });
+
+    merged.window_end_ns = merged.window_end_ns.max(acc.window_end_ns);
+    merged.source_count = merged.source_count.saturating_add(acc.source_count);
+    merged.inbox_message_count = merged
+        .inbox_message_count
+        .saturating_add(acc.inbox_message_count);
+    merged.outbox_message_count = merged
+        .outbox_message_count
+        .saturating_add(acc.outbox_message_count);
+    if !acc.inbox_preview.is_empty() {
+        merged.inbox_preview = acc.inbox_preview;
+    }
+    if !acc.outbox_preview.is_empty() {
+        merged.outbox_preview = acc.outbox_preview;
+    }
+    merged.generated_at_ns = now_ns;
+
+    SESSION_SUMMARY_MAP.with(|map| {
+        map.borrow_mut().insert(key, encode_json(&merged));
+    });
+    enforce_session_summary_cap();
+}
+
+fn upsert_turn_window_summary(acc: TurnSummaryAccumulator, now_ns: u64) {
+    let key = turn_window_summary_key(acc.window_start_ns);
+    let mut merged = TURN_WINDOW_SUMMARY_MAP
+        .with(|map| map.borrow().get(&key))
+        .and_then(|payload| read_json::<TurnWindowSummary>(Some(payload.as_slice())))
+        .unwrap_or(TurnWindowSummary {
+            window_start_ns: acc.window_start_ns,
+            window_end_ns: acc.window_end_ns,
+            source_count: 0,
+            turn_count: 0,
+            transition_count: 0,
+            tool_call_count: 0,
+            succeeded_turn_count: 0,
+            failed_turn_count: 0,
+            tool_success_count: 0,
+            tool_failure_count: 0,
+            top_errors: Vec::new(),
+            generated_at_ns: now_ns,
+        });
+
+    merged.window_end_ns = merged.window_end_ns.max(acc.window_end_ns);
+    merged.source_count = merged.source_count.saturating_add(acc.source_count);
+    merged.turn_count = merged.turn_count.saturating_add(acc.turn_count);
+    merged.transition_count = merged.transition_count.saturating_add(acc.transition_count);
+    merged.tool_call_count = merged.tool_call_count.saturating_add(acc.tool_call_count);
+    merged.succeeded_turn_count = merged
+        .succeeded_turn_count
+        .saturating_add(acc.succeeded_turn_count);
+    merged.failed_turn_count = merged
+        .failed_turn_count
+        .saturating_add(acc.failed_turn_count);
+    merged.tool_success_count = merged
+        .tool_success_count
+        .saturating_add(acc.tool_success_count);
+    merged.tool_failure_count = merged
+        .tool_failure_count
+        .saturating_add(acc.tool_failure_count);
+    merge_top_errors(&mut merged.top_errors, &acc.top_errors);
+    merged.generated_at_ns = now_ns;
+
+    TURN_WINDOW_SUMMARY_MAP.with(|map| {
+        map.borrow_mut().insert(key, encode_json(&merged));
+    });
+    enforce_turn_window_summary_cap();
+}
+
+fn enforce_session_summary_cap() {
+    let current_len = SESSION_SUMMARY_MAP.with(|map| map.borrow().len() as usize);
+    if current_len <= MAX_SESSION_SUMMARIES {
+        return;
+    }
+    let remove_count = current_len.saturating_sub(MAX_SESSION_SUMMARIES);
+    let keys = SESSION_SUMMARY_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .take(remove_count)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>()
+    });
+    SESSION_SUMMARY_MAP.with(|map| {
+        let mut summaries = map.borrow_mut();
+        for key in keys {
+            summaries.remove(&key);
+        }
+    });
+}
+
+fn enforce_turn_window_summary_cap() {
+    let current_len = TURN_WINDOW_SUMMARY_MAP.with(|map| map.borrow().len() as usize);
+    if current_len <= MAX_TURN_WINDOW_SUMMARIES {
+        return;
+    }
+    let remove_count = current_len.saturating_sub(MAX_TURN_WINDOW_SUMMARIES);
+    let keys = TURN_WINDOW_SUMMARY_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .take(remove_count)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>()
+    });
+    TURN_WINDOW_SUMMARY_MAP.with(|map| {
+        let mut summaries = map.borrow_mut();
+        for key in keys {
+            summaries.remove(&key);
+        }
+    });
+}
+
+fn enforce_memory_rollup_cap() {
+    let len = MEMORY_ROLLUP_MAP.with(|map| map.borrow().len() as usize);
+    if len <= MAX_MEMORY_ROLLUPS {
+        return;
+    }
+
+    let mut rollups = MEMORY_ROLLUP_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| {
+                read_json::<MemoryRollup>(Some(entry.value().as_slice()))
+                    .map(|rollup| (entry.key().clone(), rollup.generated_at_ns))
+            })
+            .collect::<Vec<_>>()
+    });
+    rollups.sort_by_key(|(_key, generated_at_ns)| *generated_at_ns);
+    let remove_count = len.saturating_sub(MAX_MEMORY_ROLLUPS);
+    let keys = rollups
+        .into_iter()
+        .take(remove_count)
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+
+    MEMORY_ROLLUP_MAP.with(|map| {
+        let mut rollup_map = map.borrow_mut();
+        for key in keys {
+            rollup_map.remove(&key);
+        }
+    });
+}
+
+pub fn list_session_summaries(limit: usize) -> Vec<SessionSummary> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let keep = limit.min(MAX_OBSERVABILITY_LIMIT);
+    SESSION_SUMMARY_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .rev()
+            .take(keep)
+            .filter_map(|entry| read_json::<SessionSummary>(Some(entry.value().as_slice())))
+            .collect()
+    })
+}
+
+pub fn list_turn_window_summaries(limit: usize) -> Vec<TurnWindowSummary> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let keep = limit.min(MAX_OBSERVABILITY_LIMIT);
+    TURN_WINDOW_SUMMARY_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .rev()
+            .take(keep)
+            .filter_map(|entry| read_json::<TurnWindowSummary>(Some(entry.value().as_slice())))
+            .collect()
+    })
+}
+
+pub fn list_memory_rollups(limit: usize) -> Vec<MemoryRollup> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let keep = limit.min(MAX_MEMORY_ROLLUPS);
+    let mut rollups: Vec<MemoryRollup> = MEMORY_ROLLUP_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<MemoryRollup>(Some(entry.value().as_slice())))
+            .collect()
+    });
+    rollups.sort_by(|left, right| {
+        right
+            .generated_at_ns
+            .cmp(&left.generated_at_ns)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+    });
+    rollups.truncate(keep);
+    rollups
+}
+
+fn is_critical_exact_memory_key(key: &str) -> bool {
+    key == "balance.eth"
+        || key == "balance.eth.last_checked_ns"
+        || key.starts_with("balance.eth.")
+        || key.starts_with("wallet.")
+        || key.starts_with("config.")
+}
+
+pub fn list_memory_for_context(
+    raw_limit: usize,
+    rollup_limit: usize,
+) -> (Vec<MemoryFact>, Vec<MemoryRollup>) {
+    let all = list_all_memory_facts(MAX_MEMORY_FACTS);
+    let mut critical = Vec::new();
+    let mut non_critical = Vec::new();
+    for fact in all {
+        if is_critical_exact_memory_key(&fact.key) {
+            critical.push(fact);
+        } else {
+            non_critical.push(fact);
+        }
+    }
+
+    let mut selected_raw = critical;
+    if selected_raw.len() < raw_limit {
+        let remaining = raw_limit.saturating_sub(selected_raw.len());
+        selected_raw.extend(non_critical.into_iter().take(remaining));
+    }
+    selected_raw.truncate(raw_limit);
+
+    let include_rollups = selected_raw.len() >= raw_limit;
+    let rollups = if include_rollups {
+        list_memory_rollups(rollup_limit)
+    } else {
+        Vec::new()
+    };
+
+    (selected_raw, rollups)
 }
 
 pub fn runtime_snapshot() -> RuntimeSnapshot {
@@ -1345,6 +2015,53 @@ pub fn wallet_balance_sync_config_view() -> WalletBalanceSyncConfigView {
     WalletBalanceSyncConfigView::from(&runtime_snapshot().wallet_balance_sync)
 }
 
+fn inbox_usdc_discovery_blocked(snapshot: &RuntimeSnapshot) -> bool {
+    snapshot
+        .wallet_balance
+        .last_error
+        .as_deref()
+        .map(|error| {
+            error
+                .to_ascii_lowercase()
+                .contains("inbox.usdc returned zero address")
+        })
+        .unwrap_or(false)
+}
+
+fn wallet_balance_sync_has_discoverable_usdc_source(snapshot: &RuntimeSnapshot) -> bool {
+    snapshot.wallet_balance_sync.discover_usdc_via_inbox
+        && snapshot.inbox_contract_address.is_some()
+        && !inbox_usdc_discovery_blocked(snapshot)
+}
+
+fn wallet_balance_sync_has_usdc_source(snapshot: &RuntimeSnapshot) -> bool {
+    snapshot.wallet_balance.usdc_contract_address.is_some()
+        || wallet_balance_sync_has_discoverable_usdc_source(snapshot)
+}
+
+pub fn wallet_balance_sync_capable(snapshot: &RuntimeSnapshot) -> bool {
+    if !snapshot.wallet_balance_sync.enabled {
+        return false;
+    }
+    if snapshot.evm_rpc_url.trim().is_empty() {
+        return false;
+    }
+    if snapshot.evm_address.is_some() {
+        if snapshot.wallet_balance.usdc_contract_address.is_some() {
+            return true;
+        }
+        if !snapshot.wallet_balance_sync.discover_usdc_via_inbox {
+            // Let the sync path emit a deterministic missing-config error.
+            return true;
+        }
+        return wallet_balance_sync_has_discoverable_usdc_source(snapshot);
+    }
+    if snapshot.ecdsa_key_name.trim().is_empty() {
+        return false;
+    }
+    wallet_balance_sync_has_usdc_source(snapshot)
+}
+
 pub fn inference_config_view() -> InferenceConfigView {
     InferenceConfigView::from(&runtime_snapshot())
 }
@@ -1762,7 +2479,99 @@ fn derive_cycle_telemetry(
     }
 }
 
-fn storage_growth_metrics() -> StorageGrowthMetrics {
+fn load_storage_growth_samples() -> Vec<StorageGrowthSample> {
+    RUNTIME_MAP
+        .with(|map| map.borrow().get(&STORAGE_GROWTH_SAMPLES_KEY.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+        .unwrap_or_default()
+}
+
+fn save_storage_growth_samples(samples: &[StorageGrowthSample]) {
+    RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(STORAGE_GROWTH_SAMPLES_KEY.to_string(), encode_json(samples));
+    });
+}
+
+fn push_storage_growth_sample(now_ns: u64, tracked_entries: u64) -> Vec<StorageGrowthSample> {
+    let mut samples = load_storage_growth_samples();
+    let sample = StorageGrowthSample {
+        captured_at_ns: now_ns,
+        tracked_entries,
+    };
+
+    if let Some(last) = samples.last_mut() {
+        if last.captured_at_ns == now_ns {
+            *last = sample;
+        } else {
+            samples.push(sample);
+        }
+    } else {
+        samples.push(sample);
+    }
+
+    let cutoff_ns = now_ns.saturating_sub(STORAGE_GROWTH_TREND_WINDOW_NS);
+    samples.retain(|entry| entry.captured_at_ns >= cutoff_ns);
+    if samples.len() > STORAGE_GROWTH_MAX_SAMPLES {
+        let drop_count = samples.len() - STORAGE_GROWTH_MAX_SAMPLES;
+        samples.drain(0..drop_count);
+    }
+    save_storage_growth_samples(&samples);
+    samples
+}
+
+fn calculate_tracked_entries_delta_per_hour(samples: &[StorageGrowthSample]) -> Option<i64> {
+    let first = samples.first()?;
+    let last = samples.last()?;
+    if last.captured_at_ns <= first.captured_at_ns {
+        return None;
+    }
+
+    let delta = last.tracked_entries as f64 - first.tracked_entries as f64;
+    let elapsed_secs = (last.captured_at_ns.saturating_sub(first.captured_at_ns)) as f64 / 1e9f64;
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+
+    let per_hour = (delta / elapsed_secs) * 3_600f64;
+    if !per_hour.is_finite() {
+        return None;
+    }
+
+    if per_hour >= i64::MAX as f64 {
+        return Some(i64::MAX);
+    }
+    if per_hour <= i64::MIN as f64 {
+        return Some(i64::MIN);
+    }
+    Some(per_hour.round() as i64)
+}
+
+fn utilization_percent(entries: u64, limit: u64) -> u8 {
+    if limit == 0 {
+        return 0;
+    }
+    let numerator = entries.saturating_mul(100);
+    let rounded = numerator
+        .saturating_add(limit.saturating_sub(1))
+        .saturating_div(limit)
+        .min(100);
+    u8::try_from(rounded).unwrap_or(100)
+}
+
+fn pressure_level_for_percent(max_utilization_percent: u8) -> StoragePressureLevel {
+    if max_utilization_percent >= STORAGE_PRESSURE_CRITICAL_PERCENT {
+        StoragePressureLevel::Critical
+    } else if max_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT {
+        StoragePressureLevel::High
+    } else if max_utilization_percent >= STORAGE_PRESSURE_ELEVATED_PERCENT {
+        StoragePressureLevel::Elevated
+    } else {
+        StoragePressureLevel::Normal
+    }
+}
+
+fn storage_growth_metrics(captured_at_ns: u64) -> StorageGrowthMetrics {
     #[cfg(target_arch = "wasm32")]
     let heap_memory_mb = {
         let pages = core::arch::wasm32::memory_size(0) as u64;
@@ -1779,22 +2588,148 @@ fn storage_growth_metrics() -> StorageGrowthMetrics {
     #[cfg(not(target_arch = "wasm32"))]
     let stable_memory_mb = 0.0_f64;
 
+    let runtime_map_entries = RUNTIME_MAP.with(|map| map.borrow().len());
+    let transition_map_entries = TRANSITION_MAP.with(|map| map.borrow().len());
+    let turn_map_entries = TURN_MAP.with(|map| map.borrow().len());
+    let tool_map_entries = TOOL_MAP.with(|map| map.borrow().len());
+    let job_map_entries = JOB_MAP.with(|map| map.borrow().len());
+    let job_queue_map_entries = JOB_QUEUE_MAP.with(|map| map.borrow().len());
+    let dedupe_map_entries = DEDUPE_MAP.with(|map| map.borrow().len());
+    let inbox_map_entries = INBOX_MAP.with(|map| map.borrow().len());
+    let inbox_pending_queue_entries = INBOX_PENDING_QUEUE_MAP.with(|map| map.borrow().len());
+    let inbox_staged_queue_entries = INBOX_STAGED_QUEUE_MAP.with(|map| map.borrow().len());
+    let outbox_map_entries = OUTBOX_MAP.with(|map| map.borrow().len());
+    let session_summary_entries = SESSION_SUMMARY_MAP.with(|map| map.borrow().len());
+    let turn_window_summary_entries = TURN_WINDOW_SUMMARY_MAP.with(|map| map.borrow().len());
+    let memory_rollup_entries = MEMORY_ROLLUP_MAP.with(|map| map.borrow().len());
+    let memory_fact_entries = MEMORY_FACTS_MAP.with(|map| map.borrow().len());
+
+    let session_summary_limit = u64::try_from(MAX_SESSION_SUMMARIES).unwrap_or(u64::MAX);
+    let turn_window_summary_limit = u64::try_from(MAX_TURN_WINDOW_SUMMARIES).unwrap_or(u64::MAX);
+    let memory_rollup_limit = u64::try_from(MAX_MEMORY_ROLLUPS).unwrap_or(u64::MAX);
+    let memory_fact_limit = u64::try_from(MAX_MEMORY_FACTS).unwrap_or(u64::MAX);
+
+    let tracked_entry_count = runtime_map_entries
+        .saturating_add(transition_map_entries)
+        .saturating_add(turn_map_entries)
+        .saturating_add(tool_map_entries)
+        .saturating_add(job_map_entries)
+        .saturating_add(job_queue_map_entries)
+        .saturating_add(dedupe_map_entries)
+        .saturating_add(inbox_map_entries)
+        .saturating_add(inbox_pending_queue_entries)
+        .saturating_add(inbox_staged_queue_entries)
+        .saturating_add(outbox_map_entries)
+        .saturating_add(session_summary_entries)
+        .saturating_add(turn_window_summary_entries)
+        .saturating_add(memory_rollup_entries)
+        .saturating_add(memory_fact_entries);
+    let growth_samples = push_storage_growth_sample(captured_at_ns, tracked_entry_count);
+    let tracked_entries_delta_per_hour = calculate_tracked_entries_delta_per_hour(&growth_samples);
+    let trend_window_seconds = growth_samples
+        .first()
+        .zip(growth_samples.last())
+        .map(|(first, last)| {
+            last.captured_at_ns
+                .saturating_sub(first.captured_at_ns)
+                .saturating_div(1_000_000_000)
+        })
+        .unwrap_or_default();
+    let trend_sample_count = u32::try_from(growth_samples.len()).unwrap_or(u32::MAX);
+
+    let session_summary_utilization_percent =
+        utilization_percent(session_summary_entries, session_summary_limit);
+    let turn_window_summary_utilization_percent =
+        utilization_percent(turn_window_summary_entries, turn_window_summary_limit);
+    let memory_rollup_utilization_percent =
+        utilization_percent(memory_rollup_entries, memory_rollup_limit);
+    let memory_fact_utilization_percent =
+        utilization_percent(memory_fact_entries, memory_fact_limit);
+
+    let max_utilization_percent = [
+        session_summary_utilization_percent,
+        turn_window_summary_utilization_percent,
+        memory_rollup_utilization_percent,
+        memory_fact_utilization_percent,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or_default();
+    let pressure_level = pressure_level_for_percent(max_utilization_percent);
+
+    let mut pressure_warnings = Vec::new();
+    if session_summary_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT {
+        pressure_warnings.push(format!(
+            "session summaries at {}% capacity ({}/{})",
+            session_summary_utilization_percent, session_summary_entries, session_summary_limit
+        ));
+    }
+    if turn_window_summary_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT {
+        pressure_warnings.push(format!(
+            "turn window summaries at {}% capacity ({}/{})",
+            turn_window_summary_utilization_percent,
+            turn_window_summary_entries,
+            turn_window_summary_limit
+        ));
+    }
+    if memory_rollup_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT {
+        pressure_warnings.push(format!(
+            "memory rollups at {}% capacity ({}/{})",
+            memory_rollup_utilization_percent, memory_rollup_entries, memory_rollup_limit
+        ));
+    }
+    if memory_fact_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT {
+        pressure_warnings.push(format!(
+            "memory facts at {}% capacity ({}/{})",
+            memory_fact_utilization_percent, memory_fact_entries, memory_fact_limit
+        ));
+    }
+    if tracked_entries_delta_per_hour
+        .map(|delta| delta >= STORAGE_GROWTH_WARNING_ENTRIES_PER_HOUR)
+        .unwrap_or(false)
+    {
+        pressure_warnings.push(format!(
+            "tracked entries growing quickly ({} entries/hour)",
+            tracked_entries_delta_per_hour.unwrap_or_default()
+        ));
+    }
+    let near_limit = max_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT;
+
+    let retention_runtime = retention_maintenance_runtime();
+
     StorageGrowthMetrics {
-        runtime_map_entries: RUNTIME_MAP.with(|map| map.borrow().len()),
-        transition_map_entries: TRANSITION_MAP.with(|map| map.borrow().len()),
-        turn_map_entries: TURN_MAP.with(|map| map.borrow().len()),
-        tool_map_entries: TOOL_MAP.with(|map| map.borrow().len()),
-        job_map_entries: JOB_MAP.with(|map| map.borrow().len()),
-        job_queue_map_entries: JOB_QUEUE_MAP.with(|map| map.borrow().len()),
-        dedupe_map_entries: DEDUPE_MAP.with(|map| map.borrow().len()),
-        inbox_map_entries: INBOX_MAP.with(|map| map.borrow().len()),
-        inbox_pending_queue_entries: INBOX_PENDING_QUEUE_MAP.with(|map| map.borrow().len()),
-        inbox_staged_queue_entries: INBOX_STAGED_QUEUE_MAP.with(|map| map.borrow().len()),
-        outbox_map_entries: OUTBOX_MAP.with(|map| map.borrow().len()),
-        memory_fact_entries: MEMORY_FACTS_MAP.with(|map| map.borrow().len()),
-        memory_fact_limit: u64::try_from(MAX_MEMORY_FACTS).unwrap_or(u64::MAX),
-        retention_progress_percent: 0,
-        summarization_progress_percent: 0,
+        runtime_map_entries,
+        transition_map_entries,
+        turn_map_entries,
+        tool_map_entries,
+        job_map_entries,
+        job_queue_map_entries,
+        dedupe_map_entries,
+        inbox_map_entries,
+        inbox_pending_queue_entries,
+        inbox_staged_queue_entries,
+        outbox_map_entries,
+        session_summary_entries,
+        session_summary_limit,
+        turn_window_summary_entries,
+        turn_window_summary_limit,
+        memory_rollup_entries,
+        memory_rollup_limit,
+        memory_fact_entries,
+        memory_fact_limit,
+        session_summary_utilization_percent,
+        turn_window_summary_utilization_percent,
+        memory_rollup_utilization_percent,
+        memory_fact_utilization_percent,
+        near_limit,
+        pressure_level,
+        pressure_warnings,
+        tracked_entry_count,
+        tracked_entries_delta_per_hour,
+        trend_window_seconds,
+        trend_sample_count,
+        retention_progress_percent: retention_runtime.retention_progress_percent,
+        summarization_progress_percent: retention_runtime.summarization_progress_percent,
         heap_memory_mb,
         stable_memory_mb,
     }
@@ -1814,18 +2749,24 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
         derive_cycle_telemetry(captured_at_ns, total_cycles, liquid_cycles, &cycle_samples);
     let mut conversation_summaries = list_conversation_summaries();
     conversation_summaries.truncate(bounded_limit);
+    let session_summaries = list_session_summaries(bounded_limit);
+    let turn_window_summaries = list_turn_window_summaries(bounded_limit);
+    let memory_rollups = list_memory_rollups(bounded_limit);
 
     ObservabilitySnapshot {
         captured_at_ns,
         runtime: snapshot_to_view(),
         scheduler: scheduler_runtime_view(),
-        storage_growth: storage_growth_metrics(),
+        storage_growth: storage_growth_metrics(captured_at_ns),
         inbox_stats: inbox_stats(),
         inbox_messages: list_inbox_messages(bounded_limit),
         outbox_stats: outbox_stats(),
         outbox_messages: list_outbox_messages(bounded_limit),
         prompt_layers: list_prompt_layers(),
         conversation_summaries,
+        session_summaries,
+        turn_window_summaries,
+        memory_rollups,
         cycles,
         recent_turns: list_turns(bounded_limit),
         recent_transitions: list_recent_transitions(bounded_limit),
@@ -2415,6 +3356,793 @@ fn save_job(job: &ScheduledJob) {
     });
 }
 
+#[cfg(test)]
+pub fn save_job_for_tests(job: ScheduledJob) {
+    save_job(&job);
+}
+
+#[cfg(test)]
+pub fn insert_dedupe_for_tests(dedupe_key: String, job_id: String) {
+    DEDUPE_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(dedupe_index_key(&dedupe_key), job_id.into_bytes());
+    });
+}
+
+fn oldest_job_seq_to_keep(max_records: u64) -> Option<u64> {
+    if max_records == 0 {
+        return None;
+    }
+    let keep = usize::try_from(max_records).unwrap_or(usize::MAX);
+    JOB_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .rev()
+            .take(keep)
+            .filter_map(|entry| parse_job_seq(entry.key()))
+            .last()
+    })
+}
+
+fn should_prune_job(
+    job: &ScheduledJob,
+    jobs_cutoff_ns: u64,
+    keep_from_seq: Option<u64>,
+    jobs_max_records: u64,
+) -> bool {
+    if !job.is_terminal() {
+        return false;
+    }
+    let finished_at_ns = job.finished_at_ns.unwrap_or(job.scheduled_for_ns);
+    if finished_at_ns > jobs_cutoff_ns {
+        return false;
+    }
+
+    if jobs_max_records == 0 {
+        return true;
+    }
+
+    let Some(keep_seq) = keep_from_seq else {
+        return false;
+    };
+    parse_job_seq(&job.id).is_some_and(|seq| seq < keep_seq)
+}
+
+fn collect_prunable_jobs(
+    start_after: Option<&str>,
+    budget: usize,
+    jobs_cutoff_ns: u64,
+    keep_from_seq: Option<u64>,
+    jobs_max_records: u64,
+) -> (Vec<String>, Option<String>, bool) {
+    if budget == 0 {
+        return (Vec::new(), start_after.map(ToString::to_string), false);
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut last_scanned: Option<String> = None;
+    let mut reached_end = true;
+    let mut passed_start = start_after.is_none();
+
+    JOB_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if !passed_start {
+                if start_after.is_some_and(|cursor| entry.key().as_str() <= cursor) {
+                    continue;
+                }
+                passed_start = true;
+            }
+
+            let key = entry.key().clone();
+            last_scanned = Some(key.clone());
+            let should_prune = read_json::<ScheduledJob>(Some(entry.value().as_slice()))
+                .is_some_and(|job| {
+                    should_prune_job(&job, jobs_cutoff_ns, keep_from_seq, jobs_max_records)
+                });
+            if should_prune {
+                candidates.push(key);
+                if candidates.len() >= budget {
+                    reached_end = false;
+                    break;
+                }
+            }
+        }
+    });
+
+    let next_cursor = if reached_end { None } else { last_scanned };
+    (candidates, next_cursor, reached_end)
+}
+
+fn dedupe_key_slot_ns(dedupe_index: &str) -> Option<u64> {
+    let dedupe_key = dedupe_index.strip_prefix("dedupe:")?;
+    dedupe_key.rsplit(':').next()?.parse::<u64>().ok()
+}
+
+fn should_prune_dedupe_entry(
+    index_key: &str,
+    job: Option<&ScheduledJob>,
+    dedupe_cutoff_ns: u64,
+) -> bool {
+    if let Some(job) = job {
+        if !job.is_terminal() {
+            return false;
+        }
+    }
+
+    if dedupe_key_slot_ns(index_key).is_some_and(|slot| slot <= dedupe_cutoff_ns) {
+        return true;
+    }
+
+    match job {
+        None => true,
+        Some(job) => {
+            let finished_at_ns = job.finished_at_ns.unwrap_or(job.scheduled_for_ns);
+            finished_at_ns <= dedupe_cutoff_ns
+        }
+    }
+}
+
+fn collect_prunable_dedupe(
+    start_after: Option<&str>,
+    budget: usize,
+    dedupe_cutoff_ns: u64,
+) -> (Vec<String>, Option<String>, bool) {
+    if budget == 0 {
+        return (Vec::new(), start_after.map(ToString::to_string), false);
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut last_scanned: Option<String> = None;
+    let mut reached_end = true;
+    let mut passed_start = start_after.is_none();
+
+    DEDUPE_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if !passed_start {
+                if start_after.is_some_and(|cursor| entry.key().as_str() <= cursor) {
+                    continue;
+                }
+                passed_start = true;
+            }
+
+            let key = entry.key().clone();
+            let job_id = String::from_utf8(entry.value().clone()).unwrap_or_default();
+            last_scanned = Some(key.clone());
+            let job = get_job_by_id(&job_id);
+            if should_prune_dedupe_entry(&key, job.as_ref(), dedupe_cutoff_ns) {
+                candidates.push(key);
+                if candidates.len() >= budget {
+                    reached_end = false;
+                    break;
+                }
+            }
+        }
+    });
+
+    let next_cursor = if reached_end { None } else { last_scanned };
+    (candidates, next_cursor, reached_end)
+}
+
+fn remove_queue_entries_for_job(job_id: &str) {
+    let queue_keys = JOB_QUEUE_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| {
+                String::from_utf8(entry.value().clone())
+                    .ok()
+                    .filter(|queued| queued == job_id)
+                    .map(|_| entry.key().clone())
+            })
+            .collect::<Vec<_>>()
+    });
+    if queue_keys.is_empty() {
+        return;
+    }
+    JOB_QUEUE_MAP.with(|map| {
+        let mut queue = map.borrow_mut();
+        for key in queue_keys {
+            queue.remove(&key);
+        }
+    });
+}
+
+fn clear_pending_job_runtime_refs(job_id: &str) {
+    for kind in TaskKind::all() {
+        let mut runtime = get_task_runtime(kind);
+        if runtime
+            .pending_job_id
+            .as_ref()
+            .is_some_and(|pending| pending == job_id)
+        {
+            runtime.pending_job_id = None;
+            save_task_runtime(kind, &runtime);
+        }
+    }
+}
+
+fn delete_job_candidates(job_keys: &[String]) -> u32 {
+    let mut deleted = 0u32;
+    for key in job_keys {
+        let Some(job) = get_job_by_id(key) else {
+            continue;
+        };
+        if !job.is_terminal() {
+            continue;
+        }
+        JOB_MAP.with(|map| {
+            map.borrow_mut().remove(key);
+        });
+        remove_queue_entries_for_job(&job.id);
+        clear_pending_job_runtime_refs(&job.id);
+        let dedupe_index = dedupe_index_key(&job.dedupe_key);
+        DEDUPE_MAP.with(|map| {
+            let mut dedupe = map.borrow_mut();
+            let should_remove = dedupe
+                .get(&dedupe_index)
+                .and_then(|raw| String::from_utf8(raw).ok())
+                .is_some_and(|mapped_job_id| mapped_job_id == job.id);
+            if should_remove {
+                dedupe.remove(&dedupe_index);
+            }
+        });
+        deleted = deleted.saturating_add(1);
+    }
+    deleted
+}
+
+fn delete_dedupe_candidates(dedupe_keys: &[String]) -> u32 {
+    let mut deleted = 0u32;
+    DEDUPE_MAP.with(|map| {
+        let mut dedupe = map.borrow_mut();
+        for key in dedupe_keys {
+            if dedupe.remove(key).is_some() {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+    });
+    deleted
+}
+
+fn protected_conversation_inbox_ids() -> std::collections::BTreeSet<String> {
+    CONVERSATION_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<ConversationLog>(Some(entry.value().as_slice())))
+            .flat_map(|log| {
+                log.entries
+                    .into_iter()
+                    .map(|entry| entry.inbox_message_id)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    })
+}
+
+fn collect_prunable_inbox(
+    start_after: Option<&str>,
+    budget: usize,
+    inbox_cutoff_ns: u64,
+    protected_inbox_ids: &std::collections::BTreeSet<String>,
+) -> (Vec<InboxCandidate>, Option<String>, bool) {
+    if budget == 0 {
+        return (Vec::new(), start_after.map(ToString::to_string), false);
+    }
+
+    let mut candidates = Vec::<InboxCandidate>::new();
+    let mut last_scanned: Option<String> = None;
+    let mut reached_end = true;
+    let mut passed_start = start_after.is_none();
+
+    INBOX_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if !passed_start {
+                if start_after.is_some_and(|cursor| entry.key().as_str() <= cursor) {
+                    continue;
+                }
+                passed_start = true;
+            }
+
+            let key = entry.key().clone();
+            last_scanned = Some(key.clone());
+            let Some(message) = read_json::<InboxMessage>(Some(entry.value().as_slice())) else {
+                continue;
+            };
+            if !matches!(message.status, InboxMessageStatus::Consumed) {
+                continue;
+            }
+            if protected_inbox_ids.contains(&message.id) {
+                continue;
+            }
+            let cutoff_field = message.consumed_at_ns.unwrap_or(message.posted_at_ns);
+            if cutoff_field > inbox_cutoff_ns {
+                continue;
+            }
+            candidates.push(InboxCandidate { key, message });
+            if candidates.len() >= budget {
+                reached_end = false;
+                break;
+            }
+        }
+    });
+
+    let next_cursor = if reached_end { None } else { last_scanned };
+    (candidates, next_cursor, reached_end)
+}
+
+fn collect_prunable_outbox(
+    start_after: Option<&str>,
+    budget: usize,
+    outbox_cutoff_ns: u64,
+    protected_inbox_ids: &std::collections::BTreeSet<String>,
+) -> (Vec<OutboxCandidate>, Option<String>, bool) {
+    if budget == 0 {
+        return (Vec::new(), start_after.map(ToString::to_string), false);
+    }
+
+    let mut candidates = Vec::<OutboxCandidate>::new();
+    let mut last_scanned: Option<String> = None;
+    let mut reached_end = true;
+    let mut passed_start = start_after.is_none();
+
+    OUTBOX_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if !passed_start {
+                if start_after.is_some_and(|cursor| entry.key().as_str() <= cursor) {
+                    continue;
+                }
+                passed_start = true;
+            }
+
+            let key = entry.key().clone();
+            last_scanned = Some(key.clone());
+            let Some(message) = read_json::<OutboxMessage>(Some(entry.value().as_slice())) else {
+                continue;
+            };
+            if message.created_at_ns > outbox_cutoff_ns {
+                continue;
+            }
+            if message
+                .source_inbox_ids
+                .iter()
+                .any(|id| protected_inbox_ids.contains(id))
+            {
+                continue;
+            }
+            candidates.push(OutboxCandidate { key, message });
+            if candidates.len() >= budget {
+                reached_end = false;
+                break;
+            }
+        }
+    });
+
+    let next_cursor = if reached_end { None } else { last_scanned };
+    (candidates, next_cursor, reached_end)
+}
+
+fn session_summary_accumulator(
+    sender: &str,
+    window_start_ns: u64,
+    window_end_ns: u64,
+) -> SessionSummaryAccumulator {
+    SessionSummaryAccumulator {
+        sender: sender.to_string(),
+        window_start_ns,
+        window_end_ns,
+        source_count: 0,
+        inbox_message_count: 0,
+        outbox_message_count: 0,
+        inbox_preview: String::new(),
+        outbox_preview: String::new(),
+    }
+}
+
+fn resolve_outbox_sender(
+    message: &OutboxMessage,
+    cached_inbox_senders: &std::collections::BTreeMap<String, String>,
+) -> String {
+    for inbox_id in &message.source_inbox_ids {
+        if let Some(sender) = cached_inbox_senders.get(inbox_id) {
+            return sender.clone();
+        }
+        if let Some(inbox) = get_inbox_message_by_id(inbox_id) {
+            return normalize_conversation_sender(&inbox.posted_by);
+        }
+    }
+    "unknown".to_string()
+}
+
+fn summarize_inbox_outbox_candidates(
+    inbox_candidates: &[InboxCandidate],
+    outbox_candidates: &[OutboxCandidate],
+    now_ns: u64,
+) -> u32 {
+    if inbox_candidates.is_empty() && outbox_candidates.is_empty() {
+        return 0;
+    }
+
+    let mut grouped = std::collections::BTreeMap::<(String, u64), SessionSummaryAccumulator>::new();
+    let mut cached_inbox_senders = std::collections::BTreeMap::<String, String>::new();
+
+    for candidate in inbox_candidates {
+        let sender = normalize_conversation_sender(&candidate.message.posted_by);
+        cached_inbox_senders.insert(candidate.message.id.clone(), sender.clone());
+        let cutoff_field = candidate
+            .message
+            .consumed_at_ns
+            .unwrap_or(candidate.message.posted_at_ns);
+        let window_start_ns = summary_window_start_ns(cutoff_field);
+        let key = (sender.clone(), window_start_ns);
+        let accumulator = grouped.entry(key).or_insert_with(|| {
+            session_summary_accumulator(
+                &sender,
+                window_start_ns,
+                window_start_ns.saturating_add(SUMMARY_WINDOW_NS),
+            )
+        });
+        accumulator.window_end_ns = accumulator.window_end_ns.max(cutoff_field);
+        accumulator.source_count = accumulator.source_count.saturating_add(1);
+        accumulator.inbox_message_count = accumulator.inbox_message_count.saturating_add(1);
+        if accumulator.inbox_preview.is_empty() {
+            accumulator.inbox_preview = truncate_to_chars(&candidate.message.body, 220);
+        }
+    }
+
+    for candidate in outbox_candidates {
+        let sender = resolve_outbox_sender(&candidate.message, &cached_inbox_senders);
+        let window_start_ns = summary_window_start_ns(candidate.message.created_at_ns);
+        let key = (sender.clone(), window_start_ns);
+        let accumulator = grouped.entry(key).or_insert_with(|| {
+            session_summary_accumulator(
+                &sender,
+                window_start_ns,
+                window_start_ns.saturating_add(SUMMARY_WINDOW_NS),
+            )
+        });
+        accumulator.window_end_ns = accumulator
+            .window_end_ns
+            .max(candidate.message.created_at_ns);
+        accumulator.source_count = accumulator.source_count.saturating_add(1);
+        accumulator.outbox_message_count = accumulator.outbox_message_count.saturating_add(1);
+        if accumulator.outbox_preview.is_empty() {
+            accumulator.outbox_preview = truncate_to_chars(&candidate.message.body, 220);
+        }
+    }
+
+    let generated = u32::try_from(grouped.len()).unwrap_or(u32::MAX);
+    for (_key, accumulator) in grouped {
+        upsert_session_summary(accumulator, now_ns);
+    }
+    generated
+}
+
+fn delete_inbox_candidates(candidates: &[InboxCandidate]) -> u32 {
+    let mut deleted = 0u32;
+    for candidate in candidates {
+        if !matches!(candidate.message.status, InboxMessageStatus::Consumed) {
+            continue;
+        }
+        INBOX_MAP.with(|map| {
+            map.borrow_mut().remove(&candidate.key);
+        });
+        INBOX_PENDING_QUEUE_MAP.with(|map| {
+            map.borrow_mut()
+                .remove(&inbox_pending_key(candidate.message.seq));
+        });
+        INBOX_STAGED_QUEUE_MAP.with(|map| {
+            map.borrow_mut()
+                .remove(&inbox_staged_key(candidate.message.seq));
+        });
+        deleted = deleted.saturating_add(1);
+    }
+    deleted
+}
+
+fn delete_outbox_candidates(candidates: &[OutboxCandidate]) -> u32 {
+    let mut deleted = 0u32;
+    OUTBOX_MAP.with(|map| {
+        let mut outbox = map.borrow_mut();
+        for candidate in candidates {
+            if outbox.remove(&candidate.key).is_some() {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+    });
+    deleted
+}
+
+fn collect_prunable_turns(
+    start_after: Option<&str>,
+    budget: usize,
+    turns_cutoff_ns: u64,
+) -> (Vec<TurnCandidate>, Option<String>, bool) {
+    if budget == 0 {
+        return (Vec::new(), start_after.map(ToString::to_string), false);
+    }
+
+    let mut candidates = Vec::<TurnCandidate>::new();
+    let mut last_scanned: Option<String> = None;
+    let mut reached_end = true;
+    let mut passed_start = start_after.is_none();
+
+    TURN_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if !passed_start {
+                if start_after.is_some_and(|cursor| entry.key().as_str() <= cursor) {
+                    continue;
+                }
+                passed_start = true;
+            }
+
+            let key = entry.key().clone();
+            last_scanned = Some(key.clone());
+            let Some(turn) = read_json::<TurnRecord>(Some(entry.value().as_slice())) else {
+                continue;
+            };
+            if turn.created_at_ns > turns_cutoff_ns {
+                continue;
+            }
+            candidates.push(TurnCandidate { key, turn });
+            if candidates.len() >= budget {
+                reached_end = false;
+                break;
+            }
+        }
+    });
+
+    let next_cursor = if reached_end { None } else { last_scanned };
+    (candidates, next_cursor, reached_end)
+}
+
+fn collect_prunable_transitions(
+    start_after: Option<&str>,
+    budget: usize,
+    transitions_cutoff_ns: u64,
+) -> (Vec<TransitionCandidate>, Option<String>, bool) {
+    if budget == 0 {
+        return (Vec::new(), start_after.map(ToString::to_string), false);
+    }
+
+    let mut candidates = Vec::<TransitionCandidate>::new();
+    let mut last_scanned: Option<String> = None;
+    let mut reached_end = true;
+    let mut passed_start = start_after.is_none();
+
+    TRANSITION_MAP.with(|map| {
+        for entry in map.borrow().iter() {
+            if !passed_start {
+                if start_after.is_some_and(|cursor| entry.key().as_str() <= cursor) {
+                    continue;
+                }
+                passed_start = true;
+            }
+
+            let key = entry.key().clone();
+            last_scanned = Some(key.clone());
+            let Some(transition) = read_json::<TransitionLogRecord>(Some(entry.value().as_slice()))
+            else {
+                continue;
+            };
+            if transition.occurred_at_ns > transitions_cutoff_ns {
+                continue;
+            }
+            candidates.push(TransitionCandidate { key, transition });
+            if candidates.len() >= budget {
+                reached_end = false;
+                break;
+            }
+        }
+    });
+
+    let next_cursor = if reached_end { None } else { last_scanned };
+    (candidates, next_cursor, reached_end)
+}
+
+fn turn_summary_accumulator(window_start_ns: u64) -> TurnSummaryAccumulator {
+    TurnSummaryAccumulator {
+        window_start_ns,
+        window_end_ns: window_start_ns.saturating_add(SUMMARY_WINDOW_NS),
+        source_count: 0,
+        turn_count: 0,
+        transition_count: 0,
+        tool_call_count: 0,
+        succeeded_turn_count: 0,
+        failed_turn_count: 0,
+        tool_success_count: 0,
+        tool_failure_count: 0,
+        top_errors: Vec::new(),
+    }
+}
+
+fn summarize_turn_and_transition_candidates(
+    turn_candidates: &[TurnCandidate],
+    transition_candidates: &[TransitionCandidate],
+    tools_cutoff_ns: u64,
+    now_ns: u64,
+) -> (u32, Vec<String>) {
+    if turn_candidates.is_empty() && transition_candidates.is_empty() {
+        return (0, Vec::new());
+    }
+
+    let mut grouped = std::collections::BTreeMap::<u64, TurnSummaryAccumulator>::new();
+    let mut tool_keys_to_delete = std::collections::BTreeSet::<String>::new();
+
+    for candidate in turn_candidates {
+        let window_start = summary_window_start_ns(candidate.turn.created_at_ns);
+        let accumulator = grouped
+            .entry(window_start)
+            .or_insert_with(|| turn_summary_accumulator(window_start));
+        accumulator.window_end_ns = accumulator.window_end_ns.max(candidate.turn.created_at_ns);
+        accumulator.source_count = accumulator.source_count.saturating_add(1);
+        accumulator.turn_count = accumulator.turn_count.saturating_add(1);
+        if candidate.turn.error.is_some() {
+            accumulator.failed_turn_count = accumulator.failed_turn_count.saturating_add(1);
+        } else {
+            accumulator.succeeded_turn_count = accumulator.succeeded_turn_count.saturating_add(1);
+        }
+        accumulate_error(&mut accumulator.top_errors, candidate.turn.error.as_deref());
+
+        let tool_records = get_tools_for_turn(&candidate.turn.id);
+        accumulator.tool_call_count = accumulator
+            .tool_call_count
+            .saturating_add(u32::try_from(tool_records.len()).unwrap_or(u32::MAX));
+        for tool in &tool_records {
+            if tool.success {
+                accumulator.tool_success_count = accumulator.tool_success_count.saturating_add(1);
+            } else {
+                accumulator.tool_failure_count = accumulator.tool_failure_count.saturating_add(1);
+            }
+            accumulate_error(&mut accumulator.top_errors, tool.error.as_deref());
+        }
+
+        if candidate.turn.created_at_ns <= tools_cutoff_ns {
+            tool_keys_to_delete.insert(format!("tools:{}", candidate.turn.id));
+        }
+    }
+
+    for candidate in transition_candidates {
+        let window_start = summary_window_start_ns(candidate.transition.occurred_at_ns);
+        let accumulator = grouped
+            .entry(window_start)
+            .or_insert_with(|| turn_summary_accumulator(window_start));
+        accumulator.window_end_ns = accumulator
+            .window_end_ns
+            .max(candidate.transition.occurred_at_ns);
+        accumulator.source_count = accumulator.source_count.saturating_add(1);
+        accumulator.transition_count = accumulator.transition_count.saturating_add(1);
+        accumulate_error(
+            &mut accumulator.top_errors,
+            candidate.transition.error.as_deref(),
+        );
+    }
+
+    let generated = u32::try_from(grouped.len()).unwrap_or(u32::MAX);
+    for (_window_start, accumulator) in grouped {
+        upsert_turn_window_summary(accumulator, now_ns);
+    }
+
+    (generated, tool_keys_to_delete.into_iter().collect())
+}
+
+fn delete_turn_candidates(candidates: &[TurnCandidate]) -> u32 {
+    let mut deleted = 0u32;
+    TURN_MAP.with(|map| {
+        let mut turns = map.borrow_mut();
+        for candidate in candidates {
+            if turns.remove(&candidate.key).is_some() {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+    });
+    deleted
+}
+
+fn delete_transition_candidates(candidates: &[TransitionCandidate]) -> u32 {
+    let mut deleted = 0u32;
+    TRANSITION_MAP.with(|map| {
+        let mut transitions = map.borrow_mut();
+        for candidate in candidates {
+            if transitions.remove(&candidate.key).is_some() {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+    });
+    deleted
+}
+
+fn delete_tool_candidates(keys: &[String]) -> u32 {
+    let mut deleted = 0u32;
+    TOOL_MAP.with(|map| {
+        let mut tools = map.borrow_mut();
+        for key in keys {
+            if tools.remove(key).is_some() {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+    });
+    deleted
+}
+
+fn memory_namespace(key: &str) -> String {
+    key.split('.').next().unwrap_or(key).trim().to_string()
+}
+
+fn update_memory_rollups(now_ns: u64) -> u32 {
+    let cutoff_ns = now_ns.saturating_sub(MEMORY_ROLLUP_STALE_NS);
+    let mut grouped = std::collections::BTreeMap::<String, Vec<MemoryFact>>::new();
+    for fact in list_all_memory_facts(MAX_MEMORY_FACTS) {
+        if fact.updated_at_ns > cutoff_ns {
+            continue;
+        }
+        if is_critical_exact_memory_key(&fact.key) {
+            continue;
+        }
+        let namespace = memory_namespace(&fact.key);
+        if namespace.is_empty() {
+            continue;
+        }
+        grouped.entry(namespace).or_default().push(fact);
+    }
+
+    if grouped.is_empty() {
+        return 0;
+    }
+
+    let mut generated = 0u32;
+    for (namespace, mut facts) in grouped {
+        facts.sort_by(|left, right| {
+            right
+                .updated_at_ns
+                .cmp(&left.updated_at_ns)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        let source_count = u32::try_from(facts.len()).unwrap_or(u32::MAX);
+        let selected = facts
+            .iter()
+            .take(MAX_MEMORY_ROLLUP_FACTS_PER_NAMESPACE)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        let window_start_ns = selected
+            .iter()
+            .map(|fact| fact.updated_at_ns)
+            .min()
+            .unwrap_or(now_ns);
+        let window_end_ns = selected
+            .iter()
+            .map(|fact| fact.updated_at_ns)
+            .max()
+            .unwrap_or(now_ns);
+        let source_keys = selected
+            .iter()
+            .take(MAX_MEMORY_ROLLUP_SOURCE_KEYS)
+            .map(|fact| fact.key.clone())
+            .collect::<Vec<_>>();
+        let canonical_value = selected
+            .iter()
+            .map(|fact| format!("{}={}", fact.key, truncate_to_chars(&fact.value, 80)))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let rollup = MemoryRollup {
+            namespace: namespace.clone(),
+            window_start_ns,
+            window_end_ns,
+            source_count,
+            source_keys,
+            canonical_value,
+            generated_at_ns: now_ns,
+        };
+        MEMORY_ROLLUP_MAP.with(|map| {
+            map.borrow_mut().insert(namespace, encode_json(&rollup));
+        });
+        generated = generated.saturating_add(1);
+    }
+    enforce_memory_rollup_cap();
+    generated
+}
+
 fn get_inbox_message_by_id(id: &str) -> Option<InboxMessage> {
     INBOX_MAP
         .with(|map| map.borrow().get(&id.to_string()))
@@ -2561,6 +4289,7 @@ mod canbench_pilots {
 
     const BENCH_DATASET_SIZE: u64 = 2_000;
     const BENCH_LIST_LIMIT: usize = 50;
+    const BENCH_PRUNE_NOW_NS: u64 = 90_000_000_000;
 
     fn clear_inbox_maps() {
         let inbox_keys = INBOX_MAP.with(|map| {
@@ -2633,6 +4362,103 @@ mod canbench_pilots {
         });
     }
 
+    fn clear_dedupe_map() {
+        let keys = DEDUPE_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        DEDUPE_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_summary_maps() {
+        let session_keys = SESSION_SUMMARY_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        SESSION_SUMMARY_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in session_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let turn_keys = TURN_WINDOW_SUMMARY_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TURN_WINDOW_SUMMARY_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in turn_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let rollup_keys = MEMORY_ROLLUP_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        MEMORY_ROLLUP_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in rollup_keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_turn_transition_tool_maps() {
+        let turn_keys = TURN_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TURN_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in turn_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let transition_keys = TRANSITION_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TRANSITION_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in transition_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let tool_keys = TOOL_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TOOL_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in tool_keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
     fn seed_inbox_messages(count: u64) {
         init_storage();
         clear_inbox_maps();
@@ -2700,6 +4526,141 @@ mod canbench_pilots {
         }
     }
 
+    fn seed_terminal_jobs_for_prune(count: u64, now_ns: u64) {
+        init_storage();
+        clear_job_map();
+        clear_dedupe_map();
+        save_retention_maintenance_runtime(&RetentionMaintenanceRuntime {
+            next_run_after_ns: now_ns,
+            ..RetentionMaintenanceRuntime::default()
+        });
+        for seq in 1..=count {
+            let scheduled_for_ns = now_ns.saturating_sub(30_000_000_000).saturating_sub(seq);
+            let dedupe_key = format!("PollInbox:{scheduled_for_ns}");
+            let job = ScheduledJob {
+                id: format!("job:{seq:020}:{scheduled_for_ns:020}"),
+                kind: TaskKind::PollInbox,
+                lane: TaskLane::Mutating,
+                dedupe_key: dedupe_key.clone(),
+                priority: 1,
+                created_at_ns: scheduled_for_ns,
+                scheduled_for_ns,
+                started_at_ns: Some(scheduled_for_ns.saturating_add(1)),
+                finished_at_ns: Some(scheduled_for_ns.saturating_add(2)),
+                status: JobStatus::Succeeded,
+                attempts: 1,
+                max_attempts: 3,
+                last_error: None,
+            };
+            JOB_MAP.with(|map| {
+                map.borrow_mut().insert(job.id.clone(), encode_json(&job));
+            });
+            DEDUPE_MAP.with(|map| {
+                map.borrow_mut()
+                    .insert(dedupe_index_key(&dedupe_key), job.id.clone().into_bytes());
+            });
+        }
+    }
+
+    fn seed_consumed_inbox_outbox_for_summary(count: u64, now_ns: u64) {
+        init_storage();
+        clear_inbox_maps();
+        clear_outbox_map();
+        clear_summary_maps();
+        for seq in 1..=count {
+            let inbox_id = format!("inbox:{seq:020}");
+            INBOX_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    inbox_id.clone(),
+                    encode_json(&InboxMessage {
+                        id: inbox_id.clone(),
+                        seq,
+                        body: format!("bench consumed inbox {seq}"),
+                        posted_at_ns: now_ns.saturating_sub(20_000_000_000),
+                        posted_by: format!("0x{seq:040x}"),
+                        status: InboxMessageStatus::Consumed,
+                        staged_at_ns: Some(now_ns.saturating_sub(19_000_000_000)),
+                        consumed_at_ns: Some(now_ns.saturating_sub(18_000_000_000)),
+                    }),
+                );
+            });
+
+            let outbox_id = format!("outbox:{seq:020}");
+            OUTBOX_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    outbox_id.clone(),
+                    encode_json(&OutboxMessage {
+                        id: outbox_id,
+                        seq,
+                        turn_id: format!("turn-{seq}"),
+                        body: format!("bench outbox {seq}"),
+                        created_at_ns: now_ns.saturating_sub(17_000_000_000),
+                        source_inbox_ids: vec![inbox_id],
+                    }),
+                );
+            });
+        }
+    }
+
+    fn seed_turn_transition_tool_for_summary(count: u64, now_ns: u64) {
+        init_storage();
+        clear_turn_transition_tool_maps();
+        clear_summary_maps();
+        for seq in 1..=count {
+            let created_at_ns = now_ns.saturating_sub(20_000_000_000).saturating_sub(seq);
+            let turn = TurnRecord {
+                id: format!("turn-{seq}"),
+                created_at_ns,
+                state_from: AgentState::Sleeping,
+                state_to: AgentState::Sleeping,
+                source_events: 0,
+                tool_call_count: 1,
+                input_summary: "bench".to_string(),
+                inner_dialogue: Some("bench".to_string()),
+                inference_round_count: 1,
+                continuation_stop_reason: crate::domain::types::ContinuationStopReason::None,
+                error: if seq.is_multiple_of(10) {
+                    Some("bench error".to_string())
+                } else {
+                    None
+                },
+            };
+            TURN_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    format!("{created_at_ns:020}-{}", turn.id),
+                    encode_json(&turn),
+                );
+            });
+            TRANSITION_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    format!("{seq:020}-{seq:020}"),
+                    encode_json(&TransitionLogRecord {
+                        id: format!("{seq:020}-{seq:020}"),
+                        turn_id: turn.id.clone(),
+                        from_state: AgentState::Sleeping,
+                        to_state: AgentState::Inferring,
+                        event: "TimerTick".to_string(),
+                        error: None,
+                        occurred_at_ns: created_at_ns,
+                    }),
+                );
+            });
+            TOOL_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    format!("tools:{}", turn.id),
+                    encode_json(&vec![ToolCallRecord {
+                        turn_id: turn.id.clone(),
+                        tool: "evm_read".to_string(),
+                        args_json: "{}".to_string(),
+                        output: "ok".to_string(),
+                        success: true,
+                        error: None,
+                    }]),
+                );
+            });
+        }
+    }
+
     #[bench(raw)]
     fn bench_list_inbox_messages_recent() -> canbench_rs::BenchResult {
         seed_inbox_messages(BENCH_DATASET_SIZE);
@@ -2723,14 +4684,115 @@ mod canbench_pilots {
             std::hint::black_box(list_recent_jobs(BENCH_LIST_LIMIT));
         })
     }
+
+    #[bench(raw)]
+    fn bench_prune_jobs_and_dedupe_batch_25() -> canbench_rs::BenchResult {
+        seed_terminal_jobs_for_prune(BENCH_DATASET_SIZE, BENCH_PRUNE_NOW_NS);
+        let _ = set_retention_config(RetentionConfig {
+            jobs_max_age_secs: 1,
+            jobs_max_records: 0,
+            dedupe_max_age_secs: 1,
+            turns_max_age_secs: 7 * 24 * 60 * 60,
+            transitions_max_age_secs: 7 * 24 * 60 * 60,
+            tools_max_age_secs: 7 * 24 * 60 * 60,
+            inbox_max_age_secs: 14 * 24 * 60 * 60,
+            outbox_max_age_secs: 14 * 24 * 60 * 60,
+            maintenance_batch_size: 25,
+            maintenance_interval_secs: 60,
+        });
+        canbench_rs::bench_fn(|| {
+            std::hint::black_box(run_retention_maintenance_once(BENCH_PRUNE_NOW_NS));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_prune_jobs_and_dedupe_batch_100() -> canbench_rs::BenchResult {
+        seed_terminal_jobs_for_prune(BENCH_DATASET_SIZE, BENCH_PRUNE_NOW_NS);
+        let _ = set_retention_config(RetentionConfig {
+            jobs_max_age_secs: 1,
+            jobs_max_records: 0,
+            dedupe_max_age_secs: 1,
+            turns_max_age_secs: 7 * 24 * 60 * 60,
+            transitions_max_age_secs: 7 * 24 * 60 * 60,
+            tools_max_age_secs: 7 * 24 * 60 * 60,
+            inbox_max_age_secs: 14 * 24 * 60 * 60,
+            outbox_max_age_secs: 14 * 24 * 60 * 60,
+            maintenance_batch_size: 100,
+            maintenance_interval_secs: 60,
+        });
+        canbench_rs::bench_fn(|| {
+            std::hint::black_box(run_retention_maintenance_once(BENCH_PRUNE_NOW_NS));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_summarize_inbox_outbox_batch_50() -> canbench_rs::BenchResult {
+        seed_consumed_inbox_outbox_for_summary(BENCH_DATASET_SIZE, BENCH_PRUNE_NOW_NS);
+        canbench_rs::bench_fn(|| {
+            let protected = std::collections::BTreeSet::new();
+            let (inbox, _, _) = collect_prunable_inbox(None, 50, BENCH_PRUNE_NOW_NS, &protected);
+            let (outbox, _, _) = collect_prunable_outbox(None, 50, BENCH_PRUNE_NOW_NS, &protected);
+            std::hint::black_box(summarize_inbox_outbox_candidates(
+                &inbox,
+                &outbox,
+                BENCH_PRUNE_NOW_NS,
+            ));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_prune_inbox_outbox_batch_50() -> canbench_rs::BenchResult {
+        seed_consumed_inbox_outbox_for_summary(BENCH_DATASET_SIZE, BENCH_PRUNE_NOW_NS);
+        canbench_rs::bench_fn(|| {
+            let protected = std::collections::BTreeSet::new();
+            let (inbox, _, _) = collect_prunable_inbox(None, 50, BENCH_PRUNE_NOW_NS, &protected);
+            let (outbox, _, _) = collect_prunable_outbox(None, 50, BENCH_PRUNE_NOW_NS, &protected);
+            std::hint::black_box(delete_inbox_candidates(&inbox));
+            std::hint::black_box(delete_outbox_candidates(&outbox));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_summarize_turn_transition_batch_50() -> canbench_rs::BenchResult {
+        seed_turn_transition_tool_for_summary(BENCH_DATASET_SIZE, BENCH_PRUNE_NOW_NS);
+        canbench_rs::bench_fn(|| {
+            let (turns, _, _) = collect_prunable_turns(None, 50, BENCH_PRUNE_NOW_NS);
+            let (transitions, _, _) = collect_prunable_transitions(None, 50, BENCH_PRUNE_NOW_NS);
+            std::hint::black_box(summarize_turn_and_transition_candidates(
+                &turns,
+                &transitions,
+                BENCH_PRUNE_NOW_NS,
+                BENCH_PRUNE_NOW_NS,
+            ));
+        })
+    }
+
+    #[bench(raw)]
+    fn bench_prune_turn_transition_batch_50() -> canbench_rs::BenchResult {
+        seed_turn_transition_tool_for_summary(BENCH_DATASET_SIZE, BENCH_PRUNE_NOW_NS);
+        canbench_rs::bench_fn(|| {
+            let (turns, _, _) = collect_prunable_turns(None, 50, BENCH_PRUNE_NOW_NS);
+            let (transitions, _, _) = collect_prunable_transitions(None, 50, BENCH_PRUNE_NOW_NS);
+            let (_, tool_keys) = summarize_turn_and_transition_candidates(
+                &turns,
+                &transitions,
+                BENCH_PRUNE_NOW_NS,
+                BENCH_PRUNE_NOW_NS,
+            );
+            std::hint::black_box(delete_turn_candidates(&turns));
+            std::hint::black_box(delete_transition_candidates(&transitions));
+            std::hint::black_box(delete_tool_candidates(&tool_keys));
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer, RuntimeSnapshot, TaskKind,
-        TaskLane, WalletBalanceSnapshot, WalletBalanceSyncConfig,
+        ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer, RetentionConfig,
+        RuntimeSnapshot, StoragePressureLevel, TaskKind, TaskLane, WalletBalanceSnapshot,
+        WalletBalanceSyncConfig,
     };
 
     fn clear_conversation_map() {
@@ -2743,6 +4805,148 @@ mod tests {
         CONVERSATION_MAP.with(|map| {
             let mut map_ref = map.borrow_mut();
             for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_session_summary_map() {
+        let keys = SESSION_SUMMARY_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        SESSION_SUMMARY_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_turn_window_summary_map() {
+        let keys = TURN_WINDOW_SUMMARY_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TURN_WINDOW_SUMMARY_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_memory_rollup_map() {
+        let keys = MEMORY_ROLLUP_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        MEMORY_ROLLUP_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_inbox_maps_for_tests() {
+        let inbox_keys = INBOX_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        INBOX_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in inbox_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let pending_keys = INBOX_PENDING_QUEUE_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        INBOX_PENDING_QUEUE_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in pending_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let staged_keys = INBOX_STAGED_QUEUE_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        INBOX_STAGED_QUEUE_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in staged_keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_outbox_map_for_tests() {
+        let keys = OUTBOX_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        OUTBOX_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_turn_transition_tool_maps_for_tests() {
+        let turn_keys = TURN_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TURN_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in turn_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let transition_keys = TRANSITION_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TRANSITION_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in transition_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let tool_keys = TOOL_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        TOOL_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in tool_keys {
                 map_ref.remove(&key);
             }
         });
@@ -3020,6 +5224,493 @@ mod tests {
     }
 
     #[test]
+    fn retention_config_persists_and_validates() {
+        init_storage();
+
+        let defaults = retention_config();
+        assert!(defaults.jobs_max_age_secs > 0);
+        assert!(defaults.jobs_max_records > 0);
+        assert!(defaults.dedupe_max_age_secs > 0);
+        assert!(defaults.maintenance_batch_size > 0);
+        assert!(defaults.maintenance_interval_secs > 0);
+
+        let updated = RetentionConfig {
+            jobs_max_age_secs: 30,
+            jobs_max_records: 12,
+            dedupe_max_age_secs: 60,
+            turns_max_age_secs: 90,
+            transitions_max_age_secs: 91,
+            tools_max_age_secs: 92,
+            inbox_max_age_secs: 120,
+            outbox_max_age_secs: 121,
+            maintenance_batch_size: 3,
+            maintenance_interval_secs: 45,
+        };
+        let stored = set_retention_config(updated.clone()).expect("retention config should store");
+        assert_eq!(stored, updated);
+        assert_eq!(retention_config(), updated);
+
+        let invalid = set_retention_config(RetentionConfig {
+            maintenance_batch_size: 0,
+            ..RetentionConfig::default()
+        });
+        assert!(invalid.is_err(), "batch size zero must be rejected");
+    }
+
+    #[test]
+    fn retention_prune_is_checkpointed_idempotent_and_queue_safe() {
+        init_storage();
+        let now_ns = 100_000_000_000u64;
+        set_retention_config(RetentionConfig {
+            jobs_max_age_secs: 1,
+            jobs_max_records: 0,
+            dedupe_max_age_secs: 1,
+            maintenance_batch_size: 1,
+            maintenance_interval_secs: 1,
+            ..RetentionConfig::default()
+        })
+        .expect("retention config should store");
+
+        post_inbox_message(
+            "queued-one".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("first inbox post should succeed");
+        post_inbox_message(
+            "queued-two".to_string(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        )
+        .expect("second inbox post should succeed");
+        assert_eq!(
+            stage_pending_inbox_messages(1, now_ns.saturating_sub(10)),
+            1,
+            "one inbox item should be staged for queue safety assertions"
+        );
+        let inbox_before = inbox_stats();
+
+        for seq in 1..=3u64 {
+            let job_id = format!(
+                "job:{seq:020}:{:020}",
+                now_ns.saturating_sub(20_000_000_000)
+            );
+            save_job(&ScheduledJob {
+                id: job_id.clone(),
+                kind: TaskKind::PollInbox,
+                lane: TaskLane::Mutating,
+                dedupe_key: format!("PollInbox:{}", now_ns.saturating_sub(20_000_000_000 + seq)),
+                priority: 1,
+                created_at_ns: now_ns.saturating_sub(20_000_000_000),
+                scheduled_for_ns: now_ns.saturating_sub(20_000_000_000),
+                started_at_ns: Some(now_ns.saturating_sub(19_000_000_000)),
+                finished_at_ns: Some(now_ns.saturating_sub(18_000_000_000)),
+                status: JobStatus::Succeeded,
+                attempts: 1,
+                max_attempts: 3,
+                last_error: None,
+            });
+            DEDUPE_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    dedupe_index_key(&format!(
+                        "PollInbox:{}",
+                        now_ns.saturating_sub(20_000_000_000 + seq)
+                    )),
+                    job_id.into_bytes(),
+                );
+            });
+        }
+
+        save_job(&ScheduledJob {
+            id: "job:00000000000000000099:00000000000000000099".to_string(),
+            kind: TaskKind::PollInbox,
+            lane: TaskLane::Mutating,
+            dedupe_key: "PollInbox:999".to_string(),
+            priority: 0,
+            created_at_ns: now_ns,
+            scheduled_for_ns: now_ns,
+            started_at_ns: None,
+            finished_at_ns: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            last_error: None,
+        });
+        DEDUPE_MAP.with(|map| {
+            map.borrow_mut().insert(
+                dedupe_index_key("PollInbox:999"),
+                b"job:00000000000000000099:00000000000000000099".to_vec(),
+            );
+            map.borrow_mut().insert(
+                dedupe_index_key(&format!(
+                    "PollInbox:{}",
+                    now_ns.saturating_sub(30_000_000_000)
+                )),
+                b"job:missing".to_vec(),
+            );
+        });
+
+        let first = run_retention_maintenance_once(now_ns);
+        assert_eq!(first.deleted_jobs, 1, "batch budget should cap first run");
+        let runtime_after_first = retention_maintenance_runtime();
+        assert!(
+            runtime_after_first.job_scan_cursor.is_some()
+                || runtime_after_first.dedupe_scan_cursor.is_some(),
+            "first bounded run should persist a checkpoint cursor"
+        );
+
+        let second = run_retention_maintenance_once(now_ns);
+        assert!(
+            second.deleted_jobs <= 1,
+            "second run must continue respecting the same delete budget"
+        );
+        let third = run_retention_maintenance_once(now_ns);
+        assert!(
+            third.deleted_jobs <= 1,
+            "third run must continue respecting the same delete budget"
+        );
+
+        let fourth = run_retention_maintenance_once(now_ns);
+        assert_eq!(
+            fourth.deleted_jobs, 0,
+            "re-running maintenance after convergence should be idempotent"
+        );
+
+        let remaining_jobs = list_recent_jobs(200);
+        assert!(
+            remaining_jobs.iter().all(|job| !job.is_terminal()
+                || job.scheduled_for_ns >= now_ns.saturating_sub(1_000_000_000)),
+            "old terminal jobs should be pruned while non-terminal/fresh jobs remain"
+        );
+        assert!(
+            remaining_jobs
+                .iter()
+                .any(|job| job.id == "job:00000000000000000099:00000000000000000099"),
+            "pending jobs must never be pruned by retention"
+        );
+
+        let inbox_after = inbox_stats();
+        assert_eq!(inbox_before.pending_count, inbox_after.pending_count);
+        assert_eq!(inbox_before.staged_count, inbox_after.staged_count);
+        assert_eq!(inbox_before.consumed_count, inbox_after.consumed_count);
+    }
+
+    #[test]
+    fn retention_summarizes_then_prunes_inbox_and_outbox_with_conversation_guardrail() {
+        init_storage();
+        clear_inbox_maps_for_tests();
+        clear_outbox_map_for_tests();
+        clear_conversation_map();
+        clear_session_summary_map();
+
+        let now_ns = 200_000_000_000u64;
+        let old_ns = now_ns.saturating_sub(20_000_000_000);
+        set_retention_config(RetentionConfig {
+            inbox_max_age_secs: 1,
+            outbox_max_age_secs: 1,
+            maintenance_batch_size: 50,
+            maintenance_interval_secs: 1,
+            ..RetentionConfig::default()
+        })
+        .expect("retention config should store");
+
+        let protected_id = "inbox:00000000000000000001".to_string();
+        let prune_id = "inbox:00000000000000000002".to_string();
+        let protected_sender = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let prune_sender = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+
+        INBOX_MAP.with(|map| {
+            map.borrow_mut().insert(
+                protected_id.clone(),
+                encode_json(&InboxMessage {
+                    id: protected_id.clone(),
+                    seq: 1,
+                    body: "protected consumed".to_string(),
+                    posted_at_ns: old_ns,
+                    posted_by: protected_sender.clone(),
+                    status: InboxMessageStatus::Consumed,
+                    staged_at_ns: Some(old_ns),
+                    consumed_at_ns: Some(old_ns),
+                }),
+            );
+            map.borrow_mut().insert(
+                prune_id.clone(),
+                encode_json(&InboxMessage {
+                    id: prune_id.clone(),
+                    seq: 2,
+                    body: "prune consumed".to_string(),
+                    posted_at_ns: old_ns,
+                    posted_by: prune_sender.clone(),
+                    status: InboxMessageStatus::Consumed,
+                    staged_at_ns: Some(old_ns),
+                    consumed_at_ns: Some(old_ns),
+                }),
+            );
+        });
+
+        append_conversation_entry(
+            &protected_sender,
+            ConversationEntry {
+                inbox_message_id: protected_id.clone(),
+                sender_body: "protected consumed".to_string(),
+                agent_reply: "ack".to_string(),
+                turn_id: "turn-protected".to_string(),
+                timestamp_ns: old_ns,
+            },
+        );
+
+        OUTBOX_MAP.with(|map| {
+            map.borrow_mut().insert(
+                "outbox:00000000000000000001".to_string(),
+                encode_json(&OutboxMessage {
+                    id: "outbox:00000000000000000001".to_string(),
+                    seq: 1,
+                    turn_id: "turn-protected".to_string(),
+                    body: "protected outbox".to_string(),
+                    created_at_ns: old_ns,
+                    source_inbox_ids: vec![protected_id.clone()],
+                }),
+            );
+            map.borrow_mut().insert(
+                "outbox:00000000000000000002".to_string(),
+                encode_json(&OutboxMessage {
+                    id: "outbox:00000000000000000002".to_string(),
+                    seq: 2,
+                    turn_id: "turn-pruned".to_string(),
+                    body: "pruned outbox".to_string(),
+                    created_at_ns: old_ns,
+                    source_inbox_ids: vec![prune_id.clone()],
+                }),
+            );
+        });
+
+        let stats = run_retention_maintenance_once(now_ns);
+        assert_eq!(
+            stats.deleted_inbox, 1,
+            "only unprotected consumed inbox should prune"
+        );
+        assert_eq!(
+            stats.deleted_outbox, 1,
+            "only unprotected outbox should prune"
+        );
+        assert!(
+            stats.generated_session_summaries >= 1,
+            "summary should be persisted before deletion"
+        );
+        assert!(
+            get_inbox_message_by_id(&protected_id).is_some(),
+            "conversation-protected inbox message must remain"
+        );
+        assert!(
+            get_inbox_message_by_id(&prune_id).is_none(),
+            "unprotected consumed inbox message should be pruned"
+        );
+        let summaries = list_session_summaries(10);
+        assert!(
+            summaries
+                .iter()
+                .any(|summary| summary.sender == prune_sender),
+            "summary store should retain provenance for pruned sender history"
+        );
+    }
+
+    #[test]
+    fn retention_summarizes_then_prunes_turn_transition_and_tools() {
+        init_storage();
+        clear_turn_transition_tool_maps_for_tests();
+        clear_turn_window_summary_map();
+
+        let now_ns = 300_000_000_000u64;
+        let old_ns = now_ns.saturating_sub(20_000_000_000);
+        set_retention_config(RetentionConfig {
+            turns_max_age_secs: 1,
+            transitions_max_age_secs: 1,
+            tools_max_age_secs: 1,
+            maintenance_batch_size: 50,
+            maintenance_interval_secs: 1,
+            ..RetentionConfig::default()
+        })
+        .expect("retention config should store");
+
+        let turn = TurnRecord {
+            id: "turn-old".to_string(),
+            created_at_ns: old_ns,
+            state_from: AgentState::Sleeping,
+            state_to: AgentState::Sleeping,
+            source_events: 0,
+            tool_call_count: 1,
+            input_summary: "old turn".to_string(),
+            inner_dialogue: Some("dialogue".to_string()),
+            inference_round_count: 1,
+            continuation_stop_reason: crate::domain::types::ContinuationStopReason::None,
+            error: Some("tool execution reported failures".to_string()),
+        };
+        TURN_MAP.with(|map| {
+            map.borrow_mut()
+                .insert(format!("{:020}-{}", old_ns, turn.id), encode_json(&turn));
+        });
+
+        TRANSITION_MAP.with(|map| {
+            map.borrow_mut().insert(
+                "00000000000000000001-00000000000000000001".to_string(),
+                encode_json(&TransitionLogRecord {
+                    id: "00000000000000000001-00000000000000000001".to_string(),
+                    turn_id: turn.id.clone(),
+                    from_state: AgentState::Sleeping,
+                    to_state: AgentState::Inferring,
+                    event: "TimerTick".to_string(),
+                    error: Some("transition error".to_string()),
+                    occurred_at_ns: old_ns,
+                }),
+            );
+        });
+
+        TOOL_MAP.with(|map| {
+            map.borrow_mut().insert(
+                format!("tools:{}", turn.id),
+                encode_json(&vec![ToolCallRecord {
+                    turn_id: turn.id.clone(),
+                    tool: "evm_read".to_string(),
+                    args_json: "{}".to_string(),
+                    output: "rpc timeout".to_string(),
+                    success: false,
+                    error: Some("rpc timeout".to_string()),
+                }]),
+            );
+        });
+
+        let stats = run_retention_maintenance_once(now_ns);
+        assert_eq!(
+            stats.deleted_turns, 1,
+            "old turn should prune after summary"
+        );
+        assert_eq!(
+            stats.deleted_transitions, 1,
+            "old transition should prune after summary"
+        );
+        assert_eq!(
+            stats.deleted_tools, 1,
+            "tool records should prune only with summarized/pruned turns"
+        );
+        assert!(
+            stats.generated_turn_window_summaries >= 1,
+            "turn-window summaries should be generated before deletion"
+        );
+        assert!(
+            list_turn_window_summaries(10)
+                .iter()
+                .any(|summary| summary.turn_count >= 1 && summary.tool_call_count >= 1),
+            "turn summary should retain aggregate tool provenance"
+        );
+    }
+
+    #[test]
+    fn context_memory_prefers_critical_raw_and_uses_rollups_when_raw_budget_is_full() {
+        init_storage();
+        clear_memory_rollup_map();
+
+        let now_ns = 200_000_000_000_000u64;
+        for idx in 0..16u64 {
+            set_memory_fact(&MemoryFact {
+                key: format!("strategy.{idx}"),
+                value: format!("value-{idx}"),
+                created_at_ns: now_ns.saturating_sub(MEMORY_ROLLUP_STALE_NS + 5_000_000_000),
+                updated_at_ns: now_ns.saturating_sub(MEMORY_ROLLUP_STALE_NS + 5_000_000_000),
+                source_turn_id: "turn-rollup".to_string(),
+            })
+            .expect("strategy fact should persist");
+        }
+        set_memory_fact(&MemoryFact {
+            key: "balance.eth".to_string(),
+            value: "0x1".to_string(),
+            created_at_ns: now_ns,
+            updated_at_ns: now_ns,
+            source_turn_id: "turn-critical".to_string(),
+        })
+        .expect("critical fact should persist");
+        let generated = update_memory_rollups(now_ns);
+        assert!(
+            generated >= 1,
+            "rollups should be generated from stale non-critical facts"
+        );
+
+        let (raw, rollups) = list_memory_for_context(1, 5);
+        assert_eq!(raw.len(), 1, "raw context should respect configured limit");
+        assert_eq!(raw[0].key, "balance.eth");
+        assert!(
+            !rollups.is_empty(),
+            "rollups should be included when raw context is saturated"
+        );
+    }
+
+    #[test]
+    fn summary_stores_enforce_independent_caps() {
+        init_storage();
+        clear_session_summary_map();
+        clear_turn_window_summary_map();
+        clear_memory_rollup_map();
+
+        for idx in 0..(MAX_SESSION_SUMMARIES + 25) {
+            upsert_session_summary(
+                SessionSummaryAccumulator {
+                    sender: format!("0x{idx:040x}"),
+                    window_start_ns: idx as u64,
+                    window_end_ns: idx as u64,
+                    source_count: 1,
+                    inbox_message_count: 1,
+                    outbox_message_count: 0,
+                    inbox_preview: "inbox".to_string(),
+                    outbox_preview: String::new(),
+                },
+                idx as u64,
+            );
+        }
+        assert!(
+            SESSION_SUMMARY_MAP.with(|map| map.borrow().len() as usize) <= MAX_SESSION_SUMMARIES
+        );
+
+        for idx in 0..(MAX_TURN_WINDOW_SUMMARIES + 10) {
+            upsert_turn_window_summary(
+                TurnSummaryAccumulator {
+                    window_start_ns: idx as u64,
+                    window_end_ns: idx as u64,
+                    source_count: 1,
+                    turn_count: 1,
+                    transition_count: 0,
+                    tool_call_count: 0,
+                    succeeded_turn_count: 1,
+                    failed_turn_count: 0,
+                    tool_success_count: 0,
+                    tool_failure_count: 0,
+                    top_errors: Vec::new(),
+                },
+                idx as u64,
+            );
+        }
+        assert!(
+            TURN_WINDOW_SUMMARY_MAP.with(|map| map.borrow().len() as usize)
+                <= MAX_TURN_WINDOW_SUMMARIES
+        );
+
+        for idx in 0..(MAX_MEMORY_ROLLUPS + 10) {
+            MEMORY_ROLLUP_MAP.with(|map| {
+                map.borrow_mut().insert(
+                    format!("namespace-{idx}"),
+                    encode_json(&MemoryRollup {
+                        namespace: format!("namespace-{idx}"),
+                        window_start_ns: 0,
+                        window_end_ns: idx as u64,
+                        source_count: 1,
+                        source_keys: vec![format!("k{idx}")],
+                        canonical_value: "v".to_string(),
+                        generated_at_ns: idx as u64,
+                    }),
+                );
+            });
+        }
+        enforce_memory_rollup_cap();
+        assert!(MEMORY_ROLLUP_MAP.with(|map| map.borrow().len() as usize) <= MAX_MEMORY_ROLLUPS);
+    }
+
+    #[test]
     fn inbox_messages_stay_pending_until_explicit_stage_call() {
         init_storage();
         post_inbox_message(
@@ -3120,6 +5811,42 @@ mod tests {
         assert!(
             stored.body.contains("[truncated"),
             "stored inbox payload should retain truncation marker for debugging"
+        );
+    }
+
+    #[test]
+    fn inbox_post_handles_oversized_burst_with_bounded_persisted_payloads() {
+        init_storage();
+        let burst_size = 180usize;
+        let oversized_body = "y".repeat(
+            MAX_INBOX_BODY_CHARS.saturating_add(MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS + 512),
+        );
+
+        for idx in 0..burst_size {
+            let message_id = post_inbox_message(oversized_body.clone(), format!("sender-{idx}"))
+                .expect("oversized burst payload should persist after truncation");
+            assert!(
+                message_id.starts_with("inbox:"),
+                "burst insert should return stable inbox ids"
+            );
+        }
+
+        let stats = inbox_stats();
+        assert_eq!(stats.total_messages, burst_size as u64);
+        assert_eq!(stats.pending_count, burst_size as u64);
+        assert_eq!(stats.staged_count, 0);
+        assert_eq!(stats.consumed_count, 0);
+
+        let stored = list_inbox_messages(burst_size);
+        assert_eq!(stored.len(), burst_size);
+        assert!(stored
+            .iter()
+            .all(|message| message.body.chars().count() <= MAX_INBOX_BODY_CHARS));
+        assert!(
+            stored
+                .iter()
+                .all(|message| message.body.contains("[truncated")),
+            "all oversized burst payloads should keep truncation markers for debugging"
         );
     }
 
@@ -3250,6 +5977,68 @@ mod tests {
         assert_eq!(
             bounded.storage_growth.memory_fact_limit, MAX_MEMORY_FACTS as u64,
             "storage growth metrics should expose memory fact cap"
+        );
+        assert!(
+            bounded.storage_growth.tracked_entry_count >= 2,
+            "storage growth metrics should expose tracked entry count"
+        );
+        assert!(
+            bounded.storage_growth.trend_sample_count >= 1,
+            "storage growth metrics should expose trend sample count"
+        );
+    }
+
+    #[test]
+    fn observability_storage_growth_exposes_pressure_and_trend_signals() {
+        init_storage();
+        for idx in 0..(MAX_MEMORY_FACTS * 9 / 10) {
+            set_memory_fact(&MemoryFact {
+                key: format!("phase3.fact.{idx:03}"),
+                value: "x".to_string(),
+                created_at_ns: idx as u64,
+                updated_at_ns: idx as u64,
+                source_turn_id: "phase3-storage-pressure-test".to_string(),
+            })
+            .expect("memory fact setup should remain within configured cap");
+        }
+
+        let baseline = observability_snapshot(1);
+        post_inbox_message("phase3 trend probe".to_string(), "2vxsx-fae".to_string())
+            .expect("inbox message should persist");
+        let after_growth = observability_snapshot(1);
+
+        assert!(
+            after_growth.storage_growth.memory_fact_utilization_percent >= 90,
+            "memory fact utilization signal should reflect high occupancy"
+        );
+        assert!(after_growth.storage_growth.near_limit);
+        assert!(matches!(
+            after_growth.storage_growth.pressure_level,
+            StoragePressureLevel::High | StoragePressureLevel::Critical
+        ));
+        assert!(
+            after_growth
+                .storage_growth
+                .pressure_warnings
+                .iter()
+                .any(|warning| warning.contains("memory facts")),
+            "pressure warnings should include near-limit map diagnostics"
+        );
+        assert!(
+            after_growth.storage_growth.trend_sample_count >= 2,
+            "trend samples should accumulate across snapshots"
+        );
+        assert!(
+            after_growth
+                .storage_growth
+                .tracked_entries_delta_per_hour
+                .is_some(),
+            "storage growth trend should expose a per-hour delta once multiple samples exist"
+        );
+        assert!(
+            after_growth.storage_growth.tracked_entry_count
+                >= baseline.storage_growth.tracked_entry_count,
+            "tracked entry count should not regress after adding a new inbox message"
         );
     }
 
@@ -3837,6 +6626,43 @@ mod tests {
         assert_eq!(succeeded.last_synced_block, None);
         assert_eq!(succeeded.last_error, None);
         assert!(!wallet_balance_bootstrap_pending());
+    }
+
+    #[test]
+    fn wallet_balance_sync_capability_blocks_zero_address_discovery_until_override() {
+        init_storage();
+        set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should be configurable");
+
+        assert!(wallet_balance_sync_capable(&runtime_snapshot()));
+
+        record_wallet_balance_sync_error("Inbox.usdc returned zero address".to_string());
+        assert!(
+            !wallet_balance_sync_capable(&runtime_snapshot()),
+            "discovery should be treated as incapable after zero-address resolution"
+        );
+
+        set_wallet_balance_snapshot(WalletBalanceSnapshot {
+            eth_balance_wei_hex: None,
+            usdc_balance_raw_hex: None,
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: None,
+            last_synced_block: None,
+            last_error: Some("Inbox.usdc returned zero address".to_string()),
+        });
+        assert!(
+            wallet_balance_sync_capable(&runtime_snapshot()),
+            "explicit usdc contract should restore capability"
+        );
     }
 
     #[test]

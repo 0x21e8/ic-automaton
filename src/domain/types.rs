@@ -440,6 +440,46 @@ pub struct ConversationSummary {
     pub entry_count: u32,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub sender: String,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub source_count: u32,
+    pub inbox_message_count: u32,
+    pub outbox_message_count: u32,
+    pub inbox_preview: String,
+    pub outbox_preview: String,
+    pub generated_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TurnWindowSummary {
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub source_count: u32,
+    pub turn_count: u32,
+    pub transition_count: u32,
+    pub tool_call_count: u32,
+    pub succeeded_turn_count: u32,
+    pub failed_turn_count: u32,
+    pub tool_success_count: u32,
+    pub tool_failure_count: u32,
+    pub top_errors: Vec<String>,
+    pub generated_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRollup {
+    pub namespace: String,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub source_count: u32,
+    pub source_keys: Vec<String>,
+    pub canonical_value: String,
+    pub generated_at_ns: u64,
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeView {
     pub state: AgentState,
@@ -520,10 +560,25 @@ pub struct ObservabilitySnapshot {
     pub prompt_layers: Vec<PromptLayerView>,
     pub conversation_summaries: Vec<ConversationSummary>,
     #[serde(default)]
+    pub session_summaries: Vec<SessionSummary>,
+    #[serde(default)]
+    pub turn_window_summaries: Vec<TurnWindowSummary>,
+    #[serde(default)]
+    pub memory_rollups: Vec<MemoryRollup>,
+    #[serde(default)]
     pub cycles: CycleTelemetry,
     pub recent_turns: Vec<TurnRecord>,
     pub recent_transitions: Vec<TransitionLogRecord>,
     pub recent_jobs: Vec<ScheduledJob>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
+pub enum StoragePressureLevel {
+    #[default]
+    Normal,
+    Elevated,
+    High,
+    Critical,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
@@ -539,14 +594,137 @@ pub struct StorageGrowthMetrics {
     pub inbox_pending_queue_entries: u64,
     pub inbox_staged_queue_entries: u64,
     pub outbox_map_entries: u64,
+    #[serde(default)]
+    pub session_summary_entries: u64,
+    #[serde(default)]
+    pub session_summary_limit: u64,
+    #[serde(default)]
+    pub turn_window_summary_entries: u64,
+    #[serde(default)]
+    pub turn_window_summary_limit: u64,
+    #[serde(default)]
+    pub memory_rollup_entries: u64,
+    #[serde(default)]
+    pub memory_rollup_limit: u64,
     pub memory_fact_entries: u64,
     pub memory_fact_limit: u64,
+    #[serde(default)]
+    pub session_summary_utilization_percent: u8,
+    #[serde(default)]
+    pub turn_window_summary_utilization_percent: u8,
+    #[serde(default)]
+    pub memory_rollup_utilization_percent: u8,
+    #[serde(default)]
+    pub memory_fact_utilization_percent: u8,
+    #[serde(default)]
+    pub near_limit: bool,
+    #[serde(default)]
+    pub pressure_level: StoragePressureLevel,
+    #[serde(default)]
+    pub pressure_warnings: Vec<String>,
+    #[serde(default)]
+    pub tracked_entry_count: u64,
+    #[serde(default)]
+    pub tracked_entries_delta_per_hour: Option<i64>,
+    #[serde(default)]
+    pub trend_window_seconds: u64,
+    #[serde(default)]
+    pub trend_sample_count: u32,
     pub retention_progress_percent: u8,
     pub summarization_progress_percent: u8,
     #[serde(default)]
     pub heap_memory_mb: f64,
     #[serde(default)]
     pub stable_memory_mb: f64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RetentionConfig {
+    #[serde(default = "default_jobs_max_age_secs")]
+    pub jobs_max_age_secs: u64,
+    #[serde(default = "default_jobs_max_records")]
+    pub jobs_max_records: u64,
+    #[serde(default = "default_dedupe_max_age_secs")]
+    pub dedupe_max_age_secs: u64,
+    #[serde(default = "default_turns_max_age_secs")]
+    pub turns_max_age_secs: u64,
+    #[serde(default = "default_transitions_max_age_secs")]
+    pub transitions_max_age_secs: u64,
+    #[serde(default = "default_tools_max_age_secs")]
+    pub tools_max_age_secs: u64,
+    #[serde(default = "default_inbox_max_age_secs")]
+    pub inbox_max_age_secs: u64,
+    #[serde(default = "default_outbox_max_age_secs")]
+    pub outbox_max_age_secs: u64,
+    #[serde(default = "default_maintenance_batch_size")]
+    pub maintenance_batch_size: u32,
+    #[serde(default = "default_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            jobs_max_age_secs: default_jobs_max_age_secs(),
+            jobs_max_records: default_jobs_max_records(),
+            dedupe_max_age_secs: default_dedupe_max_age_secs(),
+            turns_max_age_secs: default_turns_max_age_secs(),
+            transitions_max_age_secs: default_transitions_max_age_secs(),
+            tools_max_age_secs: default_tools_max_age_secs(),
+            inbox_max_age_secs: default_inbox_max_age_secs(),
+            outbox_max_age_secs: default_outbox_max_age_secs(),
+            maintenance_batch_size: default_maintenance_batch_size(),
+            maintenance_interval_secs: default_maintenance_interval_secs(),
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionMaintenanceRuntime {
+    #[serde(default)]
+    pub next_run_after_ns: u64,
+    #[serde(default)]
+    pub job_scan_cursor: Option<String>,
+    #[serde(default)]
+    pub dedupe_scan_cursor: Option<String>,
+    #[serde(default)]
+    pub inbox_scan_cursor: Option<String>,
+    #[serde(default)]
+    pub outbox_scan_cursor: Option<String>,
+    #[serde(default)]
+    pub turn_scan_cursor: Option<String>,
+    #[serde(default)]
+    pub transition_scan_cursor: Option<String>,
+    #[serde(default)]
+    pub last_started_ns: Option<u64>,
+    #[serde(default)]
+    pub last_finished_ns: Option<u64>,
+    #[serde(default)]
+    pub last_deleted_jobs: u32,
+    #[serde(default)]
+    pub last_deleted_dedupe: u32,
+    #[serde(default)]
+    pub last_deleted_inbox: u32,
+    #[serde(default)]
+    pub last_deleted_outbox: u32,
+    #[serde(default)]
+    pub last_deleted_turns: u32,
+    #[serde(default)]
+    pub last_deleted_transitions: u32,
+    #[serde(default)]
+    pub last_deleted_tools: u32,
+    #[serde(default)]
+    pub last_generated_session_summaries: u32,
+    #[serde(default)]
+    pub last_generated_turn_window_summaries: u32,
+    #[serde(default)]
+    pub last_generated_memory_rollups: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub retention_progress_percent: u8,
+    #[serde(default)]
+    pub summarization_progress_percent: u8,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
@@ -1072,12 +1250,53 @@ fn default_response_limit_tune_multiplier() -> u64 {
     2
 }
 
+fn default_jobs_max_age_secs() -> u64 {
+    14 * 24 * 60 * 60
+}
+
+fn default_jobs_max_records() -> u64 {
+    60_000
+}
+
+fn default_dedupe_max_age_secs() -> u64 {
+    3 * 24 * 60 * 60
+}
+
+fn default_turns_max_age_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_transitions_max_age_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_tools_max_age_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
+fn default_inbox_max_age_secs() -> u64 {
+    14 * 24 * 60 * 60
+}
+
+fn default_outbox_max_age_secs() -> u64 {
+    14 * 24 * 60 * 60
+}
+
+fn default_maintenance_batch_size() -> u32 {
+    120
+}
+
+fn default_maintenance_interval_secs() -> u64 {
+    10 * 60
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        RecoveryContext, ResponseLimitPolicy, RuntimeSnapshot, WalletBalanceSnapshot,
-        WalletBalanceStatus, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-        WalletBalanceTelemetryView,
+        MemoryRollup, RecoveryContext, ResponseLimitPolicy, RetentionConfig,
+        RetentionMaintenanceRuntime, RuntimeSnapshot, SessionSummary, TurnWindowSummary,
+        WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
+        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
     };
 
     #[test]
@@ -1217,5 +1436,72 @@ mod tests {
         assert_eq!(policy.min_bytes, 256);
         assert_eq!(policy.max_bytes, 4 * 1024);
         assert_eq!(policy.tune_multiplier, 2);
+    }
+
+    #[test]
+    fn retention_defaults_match_phase_one_policy() {
+        let retention = RetentionConfig::default();
+        assert_eq!(retention.jobs_max_age_secs, 14 * 24 * 60 * 60);
+        assert_eq!(retention.dedupe_max_age_secs, 3 * 24 * 60 * 60);
+        assert_eq!(retention.jobs_max_records, 60_000);
+        assert_eq!(retention.maintenance_batch_size, 120);
+        assert_eq!(retention.maintenance_interval_secs, 10 * 60);
+
+        let runtime = RetentionMaintenanceRuntime::default();
+        assert_eq!(runtime.next_run_after_ns, 0);
+        assert_eq!(runtime.retention_progress_percent, 0);
+        assert_eq!(runtime.summarization_progress_percent, 0);
+    }
+
+    #[test]
+    fn summary_schemas_round_trip_json_with_provenance_fields() {
+        let session = SessionSummary {
+            sender: "0xabc".to_string(),
+            window_start_ns: 10,
+            window_end_ns: 20,
+            source_count: 3,
+            inbox_message_count: 2,
+            outbox_message_count: 1,
+            inbox_preview: "inbox".to_string(),
+            outbox_preview: "outbox".to_string(),
+            generated_at_ns: 30,
+        };
+        let encoded_session = serde_json::to_vec(&session).expect("session summary should encode");
+        let decoded_session: SessionSummary =
+            serde_json::from_slice(&encoded_session).expect("session summary should decode");
+        assert_eq!(decoded_session, session);
+
+        let turn = TurnWindowSummary {
+            window_start_ns: 100,
+            window_end_ns: 200,
+            source_count: 4,
+            turn_count: 2,
+            transition_count: 2,
+            tool_call_count: 3,
+            succeeded_turn_count: 1,
+            failed_turn_count: 1,
+            tool_success_count: 2,
+            tool_failure_count: 1,
+            top_errors: vec!["timeout".to_string()],
+            generated_at_ns: 300,
+        };
+        let encoded_turn = serde_json::to_vec(&turn).expect("turn window summary should encode");
+        let decoded_turn: TurnWindowSummary =
+            serde_json::from_slice(&encoded_turn).expect("turn window summary should decode");
+        assert_eq!(decoded_turn, turn);
+
+        let rollup = MemoryRollup {
+            namespace: "strategy".to_string(),
+            window_start_ns: 400,
+            window_end_ns: 500,
+            source_count: 2,
+            source_keys: vec!["strategy.alpha".to_string(), "strategy.beta".to_string()],
+            canonical_value: "alpha=buy; beta=sell".to_string(),
+            generated_at_ns: 600,
+        };
+        let encoded_rollup = serde_json::to_vec(&rollup).expect("memory rollup should encode");
+        let decoded_rollup: MemoryRollup =
+            serde_json::from_slice(&encoded_rollup).expect("memory rollup should decode");
+        assert_eq!(decoded_rollup, rollup);
     }
 }

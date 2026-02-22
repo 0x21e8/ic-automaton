@@ -97,6 +97,20 @@ struct InitArgs {
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct RetentionConfig {
+    jobs_max_age_secs: u64,
+    jobs_max_records: u64,
+    dedupe_max_age_secs: u64,
+    turns_max_age_secs: u64,
+    transitions_max_age_secs: u64,
+    tools_max_age_secs: u64,
+    inbox_max_age_secs: u64,
+    outbox_max_age_secs: u64,
+    maintenance_batch_size: u32,
+    maintenance_interval_secs: u64,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
 struct InboxStats {
     total_messages: u64,
     pending_count: u64,
@@ -230,6 +244,13 @@ fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: Infe
         panic!("failed to encode set_inference_provider args: {error}");
     });
     let _: String = call_update(pic, canister_id, "set_inference_provider", payload);
+}
+
+fn set_retention_config(pic: &PocketIc, canister_id: Principal, config: RetentionConfig) {
+    let payload = encode_args((config,)).expect("failed to encode set_retention_config args");
+    let result: Result<RetentionConfig, String> =
+        call_update(pic, canister_id, "set_retention_config", payload);
+    assert!(result.is_ok(), "set_retention_config failed: {result:?}");
 }
 
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
@@ -755,5 +776,85 @@ fn non_controller_can_mutate_inference_config_but_not_control_plane() {
     assert!(
         post_result.is_ok(),
         "post_inbox_message should remain public ingress"
+    );
+}
+
+#[test]
+fn high_volume_agent_turn_flow_keeps_forward_progress_with_retention_enabled() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 1);
+    }
+    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+    set_retention_config(
+        &pic,
+        canister_id,
+        RetentionConfig {
+            jobs_max_age_secs: 2,
+            jobs_max_records: 64,
+            dedupe_max_age_secs: 2,
+            turns_max_age_secs: 2,
+            transitions_max_age_secs: 2,
+            tools_max_age_secs: 2,
+            inbox_max_age_secs: 2,
+            outbox_max_age_secs: 2,
+            maintenance_batch_size: 128,
+            maintenance_interval_secs: 1,
+        },
+    );
+
+    for idx in 0..120 {
+        let posted = post_inbox_message(&pic, canister_id, &format!("phase3-burst-{idx:03}"));
+        assert!(
+            posted.is_ok(),
+            "posting synthetic inbox message should succeed"
+        );
+    }
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+
+    for _ in 0..220 {
+        pic.advance_time(Duration::from_secs(2));
+        pic.tick();
+    }
+
+    let runtime = get_runtime_view(&pic, canister_id);
+    assert!(
+        runtime.turn_counter >= 8,
+        "agent should continue completing turns under sustained high-volume ingress"
+    );
+    assert!(
+        runtime.last_error.is_none(),
+        "runtime should not fault while retention and summarization run"
+    );
+
+    let stats = get_inbox_stats(&pic, canister_id);
+    assert!(
+        stats.consumed_count >= 8,
+        "agent should consume a meaningful portion of high-volume staged inbox traffic"
+    );
+    assert!(
+        stats.pending_count == 0,
+        "polling should continue draining the pending queue under sustained load"
+    );
+
+    let retained_outbox = list_outbox_messages(&pic, canister_id, 200);
+    assert!(
+        retained_outbox.len() <= 90,
+        "retention should bound outbox history under sustained load"
+    );
+
+    let retained_jobs = list_scheduler_jobs(&pic, canister_id);
+    assert!(
+        retained_jobs.len() <= 90,
+        "retention should bound scheduler job history under sustained load"
     );
 }
