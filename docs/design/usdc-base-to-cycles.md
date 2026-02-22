@@ -772,11 +772,11 @@ Canister must have >60B cycles before starting.
 - [x] Implement `status()`, `start()`, `reset()`
 
 ### Phase 2: ICP-Side Steps (Bottom-Up)
-- [ ] Implement `mint_cycles` step (CMC `notify_top_up`)
-- [ ] Implement `transfer_to_cmc` step (ICP ledger transfer)
-- [ ] Implement `swap_to_icp` step (KongSwap `swap`)
-- [ ] Implement `approve_kongswap` step (ICRC-2 approve)
-- [ ] Test Phase 2 with manually deposited bridged USDC and ICP
+- [x] Implement `mint_cycles` step (CMC `notify_top_up`)
+- [x] Implement `transfer_to_cmc` step (ICP ledger transfer)
+- [x] Implement `swap_to_icp` step (KongSwap `swap`)
+- [x] Implement `approve_kongswap` step (ICRC-2 approve)
+- [x] Validate Phase 2 with deterministic unit tests for ICP-side transitions (manual deposit E2E validation pending host wiring)
 
 ### Phase 3: Bridge Steps
 - [ ] Implement `encode_principal_for_onesec()` and ABI encoding helpers

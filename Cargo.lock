@@ -107,6 +107,7 @@ dependencies = [
  "pocket-ic",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "ureq",
 ]
