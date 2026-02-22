@@ -779,27 +779,25 @@ Canister must have >60B cycles before starting.
 - [x] Validate Phase 2 with deterministic unit tests for ICP-side transitions (manual deposit E2E validation pending host wiring)
 
 ### Phase 3: Bridge Steps
-- [ ] Implement `encode_principal_for_onesec()` and ABI encoding helpers
-- [ ] Implement `approve_locker` step (EVM tx via `EvmPort`)
-- [ ] Implement `lock_usdc` step (EVM tx via `EvmPort`)
-- [ ] Implement `poll_tx` step (confirmation polling via `EvmPort`)
-- [ ] Implement `validate_on_onesec` step (Onesec `transfer_evm_to_icp`)
-- [ ] Implement `poll_bridge` step (Onesec `get_transfer`)
-- [ ] Implement `preflight` step (balance + fee checks)
+- [x] Implement `encode_principal_for_onesec()` and ABI encoding helpers
+- [x] Implement `approve_locker` step (EVM tx via `EvmPort`)
+- [x] Implement `lock_usdc` step (EVM tx via `EvmPort`)
+- [x] Implement `poll_tx` step (confirmation polling via `EvmPort`)
+- [x] Implement `validate_on_onesec` step (Onesec `transfer_evm_to_icp`)
+- [x] Implement `poll_bridge` step (Onesec `get_transfer`)
+- [x] Implement `preflight` step (balance + fee checks)
 
 ### Phase 4: Host Integration (IC-Automaton)
-- [ ] Implement `AutomatonEvmPort` and `AutomatonStoragePort`
-- [ ] Add `TopUpCycles` to `TaskKind` enum + scheduler dispatch
-- [ ] Add trigger logic to `CheckCycles`
-- [ ] Add `top_up_status` and `trigger_top_up` agent tools
-- [ ] Add `TopUpConfig` fields to init args / `RuntimeSnapshot`
-- [ ] Allocate `MemoryId::new(24)` for top-up state
+- [x] Implement `AutomatonEvmPort` and `AutomatonStoragePort`
+- [x] Add `TopUpCycles` to `TaskKind` enum + scheduler dispatch
+- [x] Add trigger logic to `CheckCycles`
+- [x] Add `top_up_status` and `trigger_top_up` agent tools
+- [x] Add `TopUpConfig` fields to init args / `RuntimeSnapshot`
+- [x] Allocate `MemoryId::new(24)` for top-up state
 
 ### Phase 5: Testing & Hardening
 - [ ] Unit tests for ABI encoding, principal encoding, CMC subaccount
 - [ ] Integration test: mock `EvmPort` + mock `StoragePort`, drive full state machine
-- [ ] End-to-end test on mainnet with 1 USDC
-- [ ] Mainnet dry run with 5-10 USDC via `CheckCycles` trigger
 
 ---
 

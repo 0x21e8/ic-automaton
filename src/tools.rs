@@ -1,6 +1,7 @@
 use crate::domain::types::{
     AgentState, MemoryFact, PromptLayer, SurvivalOperationClass, ToolCall, ToolCallRecord,
 };
+use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
 use crate::prompt;
@@ -148,6 +149,20 @@ impl ToolManager {
                 allowed_states: vec![AgentState::ExecutingActions],
             },
         );
+        policies.insert(
+            "top_up_status".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        policies.insert(
+            "trigger_top_up".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
 
         Self { policies }
     }
@@ -289,6 +304,8 @@ impl ToolManager {
                 "recall" => recall_facts_tool(&call.args_json),
                 "forget" => forget_fact_tool(&call.args_json),
                 "http_fetch" => http_fetch_tool(&call.args_json).await,
+                "top_up_status" => Ok(top_up_status_tool()),
+                "trigger_top_up" => trigger_top_up_tool(),
                 "update_prompt_layer" => parse_update_prompt_layer_args(&call.args_json).and_then(
                     |(layer_id, content)| {
                         update_prompt_layer_content(layer_id, content, turn_id).map(|layer| {
@@ -571,6 +588,7 @@ fn forget_fact_tool(args_json: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::domain::types::{AgentState, SurvivalOperationClass, SurvivalTier};
+    use crate::features::cycle_topup::TopUpStage;
     use crate::storage::stable;
     use async_trait::async_trait;
     use std::cell::Cell;
@@ -1058,5 +1076,64 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records[0].success);
         assert!(records[1].success);
+    }
+
+    #[test]
+    fn top_up_status_tool_reports_state_in_inferring() {
+        stable::init_storage();
+        stable::write_topup_state(&TopUpStage::Completed {
+            cycles_minted: 123,
+            usdc_spent: 4_000_000,
+            completed_at_ns: 9,
+        });
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "top_up_status".to_string(),
+            args_json: "{}".to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-status"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        assert!(records[0].output.contains("Completed"));
+    }
+
+    #[test]
+    fn trigger_top_up_tool_starts_preflight_and_enqueues_job() {
+        stable::init_storage();
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "trigger_top_up".to_string(),
+            args_json: "{}".to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-topup"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success, "{:?}", records[0]);
+        assert_eq!(records[0].output, "Top-up enqueued.");
+        assert!(matches!(
+            stable::read_topup_state(),
+            Some(TopUpStage::Preflight)
+        ));
+        assert!(
+            stable::list_recent_jobs(10)
+                .into_iter()
+                .any(|job| job.kind == crate::domain::types::TaskKind::TopUpCycles),
+            "trigger should enqueue a TopUpCycles job"
+        );
     }
 }

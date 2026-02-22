@@ -10,6 +10,7 @@ use crate::domain::types::{
     TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
     WalletBalanceTelemetryView,
 };
+use crate::features::cycle_topup::TopUpStage;
 use crate::prompt;
 use candid::Principal;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -44,6 +45,7 @@ const CYCLE_BALANCE_SAMPLES_KEY: &str = "cycles.balance.samples";
 const STORAGE_GROWTH_SAMPLES_KEY: &str = "storage.growth.samples";
 const RETENTION_CONFIG_KEY: &str = "retention.config";
 const RETENTION_RUNTIME_KEY: &str = "retention.runtime";
+const TOPUP_STATE_KEY: &str = "cycle_topup.state";
 const MAX_RECENT_JOBS: usize = 200;
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
@@ -359,6 +361,11 @@ thread_local! {
         StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(23)))
+    ));
+    static TOPUP_STATE_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(24)))
     ));
 }
 
@@ -1203,6 +1210,25 @@ pub fn list_memory_for_context(
 pub fn runtime_snapshot() -> RuntimeSnapshot {
     let payload = RUNTIME_MAP.with(|map| map.borrow().get(&RUNTIME_KEY.to_string()));
     read_json(payload.as_deref()).unwrap_or_default()
+}
+
+pub fn read_topup_state() -> Option<TopUpStage> {
+    TOPUP_STATE_MAP
+        .with(|map| map.borrow().get(&TOPUP_STATE_KEY.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn write_topup_state(state: &TopUpStage) {
+    TOPUP_STATE_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(TOPUP_STATE_KEY.to_string(), encode_json(state));
+    });
+}
+
+pub fn clear_topup_state() {
+    TOPUP_STATE_MAP.with(|map| {
+        map.borrow_mut().remove(&TOPUP_STATE_KEY.to_string());
+    });
 }
 
 pub fn save_runtime_snapshot(snapshot: &RuntimeSnapshot) {
@@ -3294,6 +3320,7 @@ fn parse_task_kind(raw_key: &str) -> Option<TaskKind> {
         "AgentTurn" => Some(TaskKind::AgentTurn),
         "PollInbox" => Some(TaskKind::PollInbox),
         "CheckCycles" => Some(TaskKind::CheckCycles),
+        "TopUpCycles" => Some(TaskKind::TopUpCycles),
         "Reconcile" => Some(TaskKind::Reconcile),
         _ => None,
     }

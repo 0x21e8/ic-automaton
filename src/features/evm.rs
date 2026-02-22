@@ -482,6 +482,16 @@ impl HttpEvmRpcClient {
         normalize_hex_blob(raw, "eth_sendRawTransaction result")
     }
 
+    pub async fn json_rpc_call(&self, method: &str, params_json: &str) -> Result<String, String> {
+        let params: Value = serde_json::from_str(params_json)
+            .map_err(|error| format!("invalid {method} params json: {error}"))?;
+        let response = self
+            .rpc_call(method, params, self.max_response_bytes)
+            .await?;
+        serde_json::to_string(&response)
+            .map_err(|error| format!("failed to serialize {method} response: {error}"))
+    }
+
     async fn rpc_call(
         &self,
         method: &str,
