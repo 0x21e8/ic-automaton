@@ -707,7 +707,7 @@ fn apply_inference_config_update(
 
 fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::InferenceProvider, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "llm_canister" | "llm-canister" | "ic_llm" | "icllm" | "mock" => {
+        "llm_canister" | "llm-canister" | "ic_llm" | "icllm" => {
             Ok(crate::domain::types::InferenceProvider::IcLlm)
         }
         "openrouter" => Ok(crate::domain::types::InferenceProvider::OpenRouter),
@@ -718,7 +718,7 @@ fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::Inference
 fn is_ic_llm_model_alias(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "llama3.1:8b" | "qwen3:32b" | "llama4-scout"
+        "llama3.1:8b" | "qwen3:32b" | "llama4-scout" | "deterministic-local"
     )
 }
 

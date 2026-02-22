@@ -31,6 +31,11 @@ struct InitArgs {
     evm_chain_id: Option<u64>,
 }
 
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+enum InferenceProvider {
+    IcLlm,
+}
+
 #[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 enum TaskKind {
     AgentTurn,
@@ -131,6 +136,8 @@ fn with_backend_canister() -> (PocketIc, Principal) {
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
     pic.install_canister(canister_id, wasm, init_args, None);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
+    set_inference_model(&pic, canister_id, "deterministic-local");
 
     (pic, canister_id)
 }
@@ -179,6 +186,18 @@ fn call_http_update<'a>(
 fn set_task_enabled(pic: &PocketIc, canister_id: Principal, kind: TaskKind, enabled: bool) {
     let payload = encode_args((kind, enabled)).expect("failed to encode set_task_enabled");
     let _: String = call_update(pic, canister_id, "set_task_enabled", payload);
+}
+
+fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: InferenceProvider) {
+    let payload = encode_args((provider,)).expect("failed to encode set_inference_provider");
+    let _: String = call_update(pic, canister_id, "set_inference_provider", payload);
+}
+
+fn set_inference_model(pic: &PocketIc, canister_id: Principal, model: &str) {
+    let payload = encode_args((model.to_string(),)).expect("failed to encode set_inference_model");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "set_inference_model", payload);
+    assert!(result.is_ok(), "set_inference_model failed: {result:?}");
 }
 
 fn set_task_interval_secs(pic: &PocketIc, canister_id: Principal, kind: TaskKind, interval: u64) {

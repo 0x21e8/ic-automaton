@@ -749,7 +749,6 @@ pub struct CycleTelemetry {
 )]
 pub enum InferenceProvider {
     #[default]
-    Mock,
     IcLlm,
     OpenRouter,
 }
