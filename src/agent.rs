@@ -1,8 +1,8 @@
 use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, ContinuationStopReason, ConversationEntry, InboxMessage,
-    InferenceInput, InferenceProvider, MemoryFact, ToolCall, ToolCallRecord, TurnRecord,
-    WalletBalanceStatus,
+    InferenceInput, InferenceProvider, MemoryFact, MemoryRollup, ToolCall, ToolCallRecord,
+    TurnRecord, WalletBalanceStatus,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
@@ -279,7 +279,7 @@ fn continuation_tool_content(record: &ToolCallRecord) -> String {
     .to_string()
 }
 
-fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) {
+fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) -> Result<(), String> {
     let existing = stable::get_memory_fact(key);
     stable::set_memory_fact(&MemoryFact {
         key: key.to_string(),
@@ -290,7 +290,7 @@ fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) {
             .unwrap_or(now_ns),
         updated_at_ns: now_ns,
         source_turn_id: turn_id.to_string(),
-    });
+    })
 }
 
 fn successful_eth_balance_read(call: &ToolCallRecord) -> Option<(String, String)> {
@@ -317,19 +317,35 @@ fn persist_eth_balance_from_tool_calls(tool_calls: &[ToolCallRecord], turn_id: &
         let Some((address, balance_hex)) = successful_eth_balance_read(call) else {
             continue;
         };
-        upsert_memory_fact("balance.eth", balance_hex.clone(), turn_id, now_ns);
-        upsert_memory_fact(
+        if let Err(error) = upsert_memory_fact("balance.eth", balance_hex.clone(), turn_id, now_ns)
+        {
+            log!(
+                AgentLogPriority::Error,
+                "memory_fact_upsert_failed key=balance.eth err={error}"
+            );
+        }
+        if let Err(error) = upsert_memory_fact(
             &format!("balance.eth.{address}"),
             balance_hex,
             turn_id,
             now_ns,
-        );
-        upsert_memory_fact(
+        ) {
+            log!(
+                AgentLogPriority::Error,
+                "memory_fact_upsert_failed key=balance.eth.{address} err={error}"
+            );
+        }
+        if let Err(error) = upsert_memory_fact(
             "balance.eth.last_checked_ns",
             now_ns.to_string(),
             turn_id,
             now_ns,
-        );
+        ) {
+            log!(
+                AgentLogPriority::Error,
+                "memory_fact_upsert_failed key=balance.eth.last_checked_ns err={error}"
+            );
+        }
     }
 }
 
@@ -483,6 +499,7 @@ fn build_dynamic_context(
     staged_messages: &[InboxMessage],
     evm_events: usize,
     memory_facts: &[MemoryFact],
+    memory_rollups: &[MemoryRollup],
     turn_id: &str,
     conversation_history_limit: usize,
 ) -> String {
@@ -515,15 +532,25 @@ fn build_dynamic_context(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    let memory_section = if memory_facts.is_empty() {
+    let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
         "### Recent Memory\n- none".to_string()
     } else {
         let mut lines = vec!["### Recent Memory".to_string()];
         for fact in memory_facts {
             lines.push(format!(
-                "- {}={}",
+                "- raw {}={}",
                 fact.key,
                 sanitize_preview(&fact.value, 220)
+            ));
+        }
+        for rollup in memory_rollups {
+            lines.push(format!(
+                "- rollup {} [{}..{}] sources={} {}",
+                rollup.namespace,
+                rollup.window_start_ns,
+                rollup.window_end_ns,
+                rollup.source_count,
+                sanitize_preview(&rollup.canonical_value, 220)
             ));
         }
         lines.join("\n")
@@ -648,7 +675,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     if !snapshot.loop_enabled || snapshot.turn_in_flight {
         return Ok(());
     }
-    if snapshot.wallet_balance_bootstrap_pending {
+    if snapshot.wallet_balance_bootstrap_pending && stable::wallet_balance_sync_capable(&snapshot) {
         return Ok(());
     }
 
@@ -720,7 +747,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             .map(|message| message.body.as_str())
             .collect::<Vec<_>>()
             .join(" | ");
-        let memory_facts = stable::list_all_memory_facts(20);
+        let (memory_facts, memory_rollups) = stable::list_memory_for_context(20, 8);
         let conversation_history_limit =
             conversation_history_limit_for_provider(&snapshot.inference_provider);
         let context_summary = build_dynamic_context(
@@ -728,6 +755,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             &staged_messages,
             evm_events,
             &memory_facts,
+            &memory_rollups,
             &turn_id,
             conversation_history_limit,
         );
@@ -1146,8 +1174,8 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ContinuationStopReason, EvmPollCursor, InboxMessageStatus, MemoryFact, RuntimeSnapshot,
-        SurvivalTier, ToolCall, ToolCallRecord,
+        ContinuationStopReason, EvmPollCursor, InboxMessageStatus, MemoryFact, MemoryRollup,
+        RuntimeSnapshot, SurvivalTier, ToolCall, ToolCallRecord,
     };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -1300,6 +1328,44 @@ mod tests {
     }
 
     #[test]
+    fn persist_eth_balance_from_tool_calls_respects_memory_fact_capacity() {
+        reset_runtime(AgentState::Sleeping, true, false, 8);
+        for idx in 0..stable::MAX_MEMORY_FACTS {
+            stable::set_memory_fact(&MemoryFact {
+                key: format!("fact.{idx}"),
+                value: "seed".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 1,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("seed fact should persist");
+        }
+        assert_eq!(stable::memory_fact_count(), stable::MAX_MEMORY_FACTS);
+
+        let calls = vec![ToolCallRecord {
+            turn_id: "turn-9".to_string(),
+            tool: "evm_read".to_string(),
+            args_json:
+                r#"{"method":"eth_getBalance","address":"0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"}"#
+                    .to_string(),
+            output: "0x1".to_string(),
+            success: true,
+            error: None,
+        }];
+        persist_eth_balance_from_tool_calls(&calls, "turn-9", 100);
+
+        assert_eq!(
+            stable::memory_fact_count(),
+            stable::MAX_MEMORY_FACTS,
+            "agent-internal memory writes must not bypass memory fact cardinality cap"
+        );
+        assert!(
+            stable::get_memory_fact("balance.eth").is_none(),
+            "new balance fact should be rejected when map is at capacity"
+        );
+    }
+
+    #[test]
     fn suppress_duplicate_autonomy_tool_calls_respects_60m_window() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         let call = ToolCall {
@@ -1362,6 +1428,14 @@ mod tests {
     #[test]
     fn skipped_when_wallet_balance_bootstrap_is_pending_is_successful_and_non_mutating() {
         reset_runtime(AgentState::Sleeping, true, false, 9);
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be accepted");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract address should be accepted");
         stable::set_wallet_balance_bootstrap_pending(true);
 
         let result = block_on_with_spin(run_scheduled_turn_job());
@@ -1460,7 +1534,7 @@ mod tests {
         ];
         let snapshot = stable::runtime_snapshot();
 
-        let context = build_dynamic_context(&snapshot, &staged, 3, &memory, "turn-12", 5);
+        let context = build_dynamic_context(&snapshot, &staged, 3, &memory, &[], "turn-12", 5);
         assert!(context.contains("## Layer 10: Dynamic Context"));
         assert!(context.contains("### Current State"));
         assert!(context.contains("- survival_tier: LowCycles"));
@@ -1475,7 +1549,7 @@ mod tests {
         assert!(context.contains("### Pending Obligations"));
         assert!(context.contains("- staged_count: 2"));
         assert!(context.contains("### Recent Memory"));
-        assert!(context.contains("- strategy=buy dips"));
+        assert!(context.contains("- raw strategy=buy dips"));
         assert!(context.contains("### Available Tools"));
     }
 
@@ -1499,9 +1573,29 @@ mod tests {
         .expect("wallet balance sync config should persist");
 
         let snapshot = stable::runtime_snapshot();
-        let context = build_dynamic_context(&snapshot, &[], 0, &[], "turn-12", 5);
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], "turn-12", 5);
         assert!(context.contains("- wallet_balance_is_stale: false"));
         assert!(context.contains("- wallet_balance_status: Fresh"));
+    }
+
+    #[test]
+    fn dynamic_context_includes_memory_rollups_when_provided() {
+        reset_runtime(AgentState::Sleeping, true, false, 12);
+        let snapshot = stable::runtime_snapshot();
+        let rollups = vec![MemoryRollup {
+            namespace: "strategy".to_string(),
+            window_start_ns: 10,
+            window_end_ns: 20,
+            source_count: 3,
+            source_keys: vec!["strategy.a".to_string()],
+            canonical_value: "strategy.a=hold".to_string(),
+            generated_at_ns: 30,
+        }];
+
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], &rollups, "turn-12", 5);
+        assert!(context.contains("### Recent Memory"));
+        assert!(context.contains("- rollup strategy [10..20] sources=3"));
+        assert!(context.contains("strategy.a=hold"));
     }
 
     #[test]
@@ -1539,7 +1633,7 @@ mod tests {
             staged_message("inbox-b", 2, sender_b, "new msg from b"),
         ];
         let snapshot = stable::runtime_snapshot();
-        let context = build_dynamic_context(&snapshot, &staged, 0, &[], "turn-2", 5);
+        let context = build_dynamic_context(&snapshot, &staged, 0, &[], &[], "turn-2", 5);
 
         assert!(context.contains(&format!("### Conversation with {sender_a}")));
         assert!(context.contains("a-msg-1"));
@@ -1583,7 +1677,7 @@ mod tests {
         );
 
         let snapshot = stable::runtime_snapshot();
-        let context = build_dynamic_context(&snapshot, &[], 0, &[], turn_id, 5);
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], turn_id, 5);
         assert!(context.contains("- record_signal: calls_this_turn=2"));
         assert!(context.contains("- evm_read: calls_this_turn=1"));
     }
@@ -1608,7 +1702,7 @@ mod tests {
 
         let staged = vec![staged_message("inbox-1", 1, sender, "newest incoming")];
         let snapshot = stable::runtime_snapshot();
-        let context = build_dynamic_context(&snapshot, &staged, 0, &[], "turn-4", 2);
+        let context = build_dynamic_context(&snapshot, &staged, 0, &[], &[], "turn-4", 2);
         assert!(context.contains("sender-2"));
         assert!(context.contains("sender-3"));
         assert!(!context.contains("sender-1"));

@@ -16,7 +16,6 @@ fn current_time_ns() -> u64 {
     return 1;
 }
 
-const MAX_MEMORY_FACTS: usize = 500;
 const MAX_MEMORY_KEY_BYTES: usize = 128;
 const MAX_MEMORY_VALUE_BYTES: usize = 4096;
 const MAX_MEMORY_RECALL_RESULTS: usize = 50;
@@ -527,11 +526,6 @@ fn remember_fact_tool(args_json: &str, turn_id: &str) -> Result<String, String> 
     let (key, value) = parse_remember_args(args_json)?;
     let now_ns = current_time_ns();
     let existing = stable::get_memory_fact(&key);
-
-    if existing.is_none() && stable::memory_fact_count() >= MAX_MEMORY_FACTS {
-        return Err(format!("memory full: max {MAX_MEMORY_FACTS} facts"));
-    }
-
     stable::set_memory_fact(&MemoryFact {
         key: key.clone(),
         value,
@@ -541,7 +535,7 @@ fn remember_fact_tool(args_json: &str, turn_id: &str) -> Result<String, String> 
             .unwrap_or(now_ns),
         updated_at_ns: now_ns,
         source_turn_id: turn_id.to_string(),
-    });
+    })?;
     Ok(format!("stored: {key}"))
 }
 
@@ -847,6 +841,42 @@ mod tests {
         assert!(records[0].success);
         assert!(records[1].success);
         assert!(records[1].output.contains("strategy=buy-dips"));
+    }
+
+    #[test]
+    fn remember_tool_respects_global_memory_fact_capacity() {
+        stable::init_storage();
+        for idx in 0..stable::MAX_MEMORY_FACTS {
+            stable::set_memory_fact(&MemoryFact {
+                key: format!("fact.{idx}"),
+                value: "seed".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 1,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("seed fact should store");
+        }
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "remember".to_string(),
+            args_json: r#"{"key":"overflow","value":"new"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-overflow"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("memory full"),
+            "remember tool should fail when memory facts are at capacity"
+        );
     }
 
     #[test]
