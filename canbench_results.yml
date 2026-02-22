@@ -1,0 +1,23 @@
+benches:
+  bench_list_inbox_messages_recent:
+    total:
+      calls: 1
+      instructions: 932142
+      heap_increase: 0
+      stable_memory_increase: 0
+    scopes: {}
+  bench_list_outbox_messages_recent:
+    total:
+      calls: 1
+      instructions: 781508
+      heap_increase: 0
+      stable_memory_increase: 0
+    scopes: {}
+  bench_list_recent_jobs:
+    total:
+      calls: 1
+      instructions: 1291555
+      heap_increase: 0
+      stable_memory_increase: 0
+    scopes: {}
+version: 0.4.0

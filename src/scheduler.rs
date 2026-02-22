@@ -92,6 +92,23 @@ pub async fn scheduler_tick() {
         }
     }
 
+    if let Some(pruned) = stable::run_retention_maintenance_if_due(current_time_ns()) {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_retention_maintenance deleted_jobs={} deleted_dedupe={} deleted_inbox={} deleted_outbox={} deleted_turns={} deleted_transitions={} deleted_tools={} generated_session_summaries={} generated_turn_window_summaries={} generated_memory_rollups={}",
+            pruned.deleted_jobs,
+            pruned.deleted_dedupe,
+            pruned.deleted_inbox,
+            pruned.deleted_outbox,
+            pruned.deleted_turns,
+            pruned.deleted_transitions,
+            pruned.deleted_tools,
+            pruned.generated_session_summaries,
+            pruned.generated_turn_window_summaries,
+            pruned.generated_memory_rollups
+        );
+    }
+
     log!(
         SchedulerLogPriority::Info,
         "scheduler_tick_end processed_jobs={} now={}",
@@ -311,7 +328,11 @@ fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
 
 fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
     match decode_message_queued_payload(&event.payload) {
-        Ok(decoded) => (decoded.message, decoded.sender),
+        Ok(decoded) => {
+            let bounded = stable::normalize_inbox_body(&decoded.message)
+                .unwrap_or_else(|_| "[invalid decoded message]".to_string());
+            (bounded, decoded.sender)
+        }
         Err(error) => {
             log!(
                 SchedulerLogPriority::Error,
@@ -320,7 +341,9 @@ fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
                 event.log_index,
                 error
             );
-            (evm_event_to_inbox_body(event), event.source.clone())
+            let fallback = stable::normalize_inbox_body(&evm_event_to_inbox_body(event))
+                .unwrap_or_else(|_| "[evm log decode failed]".to_string());
+            (fallback, event.source.clone())
         }
     }
 }
@@ -395,6 +418,17 @@ async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
         );
         return;
     };
+    if !stable::wallet_balance_sync_capable(snapshot) {
+        if snapshot.wallet_balance_bootstrap_pending {
+            stable::set_wallet_balance_bootstrap_pending(false);
+        }
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_wallet_balance_sync_skipped reason=not_configured_or_incomplete_route tier={:?}",
+            tier
+        );
+        return;
+    }
     if !wallet_balance_sync_due(snapshot, now_ns, interval_secs) {
         let next_due_ns = snapshot
             .wallet_balance
@@ -766,8 +800,8 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         EvmEvent, RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment,
-        SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime, WalletBalanceSnapshot,
-        WalletBalanceSyncConfig,
+        RetentionConfig, SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime,
+        WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
     use crate::storage::stable;
     use std::future::Future;
@@ -896,6 +930,35 @@ mod tests {
         assert!(
             body.contains(&event.tx_hash),
             "fallback body should preserve transaction hash for debugging"
+        );
+    }
+
+    #[test]
+    fn evm_event_fallback_payload_is_truncated_under_oversized_burst_inputs() {
+        let oversized_payload = format!("0x{}", "ab".repeat(16_000));
+        let event = EvmEvent {
+            tx_hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            chain_id: 31_337,
+            block_number: 88,
+            log_index: 4,
+            source: "0x5fc8d32690cc91d4c39d9d3abcbd16989f875707".to_string(),
+            payload: oversized_payload,
+        };
+
+        let (body, sender) = evm_event_to_inbox_message(&event);
+        assert_eq!(sender, event.source);
+        assert!(
+            body.chars().count() <= crate::storage::stable::MAX_INBOX_BODY_CHARS,
+            "scheduler fallback body must remain capped for oversized decode failures"
+        );
+        assert!(
+            body.contains("[truncated"),
+            "scheduler fallback body should include truncation marker for diagnostics"
+        );
+        assert!(
+            body.contains(&event.tx_hash),
+            "scheduler fallback body should still include tx hash metadata"
         );
     }
 
@@ -1213,6 +1276,72 @@ mod tests {
             .expect("reconcile job should be present");
         assert_eq!(poll.status, JobStatus::Succeeded);
         assert_eq!(reconcile.status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn scheduler_tick_runs_retention_maintenance_in_low_priority_lane() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+        stable::set_retention_config(RetentionConfig {
+            jobs_max_age_secs: 1,
+            jobs_max_records: 0,
+            dedupe_max_age_secs: 1,
+            turns_max_age_secs: 7 * 24 * 60 * 60,
+            transitions_max_age_secs: 7 * 24 * 60 * 60,
+            tools_max_age_secs: 7 * 24 * 60 * 60,
+            inbox_max_age_secs: 14 * 24 * 60 * 60,
+            outbox_max_age_secs: 14 * 24 * 60 * 60,
+            maintenance_batch_size: 50,
+            maintenance_interval_secs: 30,
+        })
+        .expect("retention config should persist");
+        let now_ns = current_time_ns();
+        let old_scheduled_for_ns = now_ns.saturating_sub(5_000_000_000);
+        let old_job_id = "job:00000000000000000001:00000000000000000001".to_string();
+        stable::save_job_for_tests(ScheduledJob {
+            id: old_job_id.clone(),
+            kind: TaskKind::PollInbox,
+            lane: TaskLane::Mutating,
+            dedupe_key: format!("PollInbox:{}", old_scheduled_for_ns),
+            priority: 1,
+            created_at_ns: old_scheduled_for_ns,
+            scheduled_for_ns: old_scheduled_for_ns,
+            started_at_ns: Some(old_scheduled_for_ns),
+            finished_at_ns: Some(old_scheduled_for_ns.saturating_add(1)),
+            status: JobStatus::Succeeded,
+            attempts: 1,
+            max_attempts: 3,
+            last_error: None,
+        });
+        stable::insert_dedupe_for_tests(
+            format!("PollInbox:{}", old_scheduled_for_ns),
+            old_job_id.clone(),
+        );
+
+        let poll_job = stable::enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "PollInbox:maintenance-order".to_string(),
+            now_ns,
+            0,
+        );
+        assert!(poll_job.is_some(), "poll job should enqueue");
+
+        block_on_with_spin(scheduler_tick());
+
+        let recent = stable::list_recent_jobs(200);
+        let manual = recent
+            .iter()
+            .find(|job| job.dedupe_key == "PollInbox:maintenance-order")
+            .expect("manual poll job should still run before maintenance");
+        assert_eq!(manual.status, JobStatus::Succeeded);
+        assert!(
+            recent.iter().all(|job| job.id != old_job_id),
+            "retention maintenance should prune old terminal jobs"
+        );
     }
 
     #[test]
