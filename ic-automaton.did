@@ -109,8 +109,11 @@ type InferenceConfigView = record {
 type InferenceProvider = variant { OpenRouter; Mock; IcLlm };
 type InitArgs = record {
   evm_chain_id : opt nat64;
+  evm_confirmation_depth : opt nat64;
+  evm_rpc_url : opt text;
   ecdsa_key_name : text;
   inbox_contract_address : opt text;
+  http_allowed_domains : opt vec text;
 };
 type JobStatus = variant {
   Skipped;
@@ -120,11 +123,21 @@ type JobStatus = variant {
   TimedOut;
   Pending;
 };
+type MemoryRollup = record {
+  source_count : nat32;
+  canonical_value : text;
+  window_end_ns : nat64;
+  generated_at_ns : nat64;
+  window_start_ns : nat64;
+  source_keys : vec text;
+  namespace : text;
+};
 type ObservabilitySnapshot = record {
   inbox_stats : InboxStats;
   scheduler : SchedulerRuntime;
   outbox_stats : OutboxStats;
   conversation_summaries : vec ConversationSummary;
+  memory_rollups : vec MemoryRollup;
   recent_turns : vec TurnRecord;
   inbox_messages : vec InboxMessage;
   cycles : CycleTelemetry;
@@ -132,8 +145,11 @@ type ObservabilitySnapshot = record {
   recent_transitions : vec TransitionLogRecord;
   recent_jobs : vec ScheduledJob;
   captured_at_ns : nat64;
+  turn_window_summaries : vec TurnWindowSummary;
+  storage_growth : StorageGrowthMetrics;
   outbox_messages : vec OutboxMessage;
   runtime : RuntimeView;
+  session_summaries : vec SessionSummary;
 };
 type OutboxMessage = record {
   id : text;
@@ -160,10 +176,47 @@ type PromptLayerView = record {
   layer_id : nat8;
 };
 type Result = variant { Ok : text; Err : text };
-type Result_1 = variant { Ok : nat64; Err : text };
-type Result_2 = variant { Ok : opt text; Err : text };
+type Result_1 = variant { Ok : opt text; Err : text };
+type Result_2 = variant { Ok : nat64; Err : text };
 type Result_3 = variant { Ok : vec text; Err : text };
-type Result_4 = variant { Ok : PromptLayer; Err : text };
+type Result_4 = variant { Ok : RetentionConfig; Err : text };
+type Result_5 = variant { Ok : PromptLayer; Err : text };
+type RetentionConfig = record {
+  transitions_max_age_secs : nat64;
+  turns_max_age_secs : nat64;
+  dedupe_max_age_secs : nat64;
+  jobs_max_records : nat64;
+  maintenance_batch_size : nat32;
+  tools_max_age_secs : nat64;
+  maintenance_interval_secs : nat64;
+  inbox_max_age_secs : nat64;
+  outbox_max_age_secs : nat64;
+  jobs_max_age_secs : nat64;
+};
+type RetentionMaintenanceRuntime = record {
+  last_error : opt text;
+  outbox_scan_cursor : opt text;
+  last_deleted_dedupe : nat32;
+  last_deleted_inbox : nat32;
+  retention_progress_percent : nat8;
+  last_generated_session_summaries : nat32;
+  dedupe_scan_cursor : opt text;
+  inbox_scan_cursor : opt text;
+  last_deleted_tools : nat32;
+  last_deleted_turns : nat32;
+  last_started_ns : opt nat64;
+  transition_scan_cursor : opt text;
+  job_scan_cursor : opt text;
+  last_generated_turn_window_summaries : nat32;
+  last_deleted_transitions : nat32;
+  last_deleted_outbox : nat32;
+  turn_scan_cursor : opt text;
+  last_deleted_jobs : nat32;
+  last_finished_ns : opt nat64;
+  next_run_after_ns : nat64;
+  summarization_progress_percent : nat8;
+  last_generated_memory_rollups : nat32;
+};
 type RuntimeView = record {
   last_error : opt text;
   evm_chain_id : nat64;
@@ -212,6 +265,17 @@ type SchedulerRuntime = record {
   paused_reason : opt text;
   low_cycles_mode : bool;
 };
+type SessionSummary = record {
+  source_count : nat32;
+  inbox_message_count : nat32;
+  outbox_preview : text;
+  outbox_message_count : nat32;
+  window_end_ns : nat64;
+  sender : text;
+  generated_at_ns : nat64;
+  window_start_ns : nat64;
+  inbox_preview : text;
+};
 type SkillRecord = record {
   name : text;
   description : text;
@@ -219,6 +283,43 @@ type SkillRecord = record {
   enabled : bool;
   mutable : bool;
 };
+type StorageGrowthMetrics = record {
+  inbox_staged_queue_entries : nat64;
+  memory_fact_limit : nat64;
+  turn_map_entries : nat64;
+  inbox_pending_queue_entries : nat64;
+  pressure_level : StoragePressureLevel;
+  memory_rollup_utilization_percent : nat8;
+  tracked_entries_delta_per_hour : opt int64;
+  retention_progress_percent : nat8;
+  session_summary_limit : nat64;
+  tracked_entry_count : nat64;
+  memory_rollup_entries : nat64;
+  outbox_map_entries : nat64;
+  session_summary_utilization_percent : nat8;
+  turn_window_summary_utilization_percent : nat8;
+  memory_fact_entries : nat64;
+  memory_fact_utilization_percent : nat8;
+  near_limit : bool;
+  trend_sample_count : nat32;
+  session_summary_entries : nat64;
+  dedupe_map_entries : nat64;
+  inbox_map_entries : nat64;
+  turn_window_summary_entries : nat64;
+  pressure_warnings : vec text;
+  heap_memory_mb : float64;
+  tool_map_entries : nat64;
+  runtime_map_entries : nat64;
+  stable_memory_mb : float64;
+  memory_rollup_limit : nat64;
+  transition_map_entries : nat64;
+  turn_window_summary_limit : nat64;
+  job_map_entries : nat64;
+  job_queue_map_entries : nat64;
+  trend_window_seconds : nat64;
+  summarization_progress_percent : nat8;
+};
+type StoragePressureLevel = variant { High; Normal; Critical; Elevated };
 type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
 type TaskKind = variant { Reconcile; CheckCycles; PollInbox; AgentTurn };
 type TaskLane = variant { ReadOnly; Mutating };
@@ -270,6 +371,20 @@ type TurnRecord = record {
   state_from : AgentState;
   tool_call_count : nat32;
 };
+type TurnWindowSummary = record {
+  tool_success_count : nat32;
+  source_count : nat32;
+  failed_turn_count : nat32;
+  turn_count : nat32;
+  transition_count : nat32;
+  window_end_ns : nat64;
+  top_errors : vec text;
+  generated_at_ns : nat64;
+  window_start_ns : nat64;
+  succeeded_turn_count : nat32;
+  tool_failure_count : nat32;
+  tool_call_count : nat32;
+};
 type WalletBalanceStatus = variant { Error; Stale; Fresh; Unknown };
 type WalletBalanceSyncConfigView = record {
   normal_interval_secs : nat64;
@@ -302,6 +417,8 @@ service : (InitArgs) -> {
   get_observability_snapshot : (nat32) -> (ObservabilitySnapshot) query;
   get_outbox_stats : () -> (OutboxStats) query;
   get_prompt_layers : () -> (vec PromptLayerView) query;
+  get_retention_config : () -> (RetentionConfig) query;
+  get_retention_maintenance_runtime : () -> (RetentionMaintenanceRuntime) query;
   get_runtime_view : () -> (RuntimeView) query;
   get_scheduler_view : () -> (SchedulerRuntime) query;
   get_soul : () -> (text) query;
@@ -312,32 +429,37 @@ service : (InitArgs) -> {
   http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
   list_conversations : () -> (vec ConversationSummary) query;
   list_inbox_messages : (nat32) -> (vec InboxMessage) query;
+  list_memory_rollups : (nat32) -> (vec MemoryRollup) query;
   list_outbox_messages : (nat32) -> (vec OutboxMessage) query;
   list_recent_events : (nat32) -> (vec text) query;
   list_scheduler_jobs : (nat32) -> (vec ScheduledJob) query;
+  list_session_summaries : (nat32) -> (vec SessionSummary) query;
   list_skills : () -> (vec SkillRecord) query;
   list_task_schedules : () -> (
       vec record { TaskScheduleConfig; TaskScheduleRuntime },
     ) query;
   list_tool_policies : () -> (vec text) query;
+  list_turn_window_summaries : (nat32) -> (vec TurnWindowSummary) query;
   list_turns : (nat32) -> (vec text) query;
   post_inbox_message : (text) -> (Result);
-  set_evm_chain_id_admin : (nat64) -> (Result_1);
-  set_evm_confirmation_depth_admin : (nat64) -> (Result_1);
-  set_evm_rpc_fallback_url : (opt text) -> (Result_2);
-  set_evm_rpc_max_response_bytes : (nat64) -> (Result_1);
+  set_automaton_evm_address_admin : (opt text) -> (Result_1);
+  set_evm_chain_id_admin : (nat64) -> (Result_2);
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_2);
+  set_evm_rpc_fallback_url : (opt text) -> (Result_1);
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_2);
   set_evm_rpc_url : (text) -> (Result);
   set_http_allowed_domains : (vec text) -> (Result_3);
-  set_inbox_contract_address_admin : (opt text) -> (Result_2);
+  set_inbox_contract_address_admin : (opt text) -> (Result_1);
   set_inference_model : (text) -> (Result);
   set_inference_provider : (InferenceProvider) -> (text);
   set_loop_enabled : (bool) -> (text);
   set_openrouter_api_key : (opt text) -> (text);
   set_openrouter_base_url : (text) -> (Result);
+  set_retention_config : (RetentionConfig) -> (Result_4);
   set_scheduler_enabled : (bool) -> (text);
   set_scheduler_low_cycles_mode : (bool) -> (text);
   set_task_enabled : (TaskKind, bool) -> (text);
   set_task_interval_secs : (TaskKind, nat64) -> (Result);
-  update_prompt_layer_admin : (nat8, text) -> (Result_4);
+  update_prompt_layer_admin : (nat8, text) -> (Result_5);
   update_soul : (text) -> (Result);
 }
