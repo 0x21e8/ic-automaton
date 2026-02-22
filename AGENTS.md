@@ -2,6 +2,12 @@
 
 Follow the KISS principle. Clarify with the human if you need to introduce complexity.
 
+## Goal of this project
+- Autonomous agent (Automaton) implemented as a canister on ICP with wallet on EVM chain.
+- Automaton needs to pay for cycles for its existence on ICP as well as USDC for inference.
+- Automaton can think and do on its own without human involvement and needs to be creative to generate income for its survival.
+- We always need to think about the requirements of the automaton first when designing or implementing features not about a human user/owner.
+
 ## Delivery workflow
 - Use `icp-cli` as the default toolchain to set up and drive this project (network, build, deploy, and related lifecycle tasks).
 - Follow TDD: write or update tests first, implement incrementally, and keep tests green throughout development.
@@ -35,6 +41,7 @@ Follow the KISS principle. Clarify with the human if you need to introduce compl
 
 ## Init args
 - If you add new canister init arguments. Make sure to add defaults to `icp.yml`.
+- When passing numeric init args through `icp canister install --args` (especially `nat64` fields), always use explicit Candid typing, for example `opt (31337 : nat64)` instead of `opt 31337`. Untyped numerics may decode as `int` and silently fall back to defaults.
 
 ## Skills
 A skill is a set of local instructions to follow that is stored in a `SKILL.md` file.

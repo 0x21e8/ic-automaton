@@ -36,6 +36,69 @@ const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedMessageQueuedPayload {
+    pub sender: String,
+    pub message: String,
+    pub usdc_amount: U256,
+    pub eth_amount: U256,
+}
+
+pub fn decode_message_queued_payload(
+    payload_hex: &str,
+) -> Result<DecodedMessageQueuedPayload, String> {
+    let payload = normalize_hex_blob(payload_hex, "message queued payload")?;
+    let bytes = hex::decode(payload.trim_start_matches("0x"))
+        .map_err(|error| format!("failed to decode message queued payload: {error}"))?;
+    if bytes.len() < 128 {
+        return Err("message queued payload must be at least 128 bytes".to_string());
+    }
+
+    let sender = format!("0x{}", hex::encode(&bytes[12..32]));
+    let sender = normalize_address(&sender)?;
+    let message_offset = read_usize_word(&bytes[32..64], "message offset")?;
+    let usdc_amount = U256::from_be_slice(&bytes[64..96]);
+    let eth_amount = U256::from_be_slice(&bytes[96..128]);
+    if message_offset.saturating_add(32) > bytes.len() {
+        return Err("message offset points outside payload".to_string());
+    }
+    let message_len = read_usize_word(
+        &bytes[message_offset..message_offset + 32],
+        "message length",
+    )?;
+    let message_start = message_offset + 32;
+    let message_end = message_start.saturating_add(message_len);
+    if message_end > bytes.len() {
+        return Err("message bytes exceed payload length".to_string());
+    }
+
+    let message = std::str::from_utf8(&bytes[message_start..message_end])
+        .map_err(|error| format!("message payload is not utf-8: {error}"))?
+        .to_string();
+
+    Ok(DecodedMessageQueuedPayload {
+        sender,
+        message,
+        usdc_amount,
+        eth_amount,
+    })
+}
+
+fn read_usize_word(word: &[u8], field: &str) -> Result<usize, String> {
+    if word.len() != 32 {
+        return Err(format!("{field} word must be 32 bytes"));
+    }
+    let size = std::mem::size_of::<usize>();
+    if word[..(32 - size)].iter().any(|byte| *byte != 0) {
+        return Err(format!("{field} overflowed usize"));
+    }
+    let mut value = 0usize;
+    for byte in &word[(32 - size)..] {
+        value = (value << 8) | usize::from(*byte);
+    }
+    Ok(value)
+}
+
 pub struct EvmPollResult {
     pub cursor: EvmPollCursor,
     pub events: Vec<EvmEvent>,

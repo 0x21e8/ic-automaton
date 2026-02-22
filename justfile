@@ -26,11 +26,30 @@ anvil-start:
   if [ -f .local/anvil.pid ] && kill -0 "$(cat .local/anvil.pid)" 2>/dev/null; then
     echo "Anvil already running with PID $(cat .local/anvil.pid)"
   else
+    rm -f .local/anvil.pid
     nohup anvil --host {{anvil_host}} --port {{anvil_port}} --chain-id {{anvil_chain_id}} --silent >/tmp/anvil-ic-automaton.log 2>&1 &
     echo $! > .local/anvil.pid
     echo "Started Anvil with PID $(cat .local/anvil.pid)"
   fi
-  cast chain-id --rpc-url {{anvil_rpc_url}}
+  ready=0
+  for _ in $(seq 1 50); do
+    if curl -fsS \
+      -H 'content-type: application/json' \
+      --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' \
+      "{{anvil_rpc_url}}" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.2
+  done
+
+  if [ "$ready" -ne 1 ]; then
+    echo "Anvil did not become ready at {{anvil_rpc_url}}" >&2
+    if [ -f /tmp/anvil-ic-automaton.log ]; then
+      tail -n 40 /tmp/anvil-ic-automaton.log >&2 || true
+    fi
+    exit 1
+  fi
 
 anvil-stop:
   #!/usr/bin/env bash
@@ -78,8 +97,7 @@ deploy-canister inbox_address="":
   if ! icp canister create backend -e local >/dev/null 2>&1; then
     echo "backend canister already exists on local"
   fi
-  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt {{anvil_chain_id}} })"
-  icp canister call backend set_evm_chain_id_admin "({{anvil_chain_id}})" -e local >/dev/null
+  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ({{anvil_chain_id}} : nat64); evm_rpc_url = opt \"{{anvil_rpc_url}}\"; evm_confirmation_depth = opt (0 : nat64) })"
   canister_id="$(icp canister status backend -e local | awk '/Canister Id:/ { print $3 }')"
   echo "Canister ID: $canister_id"
   echo "UI URL: http://$canister_id.localhost:8000/"

@@ -94,6 +94,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "async-trait",
+ "canbench-rs",
  "candid",
  "canlog",
  "hex",
@@ -194,6 +195,29 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "canbench-rs"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dfe0fee0135b3face2ff259fddc28fff3c28e7acd84ae7746e25972f11230f9"
+dependencies = [
+ "canbench-rs-macros",
+ "candid",
+ "ic-cdk",
+ "serde",
+]
+
+[[package]]
+name = "canbench-rs-macros"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "237e2e5d914039918eee4bdf141e976ff34cf4130c6760808a047c081710e0a8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
 
 [[package]]
 name = "candid"
