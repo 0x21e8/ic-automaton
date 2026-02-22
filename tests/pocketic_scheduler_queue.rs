@@ -27,7 +27,6 @@ enum TaskKind {
 
 #[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 enum InferenceProvider {
-    Mock,
     IcLlm,
     OpenRouter,
 }
@@ -143,6 +142,8 @@ fn with_backend_canister() -> (PocketIc, Principal) {
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
     pic.install_canister(canister_id, wasm, init_args, None);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
+    set_inference_model(&pic, canister_id, "deterministic-local");
 
     (pic, canister_id)
 }
@@ -219,6 +220,15 @@ fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: Infe
         panic!("failed to encode set_inference_provider args: {error}");
     });
     let _: String = call_update(pic, canister_id, "set_inference_provider", payload);
+}
+
+fn set_inference_model(pic: &PocketIc, canister_id: Principal, model: &str) {
+    let payload = encode_args((model.to_string(),)).unwrap_or_else(|error| {
+        panic!("failed to encode set_inference_model args: {error}");
+    });
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "set_inference_model", payload);
+    assert!(result.is_ok(), "set_inference_model failed: {result:?}");
 }
 
 fn set_openrouter_api_key(pic: &PocketIc, canister_id: Principal, api_key: Option<String>) {

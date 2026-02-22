@@ -50,7 +50,6 @@ enum AgentState {
 
 #[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash)]
 enum InferenceProvider {
-    Mock,
     IcLlm,
     OpenRouter,
 }
@@ -160,6 +159,8 @@ fn with_backend_canister_with_init_args(init: InitArgs) -> (PocketIc, Principal)
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
     pic.install_canister(canister_id, wasm, init_args, None);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
+    set_inference_model(&pic, canister_id, "deterministic-local");
 
     (pic, canister_id)
 }
@@ -244,6 +245,15 @@ fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: Infe
         panic!("failed to encode set_inference_provider args: {error}");
     });
     let _: String = call_update(pic, canister_id, "set_inference_provider", payload);
+}
+
+fn set_inference_model(pic: &PocketIc, canister_id: Principal, model: &str) {
+    let payload = encode_args((model.to_string(),)).unwrap_or_else(|error| {
+        panic!("failed to encode set_inference_model args: {error}");
+    });
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "set_inference_model", payload);
+    assert!(result.is_ok(), "set_inference_model failed: {result:?}");
 }
 
 fn set_retention_config(pic: &PocketIc, canister_id: Principal, config: RetentionConfig) {
@@ -407,7 +417,7 @@ fn agent_turn_self_recovers_after_transient_inference_failure() {
         "faulted state must preserve error context"
     );
 
-    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
     pic.advance_time(Duration::from_secs(61));
     pic.tick();
 
@@ -551,7 +561,7 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
         set_task_enabled(&pic, canister_id, kind, false);
         set_task_interval_secs(&pic, canister_id, kind, 60);
     }
-    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
 
     let update_message_id =
         post_inbox_message(&pic, canister_id, "request_update_prompt_layer:true")
@@ -581,7 +591,7 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
         .find(|message| message.source_inbox_ids.contains(&update_message_id))
         .expect("first turn should produce outbox response");
     assert!(
-        update_outbox.body.contains("mocked continuation"),
+        update_outbox.body.contains("deterministic continuation"),
         "outbox should prefer continuation text after tool execution"
     );
 
@@ -603,7 +613,7 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
         .find(|message| message.source_inbox_ids.contains(&probe_message_id))
         .expect("second turn should produce outbox response");
     assert!(
-        probe_outbox.body.contains("mocked continuation"),
+        probe_outbox.body.contains("deterministic continuation"),
         "continuation response should be posted as final outbox body"
     );
 
@@ -629,7 +639,7 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
         set_task_enabled(&pic, canister_id, kind, false);
         set_task_interval_secs(&pic, canister_id, kind, 60);
     }
-    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
 
     let message_id = post_inbox_message(&pic, canister_id, "request_update_prompt_layer:true")
         .expect("inbox message should post");
@@ -666,7 +676,7 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
         .find(|message| message.source_inbox_ids.contains(&message_id))
         .expect("agent turn should post an outbox response");
     assert!(
-        turn_outbox.body.contains("mocked continuation"),
+        turn_outbox.body.contains("deterministic continuation"),
         "reply body should come from continuation round after tool output"
     );
 
@@ -792,7 +802,7 @@ fn high_volume_agent_turn_flow_keeps_forward_progress_with_retention_enabled() {
         set_task_enabled(&pic, canister_id, kind, false);
         set_task_interval_secs(&pic, canister_id, kind, 1);
     }
-    set_inference_provider(&pic, canister_id, InferenceProvider::Mock);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
     set_retention_config(
         &pic,
         canister_id,

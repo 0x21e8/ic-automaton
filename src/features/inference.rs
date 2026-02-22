@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 const IC_LLM_CANISTER_ID: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
-const MOCK_LAYER_6_MARKER: &str = "phase5-layer6-marker";
-const MOCK_LAYER_6_UPDATE_CONTENT: &str =
+const DETERMINISTIC_IC_LLM_MODEL: &str = "deterministic-local";
+const DETERMINISTIC_LAYER_6_MARKER: &str = "phase5-layer6-marker";
+const DETERMINISTIC_LAYER_6_UPDATE_CONTENT: &str =
     "## Layer 6: Economic Decision Loop (Mutable Default)\n- phase5-layer6-marker";
 
 fn current_time_ns() -> u64 {
@@ -104,11 +105,6 @@ pub async fn infer_with_provider_transcript(
     }
 
     let output = match snapshot.inference_provider {
-        InferenceProvider::Mock => {
-            MockInferenceAdapter
-                .infer_with_transcript(input, transcript)
-                .await
-        }
         InferenceProvider::IcLlm => {
             IcLlmInferenceAdapter::from_snapshot(snapshot)
                 .infer_with_transcript(input, transcript)
@@ -127,87 +123,77 @@ pub async fn infer_with_provider_transcript(
     output
 }
 
-pub struct MockInferenceAdapter;
+fn run_deterministic_inference(
+    input: &InferenceInput,
+    transcript: &[InferenceTranscriptMessage],
+) -> Result<InferenceOutput, String> {
+    let explicit_sign_request = input.input.contains("request_sign_message:true")
+        || input.context_snippet.contains("request_sign_message:true");
+    let update_prompt_layer_request = input.input.contains("request_update_prompt_layer:true");
+    let layer_6_probe_request = input.input.contains("request_layer_6_probe:true");
+    let continuation_loop_request = input.input.contains("request_continuation_loop:true")
+        || input
+            .context_snippet
+            .contains("request_continuation_loop:true");
+    let continuation_error_request = input.input.contains("request_continuation_error:true")
+        || input
+            .context_snippet
+            .contains("request_continuation_error:true");
 
-#[async_trait(?Send)]
-impl InferenceAdapter for MockInferenceAdapter {
-    async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
-        self.infer_with_transcript(input, &[]).await
+    let has_tool_transcript = transcript
+        .iter()
+        .any(|entry| matches!(entry, InferenceTranscriptMessage::Tool { .. }));
+
+    if continuation_error_request && has_tool_transcript {
+        return Err("deterministic continuation inference failed after tool execution".to_string());
     }
 
-    async fn infer_with_transcript(
-        &self,
-        input: &InferenceInput,
-        transcript: &[InferenceTranscriptMessage],
-    ) -> Result<InferenceOutput, String> {
-        let explicit_sign_request = input.input.contains("request_sign_message:true")
-            || input.context_snippet.contains("request_sign_message:true");
-        let update_prompt_layer_request = input.input.contains("request_update_prompt_layer:true");
-        let layer_6_probe_request = input.input.contains("request_layer_6_probe:true");
-        let continuation_loop_request = input.input.contains("request_continuation_loop:true")
-            || input
-                .context_snippet
-                .contains("request_continuation_loop:true");
-        let continuation_error_request = input.input.contains("request_continuation_error:true")
-            || input
-                .context_snippet
-                .contains("request_continuation_error:true");
-
-        let has_tool_transcript = transcript
-            .iter()
-            .any(|entry| matches!(entry, InferenceTranscriptMessage::Tool { .. }));
-
-        if continuation_error_request && has_tool_transcript {
-            return Err("mock continuation inference failed after tool execution".to_string());
-        }
-
-        if has_tool_transcript && !continuation_loop_request {
-            return Ok(InferenceOutput {
-                tool_calls: Vec::new(),
-                explanation: format!("mocked continuation for {}", input.turn_id),
-            });
-        }
-
-        let tool_calls = if explicit_sign_request {
-            vec![ToolCall {
-                tool_call_id: None,
-                tool: "sign_message".to_string(),
-                args_json: r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#.to_string(),
-            }]
-        } else if update_prompt_layer_request {
-            vec![ToolCall {
-                tool_call_id: None,
-                tool: "update_prompt_layer".to_string(),
-                args_json: json!({
-                    "layer_id": 6,
-                    "content": MOCK_LAYER_6_UPDATE_CONTENT
-                })
-                .to_string(),
-            }]
-        } else {
-            vec![ToolCall {
-                tool_call_id: None,
-                tool: "record_signal".to_string(),
-                args_json: r#"{"signal":"tick"}"#.to_string(),
-            }]
-        };
-
-        let explanation = if layer_6_probe_request {
-            let assembled = prompt::assemble_system_prompt(&input.context_snippet);
-            if assembled.contains(MOCK_LAYER_6_MARKER) {
-                "layer6_probe:present".to_string()
-            } else {
-                "layer6_probe:missing".to_string()
-            }
-        } else {
-            format!("mocked inference for {}", input.turn_id)
-        };
-
-        Ok(InferenceOutput {
-            tool_calls,
-            explanation,
-        })
+    if has_tool_transcript && !continuation_loop_request {
+        return Ok(InferenceOutput {
+            tool_calls: Vec::new(),
+            explanation: format!("deterministic continuation for {}", input.turn_id),
+        });
     }
+
+    let tool_calls = if explicit_sign_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "sign_message".to_string(),
+            args_json: r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#.to_string(),
+        }]
+    } else if update_prompt_layer_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "update_prompt_layer".to_string(),
+            args_json: json!({
+                "layer_id": 6,
+                "content": DETERMINISTIC_LAYER_6_UPDATE_CONTENT
+            })
+            .to_string(),
+        }]
+    } else {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "record_signal".to_string(),
+            args_json: r#"{"signal":"tick"}"#.to_string(),
+        }]
+    };
+
+    let explanation = if layer_6_probe_request {
+        let assembled = prompt::assemble_system_prompt(&input.context_snippet);
+        if assembled.contains(DETERMINISTIC_LAYER_6_MARKER) {
+            "layer6_probe:present".to_string()
+        } else {
+            "layer6_probe:missing".to_string()
+        }
+    } else {
+        format!("deterministic inference for {}", input.turn_id)
+    };
+
+    Ok(InferenceOutput {
+        tool_calls,
+        explanation,
+    })
 }
 
 #[allow(dead_code)]
@@ -223,13 +209,25 @@ impl InferenceAdapter for StubInferenceAdapter {
 pub struct IcLlmInferenceAdapter {
     model: String,
     evm_tools_enabled: bool,
+    allow_deterministic_model: bool,
 }
 
 impl IcLlmInferenceAdapter {
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Self {
+        let allow_deterministic_model = {
+            #[cfg(test)]
+            {
+                true
+            }
+            #[cfg(not(test))]
+            {
+                snapshot.ecdsa_key_name.trim() == "dfx_test_key"
+            }
+        };
         Self {
             model: snapshot.inference_model.clone(),
             evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
+            allow_deterministic_model,
         }
     }
 }
@@ -252,6 +250,15 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
         input: &InferenceInput,
         transcript: &[InferenceTranscriptMessage],
     ) -> Result<InferenceOutput, String> {
+        if self.allow_deterministic_model
+            && self
+                .model
+                .trim()
+                .eq_ignore_ascii_case(DETERMINISTIC_IC_LLM_MODEL)
+        {
+            return run_deterministic_inference(input, transcript);
+        }
+
         let model = parse_ic_llm_model(&self.model)?;
         let request =
             build_ic_llm_request_with_transcript(input, model, transcript, self.evm_tools_enabled);
@@ -1981,22 +1988,26 @@ mod tests {
     }
 
     #[test]
-    fn mock_inference_layer_6_probe_reflects_prompt_layer_updates() {
+    fn deterministic_ic_llm_model_layer_6_probe_reflects_prompt_layer_updates() {
         stable::init_storage();
-        let adapter = MockInferenceAdapter;
+        let adapter = IcLlmInferenceAdapter {
+            model: DETERMINISTIC_IC_LLM_MODEL.to_string(),
+            evm_tools_enabled: true,
+            allow_deterministic_model: true,
+        };
         let no_marker = InferenceInput {
             input: "request_layer_6_probe:true".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-probe-1".to_string(),
         };
 
-        let first =
-            block_on_with_spin(adapter.infer(&no_marker)).expect("mock inference should succeed");
+        let first = block_on_with_spin(adapter.infer(&no_marker))
+            .expect("deterministic inference should succeed");
         assert_eq!(first.explanation, "layer6_probe:missing");
 
         stable::save_prompt_layer(&crate::domain::types::PromptLayer {
             layer_id: 6,
-            content: MOCK_LAYER_6_UPDATE_CONTENT.to_string(),
+            content: DETERMINISTIC_LAYER_6_UPDATE_CONTENT.to_string(),
             updated_at_ns: 1,
             updated_by_turn: "test".to_string(),
             version: 99,
@@ -2008,8 +2019,8 @@ mod tests {
             context_snippet: "ctx".to_string(),
             turn_id: "turn-probe-2".to_string(),
         };
-        let second =
-            block_on_with_spin(adapter.infer(&with_marker)).expect("mock inference should succeed");
+        let second = block_on_with_spin(adapter.infer(&with_marker))
+            .expect("deterministic inference should succeed");
         assert_eq!(second.explanation, "layer6_probe:present");
     }
 }

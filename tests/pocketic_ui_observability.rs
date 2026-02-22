@@ -42,6 +42,11 @@ struct InitArgs {
     evm_chain_id: Option<u64>,
 }
 
+#[derive(CandidType, Clone, Copy, Debug)]
+enum InferenceProvider {
+    IcLlm,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -69,6 +74,8 @@ fn with_backend_canister() -> (PocketIc, Principal) {
 
     pic.add_cycles(canister_id, 2_000_000_000_000);
     pic.install_canister(canister_id, wasm, init_args, None);
+    set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
+    set_inference_model(&pic, canister_id, "deterministic-local");
 
     (pic, canister_id)
 }
@@ -125,6 +132,18 @@ fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, addr
         result.is_ok(),
         "set_inbox_contract_address_admin failed: {result:?}"
     );
+}
+
+fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: InferenceProvider) {
+    let payload = encode_args((provider,)).expect("failed to encode set_inference_provider");
+    let _: String = call_update(pic, canister_id, "set_inference_provider", payload);
+}
+
+fn set_inference_model(pic: &PocketIc, canister_id: Principal, model: &str) {
+    let payload = encode_args((model.to_string(),)).expect("failed to encode set_inference_model");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "set_inference_model", payload);
+    assert!(result.is_ok(), "set_inference_model failed: {result:?}");
 }
 
 fn response_word_from_address(address: &str) -> String {
@@ -385,7 +404,7 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
             msg.get("body")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .contains("mocked continuation")
+                .contains("deterministic continuation")
         }),
         "outbox body should reflect continuation-stage model response after tool execution"
     );
@@ -449,7 +468,7 @@ fn supports_inference_config_http_flow() {
             .get("provider")
             .and_then(Value::as_str)
             .unwrap_or_default(),
-        "Mock"
+        "IcLlm"
     );
     assert!(initial_json.get("openrouter_api_key").is_none());
     assert_eq!(

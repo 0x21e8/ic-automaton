@@ -106,7 +106,7 @@ type InferenceConfigView = record {
   provider : InferenceProvider;
   openrouter_base_url : text;
 };
-type InferenceProvider = variant { OpenRouter; Mock; IcLlm };
+type InferenceProvider = variant { OpenRouter; IcLlm };
 type InitArgs = record {
   evm_chain_id : opt nat64;
   evm_confirmation_depth : opt nat64;

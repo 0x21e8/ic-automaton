@@ -1193,6 +1193,7 @@ mod tests {
             turn_in_flight,
             turn_counter,
             last_turn_id: Some(format!("turn-{turn_counter}")),
+            inference_model: "deterministic-local".to_string(),
             wallet_balance_bootstrap_pending: false,
             ..RuntimeSnapshot::default()
         };
@@ -1724,7 +1725,7 @@ mod tests {
         assert_eq!(turn.input_summary, "autonomy:no-input");
         assert!(
             turn.tool_call_count >= 1,
-            "mock autonomous turn should execute at least one tool"
+            "deterministic autonomous turn should execute at least one tool"
         );
         assert!(
             turn.inner_dialogue
@@ -1783,7 +1784,7 @@ mod tests {
                 .inner_dialogue
                 .as_deref()
                 .unwrap_or_default()
-                .contains("mocked continuation"),
+                .contains("deterministic continuation"),
             "suppressed calls should still feed continuation inference"
         );
     }
@@ -1819,7 +1820,7 @@ mod tests {
                 .inner_dialogue
                 .as_deref()
                 .unwrap_or_default()
-                .contains("mocked continuation"),
+                .contains("deterministic continuation"),
             "synthetic tool outputs must allow continuation inference to complete"
         );
     }
@@ -1840,7 +1841,7 @@ mod tests {
         let outbox = stable::list_outbox_messages(10);
         assert_eq!(outbox.len(), 1, "reply should be posted for staged input");
         assert!(
-            outbox[0].body.contains("mocked continuation"),
+            outbox[0].body.contains("deterministic continuation"),
             "outbox should prefer continuation model text"
         );
 
