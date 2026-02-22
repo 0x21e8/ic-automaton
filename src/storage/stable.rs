@@ -104,14 +104,6 @@ const MAX_WALLET_BALANCE_FRESHNESS_WINDOW_SECS: u64 = 24 * 60 * 60;
 const MIN_WALLET_BALANCE_SYNC_RESPONSE_BYTES: u64 = 256;
 #[allow(dead_code)]
 const MAX_WALLET_BALANCE_SYNC_RESPONSE_BYTES: u64 = 4 * 1024;
-const DEFAULT_HTTP_ALLOWED_DOMAINS: &[&str] = &[
-    "api.coingecko.com",
-    "api.coinbase.com",
-    "min-api.cryptocompare.com",
-    "base.blockscout.com",
-    "basescan.org",
-];
-
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
     #[log_level(capacity = 2000, name = "SCHED_STORAGE_INFO")]
@@ -398,9 +390,8 @@ pub fn init_storage() {
     if runtime_u64(OUTBOX_SEQ_KEY).is_none() {
         save_runtime_u64(OUTBOX_SEQ_KEY, 0);
     }
-    if !runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY).unwrap_or(false) {
-        seed_default_http_allowed_domains();
-        save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, true);
+    if runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY).is_none() {
+        save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, false);
     }
     init_scheduler_defaults(now_ns());
     init_retention_defaults(now_ns());
@@ -1717,6 +1708,10 @@ pub fn list_allowed_http_domains() -> Vec<String> {
     })
 }
 
+pub fn is_http_allowlist_enforced() -> bool {
+    runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY).unwrap_or(false)
+}
+
 pub fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
     let mut normalized = domains
         .into_iter()
@@ -1811,20 +1806,6 @@ fn normalize_http_allowed_domain(raw: &str) -> Result<String, String> {
     }
 
     Ok(domain)
-}
-
-fn seed_default_http_allowed_domains() {
-    let defaults = DEFAULT_HTTP_ALLOWED_DOMAINS
-        .iter()
-        .map(|domain| normalize_http_allowed_domain(domain))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_default();
-    HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
-        let mut map_ref = map.borrow_mut();
-        for domain in defaults {
-            map_ref.insert(domain, vec![1]);
-        }
-    });
 }
 
 pub fn set_evm_rpc_url(url: String) -> Result<String, String> {
@@ -6771,5 +6752,25 @@ mod tests {
         assert!(removed);
 
         assert!(set_http_allowed_domains(vec!["https://example.com".to_string()]).is_err());
+    }
+
+    #[test]
+    fn http_domain_allowlist_is_unenforced_by_default() {
+        init_storage();
+        HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
+            let keys = map
+                .borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            let mut map_ref = map.borrow_mut();
+            for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+        save_runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY, false);
+
+        assert!(!is_http_allowlist_enforced());
+        assert!(list_allowed_http_domains().is_empty());
     }
 }

@@ -9,10 +9,11 @@ mod tools;
 
 use crate::domain::types::{
     ConversationLog, ConversationSummary, EvmRouteStateView, InboxMessage, InboxStats,
-    InferenceConfigView, InferenceProvider, ObservabilitySnapshot, OutboxMessage, OutboxStats,
-    PromptLayer, PromptLayerView, RuntimeView, ScheduledJob, SchedulerRuntime, SkillRecord,
-    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    InferenceConfigView, InferenceProvider, MemoryRollup, ObservabilitySnapshot, OutboxMessage,
+    OutboxStats, PromptLayer, PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime,
+    RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary, SkillRecord, TaskKind,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TurnWindowSummary,
+    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
@@ -32,6 +33,12 @@ struct InitArgs {
     inbox_contract_address: Option<String>,
     #[serde(default)]
     evm_chain_id: Option<u64>,
+    #[serde(default)]
+    evm_rpc_url: Option<String>,
+    #[serde(default)]
+    evm_confirmation_depth: Option<u64>,
+    #[serde(default)]
+    http_allowed_domains: Option<Vec<String>>,
 }
 
 fn ensure_controller() -> Result<(), String> {
@@ -66,18 +73,33 @@ fn caller_for_audit() -> String {
 
 #[ic_cdk::init]
 fn init(args: InitArgs) {
+    apply_init_args(args);
+    crate::features::MockSkillLoader::install_defaults();
+    crate::http::init_certification();
+    arm_timer();
+}
+
+fn apply_init_args(args: InitArgs) {
     stable::init_storage();
     let _ = stable::set_ecdsa_key_name(args.ecdsa_key_name)
         .unwrap_or_else(|error| ic_cdk::trap(&error));
     if let Some(chain_id) = args.evm_chain_id {
         let _ = stable::set_evm_chain_id(chain_id).unwrap_or_else(|error| ic_cdk::trap(&error));
     }
+    if let Some(rpc_url) = args.evm_rpc_url {
+        let _ = stable::set_evm_rpc_url(rpc_url).unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
+    if let Some(confirmation_depth) = args.evm_confirmation_depth {
+        let _ = stable::set_evm_confirmation_depth(confirmation_depth)
+            .unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
     let _ = stable::set_evm_address(None).unwrap_or_else(|error| ic_cdk::trap(&error));
     let _ = stable::set_inbox_contract_address(args.inbox_contract_address)
         .unwrap_or_else(|error| ic_cdk::trap(&error));
-    crate::features::MockSkillLoader::install_defaults();
-    crate::http::init_certification();
-    arm_timer();
+    if let Some(domains) = args.http_allowed_domains {
+        let _ =
+            stable::set_http_allowed_domains(domains).unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
 }
 
 #[ic_cdk::post_upgrade]
@@ -173,6 +195,12 @@ fn get_automaton_evm_address() -> Option<String> {
     stable::get_automaton_evm_address()
 }
 
+#[ic_cdk::update]
+fn set_automaton_evm_address_admin(address: Option<String>) -> Result<Option<String>, String> {
+    ensure_controller()?;
+    stable::set_evm_address(address)
+}
+
 #[ic_cdk::query]
 fn get_wallet_balance_telemetry() -> WalletBalanceTelemetryView {
     stable::wallet_balance_telemetry_view()
@@ -186,6 +214,16 @@ fn get_wallet_balance_sync_config() -> WalletBalanceSyncConfigView {
 #[ic_cdk::query]
 fn get_scheduler_view() -> SchedulerRuntime {
     stable::scheduler_runtime_view()
+}
+
+#[ic_cdk::query]
+fn get_retention_config() -> RetentionConfig {
+    stable::retention_config()
+}
+
+#[ic_cdk::query]
+fn get_retention_maintenance_runtime() -> RetentionMaintenanceRuntime {
+    stable::retention_maintenance_runtime()
 }
 
 #[ic_cdk::query]
@@ -234,6 +272,21 @@ fn list_conversations() -> Vec<ConversationSummary> {
 }
 
 #[ic_cdk::query]
+fn list_session_summaries(limit: u32) -> Vec<SessionSummary> {
+    stable::list_session_summaries(limit as usize)
+}
+
+#[ic_cdk::query]
+fn list_turn_window_summaries(limit: u32) -> Vec<TurnWindowSummary> {
+    stable::list_turn_window_summaries(limit as usize)
+}
+
+#[ic_cdk::query]
+fn list_memory_rollups(limit: u32) -> Vec<MemoryRollup> {
+    stable::list_memory_rollups(limit as usize)
+}
+
+#[ic_cdk::query]
 fn get_conversation(sender: String) -> Option<ConversationLog> {
     stable::get_conversation_log(&sender)
 }
@@ -277,6 +330,12 @@ fn set_task_enabled(kind: TaskKind, enabled: bool) -> String {
     ensure_controller_or_trap();
     stable::set_task_enabled(&kind, enabled);
     "task_enabled_updated".to_string()
+}
+
+#[ic_cdk::update]
+fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, String> {
+    ensure_controller()?;
+    stable::set_retention_config(config)
 }
 
 #[ic_cdk::query]
@@ -362,6 +421,24 @@ mod tests {
         stable::set_evm_address(Some(expected.clone())).expect("automaton address should store");
 
         assert_eq!(get_automaton_evm_address(), Some(expected));
+    }
+
+    #[test]
+    fn apply_init_args_can_seed_http_allowlist() {
+        apply_init_args(InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: None,
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            http_allowed_domains: Some(vec!["api.coingecko.com".to_string()]),
+        });
+
+        assert!(stable::is_http_allowlist_enforced());
+        assert_eq!(
+            stable::list_allowed_http_domains(),
+            vec!["api.coingecko.com".to_string()]
+        );
     }
 }
 

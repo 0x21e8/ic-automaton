@@ -52,6 +52,9 @@ fn parse_http_fetch_args(args_json: &str) -> Result<HttpFetchArgs, String> {
 }
 
 fn ensure_host_allowed(host: &str, url: &str) -> Result<(), String> {
+    if !stable::is_http_allowlist_enforced() {
+        return Ok(());
+    }
     let allowed = stable::list_allowed_http_domains();
     if allowed.is_empty() {
         return Err("no domains allowed".to_string());
@@ -234,7 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn http_fetch_tool_uses_allowlist_and_host_stub() {
+    fn http_fetch_tool_allows_any_domain_by_default() {
+        stable::init_storage();
+
+        let out = block_on_with_spin(http_fetch_tool(r#"{"url":"https://example.com/anything"}"#))
+            .expect("without configured allowlist any https host should pass");
+        assert!(out.contains("stub"));
+    }
+
+    #[test]
+    fn http_fetch_tool_uses_allowlist_when_configured() {
         stable::init_storage();
         stable::set_http_allowed_domains(vec!["api.coingecko.com".to_string()])
             .expect("allowlist should set");
@@ -250,5 +262,15 @@ mod tests {
         ))
         .expect_err("non-allowlisted host should fail");
         assert!(err.contains("domain not in allowlist"));
+    }
+
+    #[test]
+    fn http_fetch_tool_blocks_when_allowlist_is_enforced_but_empty() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec![]).expect("empty allowlist should be valid");
+
+        let err = block_on_with_spin(http_fetch_tool(r#"{"url":"https://example.com"}"#))
+            .expect_err("configured empty allowlist should block all hosts");
+        assert!(err.contains("no domains allowed"));
     }
 }
