@@ -530,6 +530,26 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
+            name: "top_up_status".to_string(),
+            description: Some("Read the current USDC-to-cycles top-up state.".to_string()),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "trigger_top_up".to_string(),
+            description: Some(
+                "Start a USDC-to-cycles top-up flow and enqueue scheduler execution.".to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "http_fetch".to_string(),
             description: Some("Fetch text from an allowlisted HTTPS URL via GET.".to_string()),
             parameters: Some(IcLlmParameters {
@@ -580,6 +600,62 @@ fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
         tools.retain(|tool| !matches!(ic_llm_tool_name(tool), "evm_read" | "send_eth"));
     }
     tools
+}
+
+fn openrouter_tools() -> Vec<Value> {
+    ic_llm_tools()
+        .into_iter()
+        .map(ic_llm_tool_to_openrouter)
+        .collect()
+}
+
+fn ic_llm_tool_to_openrouter(tool: IcLlmTool) -> Value {
+    let IcLlmTool::Function(function) = tool;
+
+    let mut function_json = Map::new();
+    function_json.insert("name".to_string(), Value::String(function.name));
+    if let Some(description) = function.description {
+        function_json.insert("description".to_string(), Value::String(description));
+    }
+    if let Some(parameters) = function.parameters {
+        function_json.insert(
+            "parameters".to_string(),
+            ic_llm_parameters_to_openrouter(parameters),
+        );
+    }
+
+    let mut tool_json = Map::new();
+    tool_json.insert("type".to_string(), Value::String("function".to_string()));
+    tool_json.insert("function".to_string(), Value::Object(function_json));
+    Value::Object(tool_json)
+}
+
+fn ic_llm_parameters_to_openrouter(parameters: IcLlmParameters) -> Value {
+    let mut openrouter_parameters = Map::new();
+    openrouter_parameters.insert("type".to_string(), Value::String(parameters.type_));
+
+    let mut openrouter_properties = Map::new();
+    for property in parameters.properties.unwrap_or_default() {
+        let mut openrouter_property = Map::new();
+        openrouter_property.insert("type".to_string(), Value::String(property.type_));
+        if let Some(description) = property.description {
+            openrouter_property.insert("description".to_string(), Value::String(description));
+        }
+        openrouter_properties.insert(property.name, Value::Object(openrouter_property));
+    }
+    openrouter_parameters.insert(
+        "properties".to_string(),
+        Value::Object(openrouter_properties),
+    );
+
+    if let Some(required) = parameters.required {
+        openrouter_parameters.insert(
+            "required".to_string(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    Value::Object(openrouter_parameters)
 }
 
 fn parse_ic_llm_response(response: IcLlmResponse) -> Result<InferenceOutput, String> {
@@ -1058,135 +1134,7 @@ fn build_openrouter_request_body_with_transcript(
         "model": model,
         "messages": messages,
         "tool_choice": "auto",
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "sign_message",
-                    "description": "Sign a 32-byte message hash with the configured signer.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "message_hash": { "type": "string" } },
-                        "required": ["message_hash"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "record_signal",
-                    "description": "Record a signal in the automaton log.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "signal": { "type": "string" } },
-                        "required": ["signal"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "evm_read",
-                    "description": "Read on-chain state on EVM. Supports eth_getBalance and eth_call.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "method": { "type": "string", "enum": ["eth_getBalance", "eth_call"] },
-                            "address": { "type": "string" },
-                            "calldata": { "type": "string" }
-                        },
-                        "required": ["method", "address"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "send_eth",
-                    "description": "Send ETH on Base. Runtime handles nonce, gas, signing, and broadcast.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "to": { "type": "string" },
-                            "value_wei": { "type": "string" },
-                            "data": { "type": "string" }
-                        },
-                        "required": ["to", "value_wei"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "remember",
-                    "description": "Store a persistent memory fact by key; overwrites existing value for that key.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "key": { "type": "string" },
-                            "value": { "type": "string" }
-                        },
-                        "required": ["key", "value"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "recall",
-                    "description": "Retrieve memory facts. Optionally filter by key prefix.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "prefix": { "type": "string" }
-                        }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "forget",
-                    "description": "Delete a memory fact by key.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "key": { "type": "string" }
-                        },
-                        "required": ["key"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "http_fetch",
-                    "description": "Fetch text from an allowlisted HTTPS URL via GET.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": { "type": "string" }
-                        },
-                        "required": ["url"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "update_prompt_layer",
-                    "description": "Update a mutable prompt layer (6-9). Immutable layers cannot be modified.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "layer_id": { "type": "integer" },
-                            "content": { "type": "string" }
-                        },
-                        "required": ["layer_id", "content"]
-                    }
-                }
-            }
-        ]
+        "tools": openrouter_tools()
     })
 }
 
@@ -1913,6 +1861,8 @@ mod tests {
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"recall".to_string()));
         assert!(names.contains(&"forget".to_string()));
+        assert!(names.contains(&"top_up_status".to_string()));
+        assert!(names.contains(&"trigger_top_up".to_string()));
         assert!(names.contains(&"http_fetch".to_string()));
         assert!(names.contains(&"update_prompt_layer".to_string()));
     }
@@ -1943,8 +1893,31 @@ mod tests {
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"recall"));
         assert!(names.contains(&"forget"));
+        assert!(names.contains(&"top_up_status"));
+        assert!(names.contains(&"trigger_top_up"));
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
+    }
+
+    #[test]
+    fn openrouter_tools_stay_in_sync_with_ic_llm_tool_catalog() {
+        let mut ic_names = ic_llm_tools()
+            .into_iter()
+            .map(|tool| match tool {
+                IcLlmTool::Function(function) => function.name,
+            })
+            .collect::<Vec<_>>();
+        ic_names.sort();
+
+        let mut openrouter_names = openrouter_tools()
+            .into_iter()
+            .filter_map(|entry| entry.get("function").cloned())
+            .filter_map(|function| function.get("name").cloned())
+            .filter_map(|name| name.as_str().map(|value| value.to_string()))
+            .collect::<Vec<_>>();
+        openrouter_names.sort();
+
+        assert_eq!(openrouter_names, ic_names);
     }
 
     #[test]
@@ -1958,6 +1931,7 @@ mod tests {
         assert!(!names.contains(&"evm_read".to_string()));
         assert!(!names.contains(&"send_eth".to_string()));
         assert!(names.contains(&"remember".to_string()));
+        assert!(names.contains(&"top_up_status".to_string()));
     }
 
     #[test]
@@ -1986,6 +1960,7 @@ mod tests {
         assert!(!names.contains(&"evm_read"));
         assert!(!names.contains(&"send_eth"));
         assert!(names.contains(&"remember"));
+        assert!(names.contains(&"top_up_status"));
     }
 
     #[test]
