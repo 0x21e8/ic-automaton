@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+pub mod cycle_topup;
 pub mod evm;
 pub mod http_fetch;
 pub mod inference;
