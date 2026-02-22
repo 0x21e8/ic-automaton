@@ -112,6 +112,7 @@ type InitArgs = record {
   evm_confirmation_depth : opt nat64;
   evm_rpc_url : opt text;
   ecdsa_key_name : text;
+  llm_canister_id : opt principal;
   inbox_contract_address : opt text;
   http_allowed_domains : opt vec text;
 };

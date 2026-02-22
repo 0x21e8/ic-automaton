@@ -292,6 +292,8 @@ pub struct RuntimeSnapshot {
     pub inference_provider: InferenceProvider,
     #[serde(default = "default_inference_model")]
     pub inference_model: String,
+    #[serde(default = "default_llm_canister_id")]
+    pub llm_canister_id: String,
     #[serde(default)]
     pub openrouter_api_key: Option<String>,
     #[serde(default = "default_openrouter_base_url")]
@@ -334,6 +336,7 @@ impl Default for RuntimeSnapshot {
             last_transition_at_ns: 0,
             inference_provider: InferenceProvider::default(),
             inference_model: default_inference_model(),
+            llm_canister_id: default_llm_canister_id(),
             openrouter_api_key: None,
             openrouter_base_url: default_openrouter_base_url(),
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
@@ -1180,6 +1183,10 @@ impl Default for SchedulerRuntime {
 
 fn default_inference_model() -> String {
     "llama3.1:8b".to_string()
+}
+
+fn default_llm_canister_id() -> String {
+    "w36hm-eqaaa-aaaal-qr76a-cai".to_string()
 }
 
 fn default_openrouter_base_url() -> String {

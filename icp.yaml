@@ -1,7 +1,12 @@
 # yaml-language-server: $schema=https://github.com/dfinity/icp-cli/raw/refs/tags/v0.1.0/docs/schemas/icp-yaml-schema.json
 canisters:
+  - name: llm
+    build:
+      steps:
+        - type: pre-built
+          url: https://github.com/dfinity/llm/releases/download/v0.3.1/llm-canister-ollama.wasm
   - name: backend 
-    init_args: '(record { ecdsa_key_name = "dfx_test_key"; evm_chain_id = opt (31337 : nat64); evm_rpc_url = opt "http://127.0.0.1:18545"; evm_confirmation_depth = opt (0 : nat64); http_allowed_domains = null })'
+    init_args: '(record { ecdsa_key_name = "dfx_test_key"; evm_chain_id = opt (31337 : nat64); evm_rpc_url = opt "http://127.0.0.1:18545"; evm_confirmation_depth = opt (0 : nat64); http_allowed_domains = null; llm_canister_id = opt principal "w36hm-eqaaa-aaaal-qr76a-cai" })'
     recipe:
       type: "@dfinity/rust@v3.0.0"
       configuration:
