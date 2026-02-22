@@ -10,6 +10,12 @@ use crate::domain::types::{
     RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy,
     RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
 };
+use crate::features::cycle_topup::{
+    TopUpStage, TOPUP_MIN_OPERATIONAL_CYCLES, TOPUP_MIN_USDC_AVAILABLE_RAW,
+};
+use crate::features::cycle_topup_host::{
+    build_cycle_topup, enqueue_topup_cycles_job, topup_cycles_dedupe_key,
+};
 use crate::features::evm::{
     classify_evm_failure, decode_message_queued_payload, fetch_wallet_balance_sync_read,
 };
@@ -28,6 +34,13 @@ const EVM_RPC_MAX_RESPONSE_BYTES_POLICY_MAX: u64 = 2 * 1024 * 1024;
 const RESPONSE_BYTES_POLICY_MIN: u64 = 256;
 const RECOVERY_BACKOFF_BASE_SECS: u64 = 1;
 const WALLET_SYNC_MAX_RESPONSE_BYTES_RECOVERY_MAX: u64 = 4 * 1024;
+const TOPUP_FAILED_RECOVERY_BACKOFF_SECS: u64 = 120;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobDispatchOutcome {
+    Completed,
+    TopUpWaiting,
+}
 
 fn current_time_ns() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -181,8 +194,9 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
 
     let result = dispatch_job(&job).await;
     match result {
-        Ok(()) => {
-            stable::complete_job(&job.id, JobStatus::Succeeded, None, current_time_ns(), None)
+        Ok(outcome) => {
+            stable::complete_job(&job.id, JobStatus::Succeeded, None, current_time_ns(), None);
+            maybe_enqueue_topup_waiting_continuation(outcome, current_time_ns());
         }
         Err(error) => apply_recovery_policy_for_failed_job(&job, error, current_time_ns()),
     }
@@ -190,20 +204,57 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
     Ok(true)
 }
 
-async fn dispatch_job(job: &ScheduledJob) -> Result<(), String> {
+async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> {
     match job.kind {
-        TaskKind::AgentTurn => run_scheduled_turn_job().await,
-        TaskKind::PollInbox => run_poll_inbox_job(current_time_ns()).await,
-        TaskKind::CheckCycles => run_check_cycles().await,
-        TaskKind::Reconcile => Ok(()),
+        TaskKind::AgentTurn => {
+            run_scheduled_turn_job().await?;
+            Ok(JobDispatchOutcome::Completed)
+        }
+        TaskKind::PollInbox => {
+            run_poll_inbox_job(current_time_ns()).await?;
+            Ok(JobDispatchOutcome::Completed)
+        }
+        TaskKind::CheckCycles => {
+            run_check_cycles().await?;
+            Ok(JobDispatchOutcome::Completed)
+        }
+        TaskKind::TopUpCycles => {
+            let snapshot = stable::runtime_snapshot();
+            let topup = build_cycle_topup(&snapshot)?;
+            let done = topup.advance().await?;
+            if done {
+                Ok(JobDispatchOutcome::Completed)
+            } else {
+                Ok(JobDispatchOutcome::TopUpWaiting)
+            }
+        }
+        TaskKind::Reconcile => Ok(JobDispatchOutcome::Completed),
     }
+}
+
+fn maybe_enqueue_topup_waiting_continuation(outcome: JobDispatchOutcome, now_ns: u64) {
+    if !matches!(outcome, JobDispatchOutcome::TopUpWaiting) {
+        return;
+    }
+
+    let interval_secs = stable::get_task_config(&TaskKind::TopUpCycles)
+        .map(|config| config.interval_secs.max(1))
+        .unwrap_or(TaskKind::TopUpCycles.default_interval_secs().max(1));
+    let continuation_hint_ns = now_ns.saturating_add(interval_secs.saturating_mul(1_000_000_000));
+    let enqueued = enqueue_topup_cycles_job("wait", continuation_hint_ns).is_some();
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_topup_waiting_continuation enqueued={} continuation_hint_ns={}",
+        enqueued,
+        continuation_hint_ns
+    );
 }
 
 fn classify_failure_for_task(kind: &TaskKind, error: &str) -> RecoveryFailure {
     match kind {
         TaskKind::AgentTurn => classify_inference_failure(error),
         TaskKind::PollInbox => classify_evm_failure(error),
-        TaskKind::CheckCycles | TaskKind::Reconcile => {
+        TaskKind::CheckCycles | TaskKind::TopUpCycles | TaskKind::Reconcile => {
             RecoveryFailure::Operation(OperationFailure {
                 kind: OperationFailureKind::Unknown,
             })
@@ -215,7 +266,9 @@ fn recovery_operation_for_task(kind: &TaskKind) -> RecoveryOperation {
     match kind {
         TaskKind::AgentTurn => RecoveryOperation::Inference,
         TaskKind::PollInbox => RecoveryOperation::EvmPoll,
-        TaskKind::CheckCycles | TaskKind::Reconcile => RecoveryOperation::Unknown,
+        TaskKind::CheckCycles | TaskKind::TopUpCycles | TaskKind::Reconcile => {
+            RecoveryOperation::Unknown
+        }
     }
 }
 
@@ -659,18 +712,61 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
 }
 
 async fn run_check_cycles() -> Result<(), String> {
+    let now_ns = current_time_ns();
     let total_cycles = ic_cdk::api::canister_cycle_balance();
     let liquid_cycles = ic_cdk::api::canister_liquid_cycle_balance();
     let expected = classify_survival_tier(total_cycles, liquid_cycles)?;
     let requirements = check_cycles_requirements()?;
+    let snapshot = stable::runtime_snapshot();
+    let cached_usdc_balance_raw =
+        parse_hex_quantity_u64(snapshot.wallet_balance.usdc_balance_raw_hex.as_deref());
+    let mut topup_state = stable::read_topup_state();
+    let mut topup_triggered = false;
 
     stable::set_scheduler_survival_tier(expected.clone());
     let runtime_tier = stable::scheduler_survival_tier();
     let recovery_checks = stable::scheduler_survival_tier_recovery_checks();
 
+    if snapshot.cycle_topup.enabled
+        && maybe_recover_failed_topup(&snapshot, topup_state.as_ref(), now_ns)
+    {
+        topup_triggered = true;
+        topup_state = stable::read_topup_state();
+    }
+
+    if !topup_triggered
+        && should_trigger_cycle_topup(
+            total_cycles,
+            &snapshot,
+            topup_state.as_ref(),
+            cached_usdc_balance_raw,
+        )
+    {
+        match build_cycle_topup(&snapshot) {
+            Ok(topup) => match topup.start() {
+                Ok(()) => {
+                    let _ = enqueue_topup_cycles_job("auto", now_ns);
+                    topup_triggered = true;
+                }
+                Err(error) => {
+                    log!(
+                        SchedulerLogPriority::Error,
+                        "scheduler_checkcycles_topup_start_rejected error={error}",
+                    );
+                }
+            },
+            Err(error) => {
+                log!(
+                    SchedulerLogPriority::Error,
+                    "scheduler_checkcycles_topup_config_error error={error}",
+                );
+            }
+        }
+    }
+
     log!(
         SchedulerLogPriority::Info,
-    "scheduler_checkcycles total_cycles={} liquid_cycles={} reserve_floor_cycles={} required_cycles={} low_tier_limit={} observed_tier={:?} runtime_tier={:?} recovery_checks={}",
+    "scheduler_checkcycles total_cycles={} liquid_cycles={} reserve_floor_cycles={} required_cycles={} low_tier_limit={} observed_tier={:?} runtime_tier={:?} recovery_checks={} cached_usdc_balance_raw={:?} topup_triggered={} topup_state={:?}",
         total_cycles,
         liquid_cycles,
         DEFAULT_RESERVE_FLOOR_CYCLES,
@@ -678,9 +774,129 @@ async fn run_check_cycles() -> Result<(), String> {
         requirements.required_cycles.saturating_mul(CHECKCYCLES_LOW_TIER_MULTIPLIER),
         expected,
         runtime_tier,
-        recovery_checks
+        recovery_checks,
+        cached_usdc_balance_raw,
+        topup_triggered,
+        topup_state
     );
     Ok(())
+}
+
+fn parse_hex_quantity_u64(raw: Option<&str>) -> Option<u64> {
+    let raw = raw?;
+    let normalized = raw.trim();
+    let without_prefix = normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))
+        .unwrap_or(normalized);
+    if without_prefix.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(without_prefix, 16).ok()
+}
+
+fn topup_state_allows_auto_start(state: Option<&TopUpStage>) -> bool {
+    matches!(state, None | Some(TopUpStage::Completed { .. }))
+}
+
+fn topup_failed_recovery_due(state: Option<&TopUpStage>, now_ns: u64) -> bool {
+    let Some(TopUpStage::Failed { failed_at_ns, .. }) = state else {
+        return false;
+    };
+    let backoff_ns = TOPUP_FAILED_RECOVERY_BACKOFF_SECS.saturating_mul(1_000_000_000);
+    now_ns >= failed_at_ns.saturating_add(backoff_ns)
+}
+
+fn maybe_recover_failed_topup(
+    snapshot: &RuntimeSnapshot,
+    topup_state: Option<&TopUpStage>,
+    now_ns: u64,
+) -> bool {
+    let Some(TopUpStage::Failed {
+        stage,
+        error,
+        failed_at_ns,
+        attempts,
+    }) = topup_state
+    else {
+        return false;
+    };
+
+    let retry_at_ns = failed_at_ns
+        .saturating_add(TOPUP_FAILED_RECOVERY_BACKOFF_SECS.saturating_mul(1_000_000_000));
+    if !topup_failed_recovery_due(topup_state, now_ns) {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_checkcycles_topup_recovery_backoff active=true retry_at_ns={} failed_stage={} attempts={}",
+            retry_at_ns,
+            stage,
+            attempts
+        );
+        return false;
+    }
+
+    let topup = match build_cycle_topup(snapshot) {
+        Ok(topup) => topup,
+        Err(recover_error) => {
+            log!(
+                SchedulerLogPriority::Error,
+                "scheduler_checkcycles_topup_recovery_config_error error={recover_error}",
+            );
+            return false;
+        }
+    };
+
+    if let Err(recover_error) = topup.reset() {
+        log!(
+            SchedulerLogPriority::Error,
+            "scheduler_checkcycles_topup_recovery_reset_error error={recover_error}",
+        );
+        return false;
+    }
+    if let Err(recover_error) = topup.start() {
+        log!(
+            SchedulerLogPriority::Error,
+            "scheduler_checkcycles_topup_recovery_start_error error={recover_error}",
+        );
+        return false;
+    }
+
+    let enqueued = enqueue_topup_cycles_job("auto-recover", now_ns).is_some();
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_checkcycles_topup_recovery_started enqueued={} failed_stage={} failed_error={} previous_attempts={}",
+        enqueued,
+        stage,
+        error,
+        attempts
+    );
+    true
+}
+
+fn should_trigger_cycle_topup(
+    total_cycles: u128,
+    snapshot: &RuntimeSnapshot,
+    topup_state: Option<&TopUpStage>,
+    cached_usdc_balance_raw: Option<u64>,
+) -> bool {
+    if !snapshot.cycle_topup.enabled {
+        return false;
+    }
+    if total_cycles <= TOPUP_MIN_OPERATIONAL_CYCLES {
+        return false;
+    }
+    if total_cycles >= snapshot.cycle_topup.auto_topup_cycle_threshold {
+        return false;
+    }
+    if !topup_state_allows_auto_start(topup_state) {
+        return false;
+    }
+
+    let min_required = snapshot
+        .cycle_topup
+        .min_usdc_reserve
+        .saturating_add(TOPUP_MIN_USDC_AVAILABLE_RAW);
+    cached_usdc_balance_raw.unwrap_or_default() >= min_required
 }
 
 fn check_cycles_requirements() -> Result<AffordabilityRequirements, String> {
@@ -751,7 +967,11 @@ pub fn refresh_due_jobs(now_ns: u64) {
         }
 
         let slot_start_ns = now_ns - (now_ns % interval_ns);
-        let dedupe_key = format!("{}:{}", kind.as_str(), slot_start_ns);
+        let dedupe_key = if kind == TaskKind::TopUpCycles {
+            topup_cycles_dedupe_key()
+        } else {
+            format!("{}:{}", kind.as_str(), slot_start_ns)
+        };
         if let Some(job_id) = stable::enqueue_job_if_absent(
             kind.clone(),
             TaskLane::Mutating,
@@ -791,6 +1011,7 @@ fn lease_ttl_ns(kind: &TaskKind) -> u64 {
         TaskKind::AgentTurn => 240_000_000_000,
         TaskKind::PollInbox => 60_000_000_000,
         TaskKind::CheckCycles => 60_000_000_000,
+        TaskKind::TopUpCycles => 60_000_000_000,
         TaskKind::Reconcile => 60_000_000_000,
     }
 }
@@ -806,6 +1027,22 @@ mod tests {
     use crate::storage::stable;
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn settle_pending_topup_jobs(now_ns: u64) {
+        for job in stable::list_recent_jobs(500)
+            .into_iter()
+            .filter(|job| job.kind == TaskKind::TopUpCycles && !job.is_terminal())
+        {
+            stable::complete_job(&job.id, JobStatus::Succeeded, None, now_ns, None);
+        }
+    }
+
+    fn topup_job_count() -> usize {
+        stable::list_recent_jobs(500)
+            .into_iter()
+            .filter(|job| job.kind == TaskKind::TopUpCycles)
+            .count()
+    }
 
     fn block_on_with_spin<F: Future>(future: F) -> F::Output {
         unsafe fn clone(_ptr: *const ()) -> RawWaker {
@@ -1071,6 +1308,79 @@ mod tests {
     }
 
     #[test]
+    fn topup_jobs_use_singleton_dedupe_across_periodic_and_explicit_triggers() {
+        init_scheduler_scope();
+        let now_ns = 30_000_000_000u64;
+
+        let mut topup_config =
+            stable::get_task_config(&TaskKind::TopUpCycles).expect("top-up config should exist");
+        topup_config.enabled = true;
+        topup_config.interval_secs = 30;
+        stable::upsert_task_config(topup_config);
+
+        let mut topup_runtime = stable::get_task_runtime(&TaskKind::TopUpCycles);
+        topup_runtime.next_due_ns = now_ns;
+        topup_runtime.pending_job_id = None;
+        topup_runtime.backoff_until_ns = None;
+        stable::save_task_runtime(&TaskKind::TopUpCycles, &topup_runtime);
+
+        refresh_due_jobs(now_ns);
+        let dedupe_key = topup_cycles_dedupe_key();
+        let singleton_jobs: Vec<_> = stable::list_recent_jobs(200)
+            .into_iter()
+            .filter(|job| job.kind == TaskKind::TopUpCycles && job.dedupe_key == dedupe_key)
+            .collect();
+        assert_eq!(singleton_jobs.len(), 1, "periodic path should enqueue once");
+
+        assert!(
+            enqueue_topup_cycles_job("auto", now_ns).is_none(),
+            "auto trigger should dedupe against pending singleton job"
+        );
+        assert!(
+            enqueue_topup_cycles_job("tool", now_ns.saturating_add(1)).is_none(),
+            "tool trigger should dedupe against pending singleton job"
+        );
+
+        let all_topup_jobs = stable::list_recent_jobs(200)
+            .into_iter()
+            .filter(|job| job.kind == TaskKind::TopUpCycles)
+            .count();
+        assert_eq!(
+            all_topup_jobs, 1,
+            "only one top-up job should remain queued"
+        );
+    }
+
+    #[test]
+    fn topup_waiting_outcome_enqueues_continuation_job() {
+        stable::init_storage();
+        settle_pending_topup_jobs(100);
+        let before = topup_job_count();
+        maybe_enqueue_topup_waiting_continuation(JobDispatchOutcome::TopUpWaiting, 100);
+        let after = topup_job_count();
+        assert_eq!(after, before.saturating_add(1));
+        let continuation = stable::list_recent_jobs(500)
+            .into_iter()
+            .find(|job| job.kind == TaskKind::TopUpCycles && !job.is_terminal())
+            .expect("continuation topup job should be pending");
+        assert_eq!(continuation.dedupe_key, topup_cycles_dedupe_key());
+        assert!(
+            continuation.scheduled_for_ns > 100,
+            "continuation should be scheduled in the future"
+        );
+    }
+
+    #[test]
+    fn topup_completed_outcome_does_not_enqueue_continuation_job() {
+        stable::init_storage();
+        settle_pending_topup_jobs(100);
+        let before = topup_job_count();
+        maybe_enqueue_topup_waiting_continuation(JobDispatchOutcome::Completed, 100);
+        let after = topup_job_count();
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn checkcycles_classifies_survival_tier_by_liquid_cycles() {
         let requirements = check_cycles_requirements().expect("requirements should compute");
         let low_threshold = requirements
@@ -1134,6 +1444,153 @@ mod tests {
     }
 
     #[test]
+    fn checkcycles_topup_trigger_requires_threshold_usdc_and_idle_state() {
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.cycle_topup.enabled = true;
+        snapshot.cycle_topup.auto_topup_cycle_threshold = 200_000_000_000;
+        snapshot.cycle_topup.min_usdc_reserve = 2_000_000;
+
+        assert!(should_trigger_cycle_topup(
+            199_000_000_000,
+            &snapshot,
+            None,
+            Some(7_000_001)
+        ));
+        assert!(!should_trigger_cycle_topup(
+            210_000_000_000,
+            &snapshot,
+            None,
+            Some(7_000_001)
+        ));
+        assert!(!should_trigger_cycle_topup(
+            59_000_000_000,
+            &snapshot,
+            None,
+            Some(7_000_001)
+        ));
+        assert!(!should_trigger_cycle_topup(
+            199_000_000_000,
+            &snapshot,
+            Some(&TopUpStage::Preflight),
+            Some(7_000_001)
+        ));
+        assert!(!should_trigger_cycle_topup(
+            199_000_000_000,
+            &snapshot,
+            Some(&TopUpStage::Failed {
+                stage: "Preflight".to_string(),
+                error: "boom".to_string(),
+                failed_at_ns: 1,
+                attempts: 1,
+            }),
+            Some(7_000_001)
+        ));
+        assert!(should_trigger_cycle_topup(
+            199_000_000_000,
+            &snapshot,
+            Some(&TopUpStage::Completed {
+                cycles_minted: 1,
+                usdc_spent: 1,
+                completed_at_ns: 1,
+            }),
+            Some(7_000_000)
+        ));
+    }
+
+    #[test]
+    fn topup_failed_recovery_due_only_after_backoff_window() {
+        let failed_at_ns = 1_000_000_000_u64;
+        let failed_state = TopUpStage::Failed {
+            stage: "Preflight".to_string(),
+            error: "boom".to_string(),
+            failed_at_ns,
+            attempts: 1,
+        };
+        let backoff_ns = TOPUP_FAILED_RECOVERY_BACKOFF_SECS.saturating_mul(1_000_000_000);
+
+        assert!(!topup_failed_recovery_due(None, failed_at_ns));
+        assert!(!topup_failed_recovery_due(
+            Some(&failed_state),
+            failed_at_ns.saturating_add(backoff_ns).saturating_sub(1),
+        ));
+        assert!(topup_failed_recovery_due(
+            Some(&failed_state),
+            failed_at_ns.saturating_add(backoff_ns),
+        ));
+    }
+
+    #[test]
+    fn maybe_recover_failed_topup_resets_and_restarts_when_backoff_elapsed() {
+        stable::init_storage();
+        stable::clear_topup_state();
+
+        let now_ns = TOPUP_FAILED_RECOVERY_BACKOFF_SECS
+            .saturating_mul(1_000_000_000)
+            .saturating_add(100);
+        let failed_state = TopUpStage::Failed {
+            stage: "Preflight".to_string(),
+            error: "boom".to_string(),
+            failed_at_ns: 0,
+            attempts: 1,
+        };
+        stable::write_topup_state(&failed_state);
+
+        let snapshot = RuntimeSnapshot {
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            cycle_topup: crate::domain::types::CycleTopUpConfig {
+                enabled: true,
+                ..crate::domain::types::CycleTopUpConfig::default()
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        assert!(maybe_recover_failed_topup(
+            &snapshot,
+            Some(&failed_state),
+            now_ns
+        ));
+        assert!(matches!(
+            stable::read_topup_state(),
+            Some(TopUpStage::Preflight)
+        ));
+    }
+
+    #[test]
+    fn maybe_recover_failed_topup_respects_backoff_window() {
+        stable::init_storage();
+        stable::clear_topup_state();
+
+        let failed_at_ns = 10_000u64;
+        let failed_state = TopUpStage::Failed {
+            stage: "Preflight".to_string(),
+            error: "boom".to_string(),
+            failed_at_ns,
+            attempts: 1,
+        };
+        stable::write_topup_state(&failed_state);
+
+        let snapshot = RuntimeSnapshot {
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            cycle_topup: crate::domain::types::CycleTopUpConfig {
+                enabled: true,
+                ..crate::domain::types::CycleTopUpConfig::default()
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        let now_ns = failed_at_ns.saturating_add(1);
+        assert!(!maybe_recover_failed_topup(
+            &snapshot,
+            Some(&failed_state),
+            now_ns,
+        ));
+        assert!(matches!(
+            stable::read_topup_state(),
+            Some(TopUpStage::Failed { .. })
+        ));
+    }
+
+    #[test]
     fn operation_class_mapping_for_scheduler_tasks_is_stable() {
         assert_eq!(
             operation_class_for_task(&TaskKind::AgentTurn),
@@ -1144,6 +1601,7 @@ mod tests {
             Some(SurvivalOperationClass::EvmPoll)
         );
         assert_eq!(operation_class_for_task(&TaskKind::CheckCycles), None);
+        assert_eq!(operation_class_for_task(&TaskKind::TopUpCycles), None);
         assert_eq!(operation_class_for_task(&TaskKind::Reconcile), None);
     }
 
@@ -1152,6 +1610,7 @@ mod tests {
         assert_eq!(lease_ttl_ns(&TaskKind::AgentTurn), 240_000_000_000);
         assert_eq!(lease_ttl_ns(&TaskKind::PollInbox), 60_000_000_000);
         assert_eq!(lease_ttl_ns(&TaskKind::CheckCycles), 60_000_000_000);
+        assert_eq!(lease_ttl_ns(&TaskKind::TopUpCycles), 60_000_000_000);
         assert_eq!(lease_ttl_ns(&TaskKind::Reconcile), 60_000_000_000);
     }
 
