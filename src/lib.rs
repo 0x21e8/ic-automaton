@@ -41,6 +41,10 @@ struct InitArgs {
     http_allowed_domains: Option<Vec<String>>,
     #[serde(default)]
     llm_canister_id: Option<Principal>,
+    #[serde(default)]
+    cycle_topup_enabled: Option<bool>,
+    #[serde(default)]
+    auto_topup_cycle_threshold: Option<u64>,
 }
 
 fn ensure_controller() -> Result<(), String> {
@@ -105,6 +109,20 @@ fn apply_init_args(args: InitArgs) {
     if let Some(llm_canister_id) = args.llm_canister_id {
         let _ = stable::set_llm_canister_id(llm_canister_id.to_text())
             .unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
+
+    let mut snapshot = stable::runtime_snapshot();
+    let mut changed = false;
+    if let Some(enabled) = args.cycle_topup_enabled {
+        snapshot.cycle_topup.enabled = enabled;
+        changed = true;
+    }
+    if let Some(threshold) = args.auto_topup_cycle_threshold {
+        snapshot.cycle_topup.auto_topup_cycle_threshold = u128::from(threshold);
+        changed = true;
+    }
+    if changed {
+        stable::save_runtime_snapshot(&snapshot);
     }
 }
 
@@ -439,6 +457,8 @@ mod tests {
             evm_confirmation_depth: None,
             http_allowed_domains: Some(vec!["api.coingecko.com".to_string()]),
             llm_canister_id: None,
+            cycle_topup_enabled: None,
+            auto_topup_cycle_threshold: None,
         });
 
         assert!(stable::is_http_allowlist_enforced());
@@ -461,9 +481,33 @@ mod tests {
                 Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
                     .expect("test principal should parse"),
             ),
+            cycle_topup_enabled: None,
+            auto_topup_cycle_threshold: None,
         });
 
         assert_eq!(stable::get_llm_canister_id(), "w36hm-eqaaa-aaaal-qr76a-cai");
+    }
+
+    #[test]
+    fn apply_init_args_can_override_cycle_topup_controls() {
+        apply_init_args(InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: None,
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            http_allowed_domains: None,
+            llm_canister_id: None,
+            cycle_topup_enabled: Some(false),
+            auto_topup_cycle_threshold: Some(150_000_000_000),
+        });
+
+        let snapshot = stable::runtime_snapshot();
+        assert!(!snapshot.cycle_topup.enabled);
+        assert_eq!(
+            snapshot.cycle_topup.auto_topup_cycle_threshold,
+            150_000_000_000
+        );
     }
 }
 

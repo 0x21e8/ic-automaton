@@ -275,6 +275,62 @@ impl From<&WalletBalanceSyncConfig> for WalletBalanceSyncConfigView {
     }
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CycleTopUpConfig {
+    #[serde(default = "default_cycle_topup_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_auto_topup_cycle_threshold")]
+    pub auto_topup_cycle_threshold: u128,
+    #[serde(default)]
+    pub usdc_contract_address: Option<String>,
+    #[serde(default = "default_onesec_locker_address")]
+    pub onesec_locker_address: String,
+    #[serde(default = "default_onesec_canister_id")]
+    pub onesec_canister_id: String,
+    #[serde(default = "default_bridged_usdc_ledger_id")]
+    pub bridged_usdc_ledger_id: String,
+    #[serde(default = "default_kong_backend_id")]
+    pub kong_backend_id: String,
+    #[serde(default = "default_icp_ledger_id")]
+    pub icp_ledger_id: String,
+    #[serde(default = "default_cmc_id")]
+    pub cmc_id: String,
+    #[serde(default)]
+    pub target_canister_id: Option<String>,
+    #[serde(default = "default_min_usdc_reserve")]
+    pub min_usdc_reserve: u64,
+    #[serde(default = "default_max_usdc_per_topup")]
+    pub max_usdc_per_topup: u64,
+    #[serde(default = "default_max_slippage_pct")]
+    pub max_slippage_pct: f64,
+    #[serde(default = "default_max_bridge_polls")]
+    pub max_bridge_polls: u8,
+    #[serde(default = "default_lock_confirmations")]
+    pub lock_confirmations: u8,
+}
+
+impl Default for CycleTopUpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cycle_topup_enabled(),
+            auto_topup_cycle_threshold: default_auto_topup_cycle_threshold(),
+            usdc_contract_address: None,
+            onesec_locker_address: default_onesec_locker_address(),
+            onesec_canister_id: default_onesec_canister_id(),
+            bridged_usdc_ledger_id: default_bridged_usdc_ledger_id(),
+            kong_backend_id: default_kong_backend_id(),
+            icp_ledger_id: default_icp_ledger_id(),
+            cmc_id: default_cmc_id(),
+            target_canister_id: None,
+            min_usdc_reserve: default_min_usdc_reserve(),
+            max_usdc_per_topup: default_max_usdc_per_topup(),
+            max_slippage_pct: default_max_slippage_pct(),
+            max_bridge_polls: default_max_bridge_polls(),
+            lock_confirmations: default_lock_confirmations(),
+        }
+    }
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeSnapshot {
     pub state: AgentState,
@@ -318,6 +374,8 @@ pub struct RuntimeSnapshot {
     pub wallet_balance_sync: WalletBalanceSyncConfig,
     #[serde(default = "default_wallet_balance_bootstrap_pending")]
     pub wallet_balance_bootstrap_pending: bool,
+    #[serde(default)]
+    pub cycle_topup: CycleTopUpConfig,
 }
 
 impl Default for RuntimeSnapshot {
@@ -349,6 +407,7 @@ impl Default for RuntimeSnapshot {
             wallet_balance: WalletBalanceSnapshot::default(),
             wallet_balance_sync: WalletBalanceSyncConfig::default(),
             wallet_balance_bootstrap_pending: default_wallet_balance_bootstrap_pending(),
+            cycle_topup: CycleTopUpConfig::default(),
         }
     }
 }
@@ -835,6 +894,7 @@ pub enum TaskKind {
     AgentTurn,
     PollInbox,
     CheckCycles,
+    TopUpCycles,
     Reconcile,
 }
 
@@ -844,6 +904,7 @@ impl TaskKind {
             Self::AgentTurn => "AgentTurn",
             Self::PollInbox => "PollInbox",
             Self::CheckCycles => "CheckCycles",
+            Self::TopUpCycles => "TopUpCycles",
             Self::Reconcile => "Reconcile",
         }
     }
@@ -853,7 +914,8 @@ impl TaskKind {
             Self::AgentTurn => 0,
             Self::PollInbox => 1,
             Self::CheckCycles => 2,
-            Self::Reconcile => 3,
+            Self::TopUpCycles => 3,
+            Self::Reconcile => 4,
         }
     }
 
@@ -862,6 +924,7 @@ impl TaskKind {
             Self::AgentTurn => true,
             Self::PollInbox => true,
             Self::CheckCycles => true,
+            Self::TopUpCycles => true,
             Self::Reconcile => false,
         }
     }
@@ -871,15 +934,17 @@ impl TaskKind {
             Self::AgentTurn => 30,
             Self::PollInbox => 30,
             Self::CheckCycles => 60,
+            Self::TopUpCycles => 30,
             Self::Reconcile => 300,
         }
     }
 
     pub const fn all() -> &'static [Self] {
-        static TASK_KINDS: [TaskKind; 4] = [
+        static TASK_KINDS: [TaskKind; 5] = [
             TaskKind::AgentTurn,
             TaskKind::PollInbox,
             TaskKind::CheckCycles,
+            TaskKind::TopUpCycles,
             TaskKind::Reconcile,
         ];
         &TASK_KINDS
@@ -1081,9 +1146,10 @@ pub struct TaskScheduleConfig {
 
 impl TaskScheduleConfig {
     pub fn default_for(kind: &TaskKind) -> Self {
+        let enabled = !matches!(kind, TaskKind::TopUpCycles);
         Self {
             kind: kind.clone(),
-            enabled: true,
+            enabled,
             essential: kind.essential(),
             interval_secs: kind.default_interval_secs(),
             priority: kind.default_priority(),
@@ -1241,6 +1307,58 @@ fn default_wallet_balance_bootstrap_pending() -> bool {
     true
 }
 
+fn default_cycle_topup_enabled() -> bool {
+    true
+}
+
+fn default_auto_topup_cycle_threshold() -> u128 {
+    200_000_000_000
+}
+
+fn default_onesec_locker_address() -> String {
+    "0xae2351b15cff68b5863c6690dca58dce383bf45a".to_string()
+}
+
+fn default_onesec_canister_id() -> String {
+    "5okwm-giaaa-aaaar-qbn6a-cai".to_string()
+}
+
+fn default_bridged_usdc_ledger_id() -> String {
+    "53nhb-haaaa-aaaar-qbn5q-cai".to_string()
+}
+
+fn default_kong_backend_id() -> String {
+    "2ipq2-uqaaa-aaaar-qailq-cai".to_string()
+}
+
+fn default_icp_ledger_id() -> String {
+    "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string()
+}
+
+fn default_cmc_id() -> String {
+    "rkp4c-7iaaa-aaaaa-aaaca-cai".to_string()
+}
+
+fn default_min_usdc_reserve() -> u64 {
+    2_000_000
+}
+
+fn default_max_usdc_per_topup() -> u64 {
+    50_000_000
+}
+
+fn default_max_slippage_pct() -> f64 {
+    5.0
+}
+
+fn default_max_bridge_polls() -> u8 {
+    60
+}
+
+fn default_lock_confirmations() -> u8 {
+    12
+}
+
 #[allow(dead_code)]
 fn default_recovery_backoff_base_secs() -> u64 {
     5
@@ -1365,6 +1483,15 @@ mod tests {
     fn runtime_snapshot_defaults_bootstrap_pending_for_wallet_sync() {
         let snapshot = RuntimeSnapshot::default();
         assert!(snapshot.wallet_balance_bootstrap_pending);
+        assert!(snapshot.cycle_topup.enabled);
+        assert_eq!(
+            snapshot.cycle_topup.auto_topup_cycle_threshold,
+            200_000_000_000
+        );
+        assert_eq!(
+            snapshot.cycle_topup.onesec_locker_address,
+            "0xae2351b15cff68b5863c6690dca58dce383bf45a"
+        );
     }
 
     #[test]

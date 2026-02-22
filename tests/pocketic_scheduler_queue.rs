@@ -22,6 +22,7 @@ enum TaskKind {
     AgentTurn,
     PollInbox,
     CheckCycles,
+    TopUpCycles,
     Reconcile,
 }
 

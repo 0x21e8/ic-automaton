@@ -113,6 +113,8 @@ type InitArgs = record {
   evm_rpc_url : opt text;
   ecdsa_key_name : text;
   llm_canister_id : opt principal;
+  auto_topup_cycle_threshold : opt nat64;
+  cycle_topup_enabled : opt bool;
   inbox_contract_address : opt text;
   http_allowed_domains : opt vec text;
 };
@@ -322,7 +324,13 @@ type StorageGrowthMetrics = record {
 };
 type StoragePressureLevel = variant { High; Normal; Critical; Elevated };
 type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
-type TaskKind = variant { Reconcile; CheckCycles; PollInbox; AgentTurn };
+type TaskKind = variant {
+  Reconcile;
+  CheckCycles;
+  PollInbox;
+  TopUpCycles;
+  AgentTurn;
+};
 type TaskLane = variant { ReadOnly; Mutating };
 type TaskScheduleConfig = record {
   max_backoff_secs : nat64;
