@@ -188,14 +188,20 @@ icp canister call backend get_runtime_view '()'
 
 ### Full Bootstrap (with local EVM)
 
-The justfile provides a complete local development environment with a local Anvil EVM chain:
+The justfile provides a complete local development environment with a local Anvil EVM chain and two inference modes:
 
 ```bash
-# Start everything: local IC + Anvil + deploy contracts + deploy canister
-just bootstrap
+# Start everything with OpenRouter inference (requires OPENROUTER_API_KEY)
+just bootstrap openrouter
+
+# Start everything with local ic_llm mode (starts Ollama, configures IcLlm)
+just bootstrap icllm
+
+# Tear down all local services (IC, Anvil, and tracked Ollama if started)
+just down all
 
 # Send a message to the agent via the Inbox contract
-just send-message "hello automaton"
+just send-message-usdc "hello automaton"
 
 # Enable the agent loop
 icp canister call backend set_loop_enabled '(true)'

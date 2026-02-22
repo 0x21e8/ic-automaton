@@ -11,6 +11,11 @@ bootstrap_eth_wei := "500000000000000"
 automaton_wait_timeout_secs := "180"
 automaton_wait_poll_secs := "2"
 local_url := "http://127.0.0.1:8000"
+openrouter_default_model := "openai/gpt-4o-mini"
+ic_llm_default_model := "llama3.1:8b"
+ollama_host := "127.0.0.1"
+ollama_port := "11434"
+ollama_api_url := "http://" + ollama_host + ":" + ollama_port
 
 ic-start:
   icp network start --background || true
@@ -161,6 +166,94 @@ seed-bootstrap-payer:
 
   echo "Seeded payer $sender_address with {{bootstrap_usdc_amount}} mock USDC and approved inbox"
 
+configure-inference-openrouter model=openrouter_default_model:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  model="{{model}}"
+  escape_candid_text() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  }
+  model_escaped="$(escape_candid_text "$model")"
+
+  icp canister call backend set_inference_provider '(variant { OpenRouter })' -e local >/dev/null
+  icp canister call backend set_inference_model "(\"$model_escaped\")" -e local >/dev/null
+
+  if [ -n "${OPENROUTER_BASE_URL:-}" ]; then
+    base_url_escaped="$(escape_candid_text "$OPENROUTER_BASE_URL")"
+    icp canister call backend set_openrouter_base_url "(\"$base_url_escaped\")" -e local >/dev/null
+  fi
+
+  if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+    api_key_escaped="$(escape_candid_text "$OPENROUTER_API_KEY")"
+    icp canister call backend set_openrouter_api_key "(opt \"$api_key_escaped\")" -e local >/dev/null
+    echo "Configured OpenRouter provider with model=$model and OPENROUTER_API_KEY"
+  else
+    echo "Configured OpenRouter provider with model=$model"
+    echo "OPENROUTER_API_KEY is not set; inference will fail until you set it."
+  fi
+
+ollama-start model=ic_llm_default_model:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p .local
+
+  if curl -fsS "{{ollama_api_url}}/api/tags" >/dev/null 2>&1; then
+    echo "Ollama already reachable at {{ollama_api_url}}"
+  elif [ -f .local/ollama.pid ] && kill -0 "$(cat .local/ollama.pid)" 2>/dev/null; then
+    echo "Ollama already running with tracked PID $(cat .local/ollama.pid)"
+  else
+    rm -f .local/ollama.pid
+    nohup ollama serve >/tmp/ollama-ic-automaton.log 2>&1 &
+    echo $! > .local/ollama.pid
+    echo "Started Ollama with PID $(cat .local/ollama.pid)"
+  fi
+
+  ready=0
+  for _ in $(seq 1 50); do
+    if curl -fsS "{{ollama_api_url}}/api/tags" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.2
+  done
+
+  if [ "$ready" -ne 1 ]; then
+    echo "Ollama did not become ready at {{ollama_api_url}}" >&2
+    if [ -f /tmp/ollama-ic-automaton.log ]; then
+      tail -n 40 /tmp/ollama-ic-automaton.log >&2 || true
+    fi
+    exit 1
+  fi
+
+  ollama pull "{{model}}"
+
+ollama-stop:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -f .local/ollama.pid ] && kill -0 "$(cat .local/ollama.pid)" 2>/dev/null; then
+    kill "$(cat .local/ollama.pid)"
+    rm -f .local/ollama.pid
+    echo "Stopped Ollama"
+  else
+    echo "No tracked Ollama PID in .local/ollama.pid"
+  fi
+
+configure-inference-icllm model=ic_llm_default_model:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  escape_candid_text() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  }
+
+  model="{{model}}"
+  model_escaped="$(escape_candid_text "$model")"
+  icp canister call backend set_inference_provider '(variant { IcLlm })' -e local >/dev/null
+  icp canister call backend set_inference_model "(\"$model_escaped\")" -e local >/dev/null
+  echo "Configured IcLlm provider with model=$model"
+  echo "If local inference fails with 'No route to canister w36hm-eqaaa-aaaal-qr76a-cai', deploy the local llm canister per the ic_llm README."
+
 send-message-usdc message="hello automaton" usdc_amount="1000000" eth_wei=bootstrap_eth_wei:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -190,9 +283,10 @@ send-message-eth-only message="hello automaton (eth-only)" eth_wei=bootstrap_eth
     --rpc-url {{anvil_rpc_url}} \
     --private-key {{anvil_private_key}}
 
-bootstrap:
+bootstrap mode="openrouter" openrouter_model=openrouter_default_model ic_llm_model=ic_llm_default_model:
   #!/usr/bin/env bash
   set -euo pipefail
+  mode="{{mode}}"
   just ic-start
   just anvil-start
   just deploy-inbox
@@ -200,9 +294,31 @@ bootstrap:
   automaton_address="$(just --quiet automaton-evm-address)"
   echo "Automaton EVM address: $automaton_address"
   just seed-bootstrap-payer
+  case "$mode" in
+    openrouter)
+      just configure-inference-openrouter "{{openrouter_model}}"
+      ;;
+    icllm|ic-llm|ollama)
+      just ollama-start "{{ic_llm_model}}"
+      just configure-inference-icllm "{{ic_llm_model}}"
+      ;;
+    *)
+      echo "unsupported mode=$mode (supported: openrouter, icllm)" >&2
+      exit 1
+      ;;
+  esac
 
-down:
+down mode="all":
   #!/usr/bin/env bash
   set -euo pipefail
+  mode="{{mode}}"
+  case "$mode" in
+    all|icllm|ic-llm|ollama) just ollama-stop || true ;;
+    openrouter) ;;
+    *)
+      echo "unsupported mode=$mode (supported: all, openrouter, icllm)" >&2
+      exit 1
+      ;;
+  esac
   just anvil-stop || true
   just ic-stop || true
