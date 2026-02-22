@@ -11,6 +11,7 @@ use crate::domain::types::{
     WalletBalanceTelemetryView,
 };
 use crate::prompt;
+use candid::Principal;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
     memory_manager::{MemoryId, MemoryManager, VirtualMemory},
@@ -2064,6 +2065,27 @@ pub fn set_inference_model(model: String) -> Result<String, String> {
     let out = snapshot.inference_model.clone();
     save_runtime_snapshot(&snapshot);
     Ok(out)
+}
+
+pub fn set_llm_canister_id(canister_id: String) -> Result<String, String> {
+    let trimmed = canister_id.trim();
+    if trimmed.is_empty() {
+        return Err("llm canister id cannot be empty".to_string());
+    }
+    let normalized = Principal::from_text(trimmed)
+        .map_err(|error| format!("invalid llm canister id: {error}"))?
+        .to_text();
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.llm_canister_id = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
+}
+
+#[allow(dead_code)]
+pub fn get_llm_canister_id() -> String {
+    runtime_snapshot().llm_canister_id
 }
 
 pub fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
@@ -6283,6 +6305,17 @@ mod tests {
             .expect("valid key name should be stored");
         assert_eq!(stored, "dfx_test_key");
         assert_eq!(get_ecdsa_key_name(), "dfx_test_key");
+    }
+
+    #[test]
+    fn llm_canister_id_requires_valid_principal() {
+        init_storage();
+        assert!(set_llm_canister_id("".to_string()).is_err());
+        assert!(set_llm_canister_id("not-a-principal".to_string()).is_err());
+        let stored = set_llm_canister_id("w36hm-eqaaa-aaaal-qr76a-cai".to_string())
+            .expect("valid canister id should be stored");
+        assert_eq!(stored, "w36hm-eqaaa-aaaal-qr76a-cai");
+        assert_eq!(get_llm_canister_id(), "w36hm-eqaaa-aaaal-qr76a-cai");
     }
 
     #[test]

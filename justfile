@@ -16,6 +16,7 @@ ic_llm_default_model := "llama3.1:8b"
 ollama_host := "127.0.0.1"
 ollama_port := "11434"
 ollama_api_url := "http://" + ollama_host + ":" + ollama_port
+llm_default_canister_id := "w36hm-eqaaa-aaaal-qr76a-cai"
 
 ic-start:
   icp network start --background || true
@@ -91,10 +92,11 @@ deploy-inbox:
   echo "MockUSDC: $mock_usdc_address"
   echo "Inbox:    $inbox_address"
 
-deploy-canister inbox_address="":
+deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id:
   #!/usr/bin/env bash
   set -euo pipefail
   inbox_address="{{inbox_address}}"
+  llm_canister_id="{{llm_canister_id}}"
   if [ -z "$inbox_address" ]; then
     inbox_address="$(cat .local/inbox_contract_address)"
   fi
@@ -102,10 +104,23 @@ deploy-canister inbox_address="":
   if ! icp canister create backend -e local >/dev/null 2>&1; then
     echo "backend canister already exists on local"
   fi
-  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ({{anvil_chain_id}} : nat64); evm_rpc_url = opt \"{{anvil_rpc_url}}\"; evm_confirmation_depth = opt (0 : nat64) })"
+  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ({{anvil_chain_id}} : nat64); evm_rpc_url = opt \"{{anvil_rpc_url}}\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\" })"
   canister_id="$(icp canister status backend -e local | awk '/Canister Id:/ { print $3 }')"
   echo "Canister ID: $canister_id"
   echo "UI URL: http://$canister_id.localhost:8000/"
+
+deploy-llm:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  icp build llm
+  if ! icp canister create llm -e local >/dev/null 2>&1; then
+    echo "llm canister already exists on local"
+  fi
+  icp canister install llm -e local --mode reinstall
+  llm_canister_id="$(icp canister status llm -e local | awk '/Canister Id:/ { print $3 }')"
+  mkdir -p .local
+  printf '%s\n' "$llm_canister_id" > .local/llm_canister_id
+  echo "LLM canister ID: $llm_canister_id"
 
 automaton-evm-address timeout_secs=automaton_wait_timeout_secs poll_secs=automaton_wait_poll_secs:
   #!/usr/bin/env bash
@@ -252,7 +267,7 @@ configure-inference-icllm model=ic_llm_default_model:
   icp canister call backend set_inference_provider '(variant { IcLlm })' -e local >/dev/null
   icp canister call backend set_inference_model "(\"$model_escaped\")" -e local >/dev/null
   echo "Configured IcLlm provider with model=$model"
-  echo "If local inference fails with 'No route to canister w36hm-eqaaa-aaaal-qr76a-cai', deploy the local llm canister per the ic_llm README."
+  echo "Configured backend to use llm canister from init args."
 
 send-message-usdc message="hello automaton" usdc_amount="1000000" eth_wei=bootstrap_eth_wei:
   #!/usr/bin/env bash
@@ -287,10 +302,25 @@ bootstrap mode="openrouter" openrouter_model=openrouter_default_model ic_llm_mod
   #!/usr/bin/env bash
   set -euo pipefail
   mode="{{mode}}"
+  llm_canister_id="{{llm_default_canister_id}}"
   just ic-start
   just anvil-start
   just deploy-inbox
-  just deploy-canister
+  case "$mode" in
+    openrouter)
+      ;;
+    icllm|ic-llm|ollama)
+      just ollama-start "{{ic_llm_model}}"
+      just deploy-llm
+      llm_canister_id="$(cat .local/llm_canister_id)"
+      ;;
+    *)
+      echo "unsupported mode=$mode (supported: openrouter, icllm)" >&2
+      exit 1
+      ;;
+  esac
+
+  just deploy-canister "" "$llm_canister_id"
   automaton_address="$(just --quiet automaton-evm-address)"
   echo "Automaton EVM address: $automaton_address"
   just seed-bootstrap-payer
@@ -299,7 +329,6 @@ bootstrap mode="openrouter" openrouter_model=openrouter_default_model ic_llm_mod
       just configure-inference-openrouter "{{openrouter_model}}"
       ;;
     icllm|ic-llm|ollama)
-      just ollama-start "{{ic_llm_model}}"
       just configure-inference-icllm "{{ic_llm_model}}"
       ;;
     *)

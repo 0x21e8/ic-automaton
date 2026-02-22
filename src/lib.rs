@@ -18,7 +18,7 @@ use crate::domain::types::{
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
 use crate::tools::ToolManager;
-use candid::CandidType;
+use candid::{CandidType, Principal};
 use ic_cdk_timers::set_timer_interval_serial;
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use serde::Deserialize;
@@ -39,6 +39,8 @@ struct InitArgs {
     evm_confirmation_depth: Option<u64>,
     #[serde(default)]
     http_allowed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    llm_canister_id: Option<Principal>,
 }
 
 fn ensure_controller() -> Result<(), String> {
@@ -99,6 +101,10 @@ fn apply_init_args(args: InitArgs) {
     if let Some(domains) = args.http_allowed_domains {
         let _ =
             stable::set_http_allowed_domains(domains).unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
+    if let Some(llm_canister_id) = args.llm_canister_id {
+        let _ = stable::set_llm_canister_id(llm_canister_id.to_text())
+            .unwrap_or_else(|error| ic_cdk::trap(&error));
     }
 }
 
@@ -432,6 +438,7 @@ mod tests {
             evm_rpc_url: None,
             evm_confirmation_depth: None,
             http_allowed_domains: Some(vec!["api.coingecko.com".to_string()]),
+            llm_canister_id: None,
         });
 
         assert!(stable::is_http_allowlist_enforced());
@@ -439,6 +446,24 @@ mod tests {
             stable::list_allowed_http_domains(),
             vec!["api.coingecko.com".to_string()]
         );
+    }
+
+    #[test]
+    fn apply_init_args_can_set_llm_canister_id() {
+        apply_init_args(InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: None,
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            http_allowed_domains: None,
+            llm_canister_id: Some(
+                Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+                    .expect("test principal should parse"),
+            ),
+        });
+
+        assert_eq!(stable::get_llm_canister_id(), "w36hm-eqaaa-aaaal-qr76a-cai");
     }
 }
 

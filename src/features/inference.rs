@@ -17,7 +17,6 @@ use ic_cdk::management_canister::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-const IC_LLM_CANISTER_ID: &str = "w36hm-eqaaa-aaaal-qr76a-cai";
 const DETERMINISTIC_IC_LLM_MODEL: &str = "deterministic-local";
 const DETERMINISTIC_LAYER_6_MARKER: &str = "phase5-layer6-marker";
 const DETERMINISTIC_LAYER_6_UPDATE_CONTENT: &str =
@@ -208,6 +207,7 @@ impl InferenceAdapter for StubInferenceAdapter {
 
 pub struct IcLlmInferenceAdapter {
     model: String,
+    llm_canister_id: String,
     evm_tools_enabled: bool,
     allow_deterministic_model: bool,
 }
@@ -226,6 +226,7 @@ impl IcLlmInferenceAdapter {
         };
         Self {
             model: snapshot.inference_model.clone(),
+            llm_canister_id: snapshot.llm_canister_id.clone(),
             evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
             allow_deterministic_model,
         }
@@ -270,7 +271,7 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
             model
         );
 
-        let llm_canister = Principal::from_text(IC_LLM_CANISTER_ID)
+        let llm_canister = Principal::from_text(self.llm_canister_id.trim())
             .map_err(|error| format!("invalid ic_llm canister principal: {error}"))?;
         let call_result = ic_cdk::call::Call::unbounded_wait(llm_canister, "v1_chat")
             .with_arg(&request)
@@ -1992,6 +1993,7 @@ mod tests {
         stable::init_storage();
         let adapter = IcLlmInferenceAdapter {
             model: DETERMINISTIC_IC_LLM_MODEL.to_string(),
+            llm_canister_id: "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
             evm_tools_enabled: true,
             allow_deterministic_model: true,
         };
@@ -2022,5 +2024,24 @@ mod tests {
         let second = block_on_with_spin(adapter.infer(&with_marker))
             .expect("deterministic inference should succeed");
         assert_eq!(second.explanation, "layer6_probe:present");
+    }
+
+    #[test]
+    fn ic_llm_adapter_rejects_invalid_llm_canister_id() {
+        let adapter = IcLlmInferenceAdapter {
+            model: "llama3.1:8b".to_string(),
+            llm_canister_id: "not-a-principal".to_string(),
+            evm_tools_enabled: true,
+            allow_deterministic_model: false,
+        };
+        let input = InferenceInput {
+            input: "hello".to_string(),
+            context_snippet: "ctx".to_string(),
+            turn_id: "turn-invalid-llm-id".to_string(),
+        };
+
+        let error = block_on_with_spin(adapter.infer(&input))
+            .expect_err("invalid llm canister id should be rejected");
+        assert!(error.contains("invalid ic_llm canister principal"));
     }
 }

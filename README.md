@@ -194,7 +194,8 @@ The justfile provides a complete local development environment with a local Anvi
 # Start everything with OpenRouter inference (requires OPENROUTER_API_KEY)
 just bootstrap openrouter
 
-# Start everything with local ic_llm mode (starts Ollama, configures IcLlm)
+# Start everything with local ic_llm mode
+# (starts Ollama, deploys local llm canister, wires backend llm_canister_id, configures IcLlm)
 just bootstrap icllm
 
 # Tear down all local services (IC, Anvil, and tracked Ollama if started)
