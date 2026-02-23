@@ -3,14 +3,16 @@ use crate::domain::cycle_admission::{
     DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    EvmEvent, EvmPollCursor, OperationFailure, OperationFailureKind, OutcallFailure,
-    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
+    EvmEvent, EvmPollCursor, ExecutionPlan, OperationFailure, OperationFailureKind, OutcallFailure,
+    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot, StrategyExecutionCall,
+    StrategyOutcomeEvent, StrategyOutcomeKind,
 };
 use crate::storage::stable;
 use crate::tools::SignerPort;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
+use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,6 +37,20 @@ const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
 const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
+
+#[derive(Clone, Copy, Debug, LogPriorityLevels)]
+enum StrategyExecutionLogPriority {
+    #[log_level(capacity = 2_000, name = "STRATEGY_EXEC_INFO")]
+    Info,
+    #[log_level(capacity = 500, name = "STRATEGY_EXEC_ERROR")]
+    Error,
+}
+
+impl GetLogFilter for StrategyExecutionLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedMessageQueuedPayload {
@@ -1581,6 +1597,191 @@ pub async fn send_eth_tool(args_json: &str, signer: &dyn SignerPort) -> Result<S
     rpc.eth_send_raw_transaction(&signed).await
 }
 
+#[allow(dead_code)]
+pub fn strategy_call_to_send_eth_args_json(call: &StrategyExecutionCall) -> Result<String, String> {
+    let to = normalize_address(&call.to)?;
+    let value_wei = parse_decimal_u256(&call.value_wei, "value_wei")?.to_string();
+    let data = normalize_hex_blob(&call.data, "data")?;
+    Ok(format!(
+        "{{\"to\":\"{to}\",\"value_wei\":\"{value_wei}\",\"data\":\"{data}\"}}"
+    ))
+}
+
+#[allow(dead_code)]
+pub fn classify_strategy_failure_kind(error: &str) -> StrategyOutcomeKind {
+    let normalized = error.to_ascii_lowercase();
+    let nondeterministic_markers = [
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "network",
+        "dns",
+        "tls",
+        "503",
+        "502",
+        "429",
+        "gateway",
+        "rate limit",
+        "deadline exceeded",
+    ];
+    if nondeterministic_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return StrategyOutcomeKind::NondeterministicFailure;
+    }
+    StrategyOutcomeKind::DeterministicFailure
+}
+
+#[allow(dead_code)]
+pub async fn execute_strategy_plan(
+    plan: &ExecutionPlan,
+    signer: &dyn SignerPort,
+) -> Result<Vec<String>, String> {
+    log!(
+        StrategyExecutionLogPriority::Info,
+        "strategy_execute_plan_start protocol={} primitive={} template_id={} version={}.{}.{} action_id={} call_count={}",
+        plan.key.protocol,
+        plan.key.primitive,
+        plan.key.template_id,
+        plan.version.major,
+        plan.version.minor,
+        plan.version.patch,
+        plan.action_id,
+        plan.calls.len()
+    );
+    if plan.calls.is_empty() {
+        let error = "execution plan has no calls".to_string();
+        let outcome = classify_strategy_failure_kind(&error);
+        log!(
+            StrategyExecutionLogPriority::Error,
+            "strategy_execute_plan_rejected protocol={} template_id={} action_id={} error={}",
+            plan.key.protocol,
+            plan.key.template_id,
+            plan.action_id,
+            error
+        );
+        persist_strategy_outcome(plan, outcome, None, Some(error.clone()))?;
+        return Err(error);
+    }
+
+    let mut tx_hashes = Vec::with_capacity(plan.calls.len());
+    for (index, call) in plan.calls.iter().enumerate() {
+        log!(
+            StrategyExecutionLogPriority::Info,
+            "strategy_execute_call_start protocol={} template_id={} action_id={} call_index={} role={} to={} value_wei={}",
+            plan.key.protocol,
+            plan.key.template_id,
+            plan.action_id,
+            index,
+            call.role,
+            call.to,
+            call.value_wei
+        );
+        let args_json = match strategy_call_to_send_eth_args_json(call) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let outcome = classify_strategy_failure_kind(&error);
+                log!(
+                    StrategyExecutionLogPriority::Error,
+                    "strategy_execute_call_encode_failed protocol={} template_id={} action_id={} call_index={} error={}",
+                    plan.key.protocol,
+                    plan.key.template_id,
+                    plan.action_id,
+                    index,
+                    error
+                );
+                persist_strategy_outcome(
+                    plan,
+                    outcome,
+                    tx_hashes.last().cloned(),
+                    Some(error.clone()),
+                )?;
+                return Err(error);
+            }
+        };
+
+        match send_eth_tool(&args_json, signer).await {
+            Ok(tx_hash) => {
+                log!(
+                    StrategyExecutionLogPriority::Info,
+                    "strategy_execute_call_ok protocol={} template_id={} action_id={} call_index={} tx_hash={}",
+                    plan.key.protocol,
+                    plan.key.template_id,
+                    plan.action_id,
+                    index,
+                    tx_hash
+                );
+                tx_hashes.push(tx_hash);
+            }
+            Err(error) => {
+                let outcome = classify_strategy_failure_kind(&error);
+                log!(
+                    StrategyExecutionLogPriority::Error,
+                    "strategy_execute_call_failed protocol={} template_id={} action_id={} call_index={} error={}",
+                    plan.key.protocol,
+                    plan.key.template_id,
+                    plan.action_id,
+                    index,
+                    error
+                );
+                persist_strategy_outcome(
+                    plan,
+                    outcome,
+                    tx_hashes.last().cloned(),
+                    Some(error.clone()),
+                )?;
+                return Err(error);
+            }
+        }
+    }
+
+    persist_strategy_outcome(
+        plan,
+        StrategyOutcomeKind::Success,
+        tx_hashes.last().cloned(),
+        None,
+    )?;
+    log!(
+        StrategyExecutionLogPriority::Info,
+        "strategy_execute_plan_ok protocol={} template_id={} action_id={} tx_hash_count={}",
+        plan.key.protocol,
+        plan.key.template_id,
+        plan.action_id,
+        tx_hashes.len()
+    );
+    Ok(tx_hashes)
+}
+
+#[allow(dead_code)]
+fn persist_strategy_outcome(
+    plan: &ExecutionPlan,
+    outcome: StrategyOutcomeKind,
+    tx_hash: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    crate::strategy::learner::record_outcome(StrategyOutcomeEvent {
+        key: plan.key.clone(),
+        version: plan.version.clone(),
+        action_id: plan.action_id.clone(),
+        outcome,
+        tx_hash,
+        error,
+        observed_at_ns: current_time_ns(),
+    })
+    .map(|_stats| ())
+}
+
+#[allow(dead_code)]
+fn current_time_ns() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::time();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1999,6 +2200,75 @@ mod tests {
             tx_hash,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn strategy_call_to_send_eth_args_json_serializes_expected_payload() {
+        let call = crate::domain::types::StrategyExecutionCall {
+            role: "router".to_string(),
+            to: "0x2222222222222222222222222222222222222222".to_string(),
+            value_wei: "7".to_string(),
+            data: "0xabcdef00".to_string(),
+        };
+        let args_json =
+            strategy_call_to_send_eth_args_json(&call).expect("strategy call should serialize");
+        assert_eq!(
+            args_json,
+            r#"{"to":"0x2222222222222222222222222222222222222222","value_wei":"7","data":"0xabcdef00"}"#
+        );
+    }
+
+    #[test]
+    fn classify_strategy_failure_kind_distinguishes_error_classes() {
+        assert_eq!(
+            classify_strategy_failure_kind("execution reverted: slippage exceeded"),
+            crate::domain::types::StrategyOutcomeKind::DeterministicFailure
+        );
+        assert_eq!(
+            classify_strategy_failure_kind("rpc timeout while broadcasting tx"),
+            crate::domain::types::StrategyOutcomeKind::NondeterministicFailure
+        );
+    }
+
+    #[test]
+    fn execute_strategy_plan_records_deterministic_failure_evidence() {
+        stable::init_storage();
+        let plan = crate::domain::types::ExecutionPlan {
+            key: crate::domain::types::StrategyTemplateKey {
+                protocol: "erc20".to_string(),
+                primitive: "transfer".to_string(),
+                chain_id: 8453,
+                template_id: "execute-strategy-failure".to_string(),
+            },
+            version: crate::domain::types::TemplateVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            },
+            action_id: "transfer".to_string(),
+            calls: vec![crate::domain::types::StrategyExecutionCall {
+                role: "token".to_string(),
+                to: "not-an-address".to_string(),
+                value_wei: "0".to_string(),
+                data: "0x".to_string(),
+            }],
+            preconditions: vec!["ok".to_string()],
+            postconditions: vec!["delta".to_string()],
+        };
+
+        let signer = FixedSignatureSigner;
+        let err = block_on_with_spin(execute_strategy_plan(&plan, &signer))
+            .expect_err("invalid strategy call should fail");
+        assert!(
+            err.contains("address"),
+            "expected address validation error, got {err}"
+        );
+
+        let stats = crate::storage::stable::strategy_outcome_stats(&plan.key, &plan.version)
+            .expect("failure evidence should persist");
+        assert_eq!(stats.total_runs, 1);
+        assert_eq!(stats.deterministic_failures, 1);
+        assert_eq!(stats.nondeterministic_failures, 0);
     }
 
     #[cfg(all(not(feature = "anvil_e2e"), not(target_arch = "wasm32")))]

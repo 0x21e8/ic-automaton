@@ -542,6 +542,249 @@ pub struct MemoryRollup {
     pub generated_at_ns: u64,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StrategyTemplateKey {
+    pub protocol: String,
+    pub primitive: String,
+    pub chain_id: u64,
+    pub template_id: String,
+}
+
+#[derive(
+    CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+pub struct TemplateVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TemplateStatus {
+    #[default]
+    Draft,
+    Active,
+    Deprecated,
+    Revoked,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ContractRoleBinding {
+    pub role: String,
+    pub address: String,
+    pub source_ref: String,
+    #[serde(default)]
+    pub codehash: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiTypeSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub components: Vec<AbiTypeSpec>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiFunctionSpec {
+    pub role: String,
+    pub name: String,
+    pub selector_hex: String,
+    pub inputs: Vec<AbiTypeSpec>,
+    pub outputs: Vec<AbiTypeSpec>,
+    pub state_mutability: String,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActionSpec {
+    pub action_id: String,
+    pub call_sequence: Vec<AbiFunctionSpec>,
+    pub preconditions: Vec<String>,
+    pub postconditions: Vec<String>,
+    pub risk_checks: Vec<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyTemplate {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub status: TemplateStatus,
+    pub contract_roles: Vec<ContractRoleBinding>,
+    pub actions: Vec<ActionSpec>,
+    pub constraints_json: String,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbiArtifactKey {
+    pub protocol: String,
+    pub chain_id: u64,
+    pub role: String,
+    pub version: TemplateVersion,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiArtifact {
+    pub key: AbiArtifactKey,
+    pub source_ref: String,
+    #[serde(default)]
+    pub codehash: Option<String>,
+    pub abi_json: String,
+    pub functions: Vec<AbiFunctionSpec>,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiSelectorAssertion {
+    pub signature: String,
+    pub selector_hex: String,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StrategyExecutionIntent {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub action_id: String,
+    pub typed_params_json: String,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StrategyExecutionCall {
+    pub role: String,
+    pub to: String,
+    pub value_wei: String,
+    pub data: String,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ExecutionPlan {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub action_id: String,
+    pub calls: Vec<StrategyExecutionCall>,
+    pub preconditions: Vec<String>,
+    pub postconditions: Vec<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ValidationLayer {
+    Schema,
+    Address,
+    Policy,
+    Preflight,
+    Postcondition,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ValidationFinding {
+    pub layer: ValidationLayer,
+    pub code: String,
+    pub message: String,
+    pub deterministic: bool,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ValidationReport {
+    pub passed: bool,
+    pub findings: Vec<ValidationFinding>,
+    pub checked_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum StrategyOutcomeKind {
+    Success,
+    DeterministicFailure,
+    NondeterministicFailure,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyOutcomeEvent {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub action_id: String,
+    pub outcome: StrategyOutcomeKind,
+    pub tx_hash: Option<String>,
+    pub error: Option<String>,
+    pub observed_at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyOutcomeStats {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub total_runs: u64,
+    pub success_runs: u64,
+    pub deterministic_failures: u64,
+    pub nondeterministic_failures: u64,
+    #[serde(default)]
+    pub deterministic_failure_streak: u32,
+    #[serde(default)]
+    pub confidence_bps: u16,
+    #[serde(default)]
+    pub ranking_score_bps: u16,
+    #[serde(default)]
+    pub parameter_priors: StrategyParameterPriors,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_tx_hash: Option<String>,
+    #[serde(default)]
+    pub last_observed_at_ns: Option<u64>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyParameterPriors {
+    #[serde(default = "default_strategy_slippage_bps")]
+    pub slippage_bps: u16,
+    #[serde(default = "default_strategy_gas_buffer_bps")]
+    pub gas_buffer_bps: u16,
+}
+
+impl Default for StrategyParameterPriors {
+    fn default() -> Self {
+        Self {
+            slippage_bps: default_strategy_slippage_bps(),
+            gas_buffer_bps: default_strategy_gas_buffer_bps(),
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateActivationState {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub enabled: bool,
+    pub updated_at_ns: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateRevocationState {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub revoked: bool,
+    pub updated_at_ns: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyKillSwitchState {
+    pub key: StrategyTemplateKey,
+    pub enabled: bool,
+    pub updated_at_ns: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeView {
     pub state: AgentState,
@@ -1293,6 +1536,14 @@ fn default_wallet_balance_sync_low_cycles_interval_secs() -> u64 {
 
 fn default_wallet_balance_sync_freshness_window_secs() -> u64 {
     600
+}
+
+fn default_strategy_slippage_bps() -> u16 {
+    100
+}
+
+fn default_strategy_gas_buffer_bps() -> u16 {
+    120
 }
 
 fn default_wallet_balance_sync_max_response_bytes() -> u64 {

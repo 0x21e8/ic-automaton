@@ -5,15 +5,19 @@ mod http;
 pub mod prompt;
 mod scheduler;
 mod storage;
+#[allow(dead_code)]
+mod strategy;
 mod tools;
 
 use crate::domain::types::{
-    ConversationLog, ConversationSummary, EvmRouteStateView, InboxMessage, InboxStats,
-    InferenceConfigView, InferenceProvider, MemoryRollup, ObservabilitySnapshot, OutboxMessage,
-    OutboxStats, PromptLayer, PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime,
-    RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary, SkillRecord, TaskKind,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TurnWindowSummary,
-    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, ConversationLog, ConversationSummary,
+    EvmRouteStateView, InboxMessage, InboxStats, InferenceConfigView, InferenceProvider,
+    MemoryRollup, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
+    RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime,
+    SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate,
+    StrategyTemplateKey, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
+    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
@@ -24,7 +28,7 @@ use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUp
 use serde::Deserialize;
 use std::time::Duration;
 
-const SCHEDULER_TICK_INTERVAL_SECS: u64 = 60;
+const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 
 #[derive(CandidType, Deserialize)]
 struct InitArgs {
@@ -45,6 +49,31 @@ struct InitArgs {
     cycle_topup_enabled: Option<bool>,
     #[serde(default)]
     auto_topup_cycle_threshold: Option<u64>,
+}
+
+#[derive(CandidType, Deserialize)]
+struct StrategyAbiIngestArgs {
+    key: AbiArtifactKey,
+    abi_json: String,
+    source_ref: String,
+    #[serde(default)]
+    codehash: Option<String>,
+    #[serde(default)]
+    selector_assertions: Vec<AbiSelectorAssertion>,
+}
+
+fn current_time_ns() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::time();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
+            .unwrap_or_default()
+    }
 }
 
 fn ensure_controller() -> Result<(), String> {
@@ -75,6 +104,35 @@ fn caller_for_audit() -> String {
 
     #[cfg(not(target_arch = "wasm32"))]
     return "native".to_string();
+}
+
+fn require_strategy_template(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> Result<StrategyTemplate, String> {
+    crate::strategy::registry::get_template(key, version).ok_or_else(|| {
+        format!(
+            "strategy template not found for {}:{}:{}:{}@{}.{}.{}",
+            key.protocol,
+            key.primitive,
+            key.chain_id,
+            key.template_id,
+            version.major,
+            version.minor,
+            version.patch
+        )
+    })
+}
+
+fn upsert_template_status(
+    key: StrategyTemplateKey,
+    version: TemplateVersion,
+    status: TemplateStatus,
+) -> Result<StrategyTemplate, String> {
+    let mut template = require_strategy_template(&key, &version)?;
+    template.status = status;
+    template.updated_at_ns = current_time_ns();
+    crate::strategy::registry::upsert_template(template)
 }
 
 #[ic_cdk::init]
@@ -418,6 +476,134 @@ fn get_tool_calls_for_turn(turn_id: String) -> Vec<ToolCallRecord> {
 }
 
 #[ic_cdk::query]
+fn list_strategy_templates(key: Option<StrategyTemplateKey>, limit: u32) -> Vec<StrategyTemplate> {
+    let bounded_limit = limit.max(1) as usize;
+    match key {
+        Some(key) => crate::strategy::registry::list_templates(&key, bounded_limit),
+        None => crate::strategy::registry::list_all_templates(bounded_limit),
+    }
+}
+
+#[ic_cdk::query]
+fn get_strategy_template(
+    key: StrategyTemplateKey,
+    version: TemplateVersion,
+) -> Option<StrategyTemplate> {
+    crate::strategy::registry::get_template(&key, &version)
+}
+
+#[ic_cdk::query]
+fn get_strategy_outcome_stats(
+    key: StrategyTemplateKey,
+    version: TemplateVersion,
+) -> Option<StrategyOutcomeStats> {
+    crate::strategy::learner::outcome_stats(&key, &version)
+}
+
+#[ic_cdk::update]
+fn ingest_strategy_template_admin(template: StrategyTemplate) -> Result<StrategyTemplate, String> {
+    ensure_controller()?;
+    let mut template = template;
+    let now_ns = current_time_ns();
+    if template.created_at_ns == 0 {
+        template.created_at_ns = now_ns;
+    }
+    template.updated_at_ns = now_ns;
+    crate::strategy::registry::upsert_template(template)
+}
+
+#[ic_cdk::update]
+fn ingest_strategy_abi_artifact_admin(args: StrategyAbiIngestArgs) -> Result<AbiArtifact, String> {
+    ensure_controller()?;
+    crate::strategy::abi::normalize_and_store_abi_artifact(
+        args.key,
+        &args.abi_json,
+        &args.source_ref,
+        args.codehash,
+        &args.selector_assertions,
+        current_time_ns(),
+    )
+}
+
+#[ic_cdk::update]
+fn activate_strategy_template_admin(
+    key: StrategyTemplateKey,
+    version: TemplateVersion,
+    reason: Option<String>,
+) -> Result<TemplateActivationState, String> {
+    ensure_controller()?;
+    let _template = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Active)?;
+    crate::strategy::registry::canary_probe_template(&key, &version)?;
+    crate::strategy::registry::set_activation(TemplateActivationState {
+        key,
+        version,
+        enabled: true,
+        updated_at_ns: current_time_ns(),
+        reason: reason.or_else(|| Some("controller activation after canary probe".to_string())),
+    })
+}
+
+#[ic_cdk::update]
+fn deprecate_strategy_template_admin(
+    key: StrategyTemplateKey,
+    version: TemplateVersion,
+    reason: Option<String>,
+) -> Result<StrategyTemplate, String> {
+    ensure_controller()?;
+    let template =
+        upsert_template_status(key.clone(), version.clone(), TemplateStatus::Deprecated)?;
+    let _ = crate::strategy::registry::set_activation(TemplateActivationState {
+        key,
+        version,
+        enabled: false,
+        updated_at_ns: current_time_ns(),
+        reason,
+    });
+    Ok(template)
+}
+
+#[ic_cdk::update]
+fn revoke_strategy_template_admin(
+    key: StrategyTemplateKey,
+    version: TemplateVersion,
+    reason: Option<String>,
+) -> Result<TemplateRevocationState, String> {
+    ensure_controller()?;
+    let _ = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Revoked)?;
+    let now_ns = current_time_ns();
+    let revocation = crate::strategy::registry::set_revocation(TemplateRevocationState {
+        key: key.clone(),
+        version: version.clone(),
+        revoked: true,
+        updated_at_ns: now_ns,
+        reason: reason.clone(),
+    })?;
+    let _ = crate::strategy::registry::set_activation(TemplateActivationState {
+        key,
+        version,
+        enabled: false,
+        updated_at_ns: now_ns,
+        reason: reason.or_else(|| Some("revoked".to_string())),
+    });
+    Ok(revocation)
+}
+
+#[ic_cdk::update]
+fn set_strategy_kill_switch_admin(
+    key: StrategyTemplateKey,
+    enabled: bool,
+    reason: Option<String>,
+) -> Result<StrategyKillSwitchState, String> {
+    ensure_controller()?;
+    crate::strategy::registry::set_kill_switch(StrategyKillSwitchState {
+        key,
+        enabled,
+        updated_at_ns: current_time_ns(),
+        reason,
+    })
+}
+
+#[ic_cdk::query]
 fn http_request(request: HttpRequest) -> HttpResponse {
     crate::http::handle_http_request(request)
 }
@@ -437,6 +623,10 @@ fn arm_timer() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::types::{
+        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, StrategyTemplate,
+        StrategyTemplateKey, TemplateStatus, TemplateVersion,
+    };
 
     #[test]
     fn get_automaton_evm_address_query_returns_stored_value() {
@@ -508,6 +698,141 @@ mod tests {
             snapshot.cycle_topup.auto_topup_cycle_threshold,
             150_000_000_000
         );
+    }
+
+    fn sample_strategy_key() -> StrategyTemplateKey {
+        StrategyTemplateKey {
+            protocol: "erc20".to_string(),
+            primitive: "transfer".to_string(),
+            chain_id: 8453,
+            template_id: "lib-strategy".to_string(),
+        }
+    }
+
+    fn sample_version() -> TemplateVersion {
+        TemplateVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        }
+    }
+
+    fn sample_template(status: TemplateStatus) -> StrategyTemplate {
+        StrategyTemplate {
+            key: sample_strategy_key(),
+            version: sample_version(),
+            status,
+            contract_roles: vec![ContractRoleBinding {
+                role: "token".to_string(),
+                address: "0x2222222222222222222222222222222222222222".to_string(),
+                source_ref: "https://example.com/token-address".to_string(),
+                codehash: None,
+            }],
+            actions: vec![ActionSpec {
+                action_id: "transfer".to_string(),
+                call_sequence: vec![AbiFunctionSpec {
+                    role: "token".to_string(),
+                    name: "transfer".to_string(),
+                    selector_hex: "0xa9059cbb".to_string(),
+                    inputs: vec![
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            kind: "uint256".to_string(),
+                            components: Vec::new(),
+                        },
+                    ],
+                    outputs: vec![AbiTypeSpec {
+                        kind: "bool".to_string(),
+                        components: Vec::new(),
+                    }],
+                    state_mutability: "nonpayable".to_string(),
+                }],
+                preconditions: vec!["allowance_ok".to_string()],
+                postconditions: vec!["balance_delta_positive".to_string()],
+                risk_checks: vec!["max_notional".to_string()],
+            }],
+            constraints_json:
+                r#"{"max_calls":1,"max_total_value_wei":"0","required_postconditions":["balance_delta_positive"]}"#
+                    .to_string(),
+            created_at_ns: 0,
+            updated_at_ns: 0,
+        }
+    }
+
+    fn seed_template_and_artifact() {
+        ingest_strategy_template_admin(sample_template(TemplateStatus::Draft))
+            .expect("template should ingest");
+        ingest_strategy_abi_artifact_admin(StrategyAbiIngestArgs {
+            key: AbiArtifactKey {
+                protocol: "erc20".to_string(),
+                chain_id: 8453,
+                role: "token".to_string(),
+                version: sample_version(),
+            },
+            abi_json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]}]"#.to_string(),
+            source_ref: "https://example.com/token-abi".to_string(),
+            codehash: None,
+            selector_assertions: vec![AbiSelectorAssertion {
+                signature: "transfer(address,uint256)".to_string(),
+                selector_hex: "0xa9059cbb".to_string(),
+            }],
+        })
+        .expect("abi should ingest");
+    }
+
+    #[test]
+    fn strategy_lifecycle_admin_methods_manage_status_activation_and_kill_switch() {
+        stable::init_storage();
+        seed_template_and_artifact();
+
+        let activated = activate_strategy_template_admin(
+            sample_strategy_key(),
+            sample_version(),
+            Some("manual activation".to_string()),
+        )
+        .expect("activation should succeed");
+        assert!(activated.enabled);
+
+        let deprecated = deprecate_strategy_template_admin(
+            sample_strategy_key(),
+            sample_version(),
+            Some("rotating template".to_string()),
+        )
+        .expect("deprecation should succeed");
+        assert!(matches!(deprecated.status, TemplateStatus::Deprecated));
+
+        let revoked = revoke_strategy_template_admin(
+            sample_strategy_key(),
+            sample_version(),
+            Some("safety incident".to_string()),
+        )
+        .expect("revocation should succeed");
+        assert!(revoked.revoked);
+
+        let kill_switch = set_strategy_kill_switch_admin(
+            sample_strategy_key(),
+            true,
+            Some("protocol halt".to_string()),
+        )
+        .expect("kill switch should persist");
+        assert!(kill_switch.enabled);
+    }
+
+    #[test]
+    fn strategy_queries_return_ingested_templates() {
+        stable::init_storage();
+        seed_template_and_artifact();
+
+        let listed = list_strategy_templates(Some(sample_strategy_key()), 10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].version, sample_version());
+
+        let fetched = get_strategy_template(sample_strategy_key(), sample_version())
+            .expect("template exists");
+        assert_eq!(fetched.actions[0].action_id, "transfer");
     }
 }
 

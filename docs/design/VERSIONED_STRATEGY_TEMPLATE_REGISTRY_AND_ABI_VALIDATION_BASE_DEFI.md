@@ -439,3 +439,55 @@ Add/repurpose periodic jobs for:
   - `https://raw.githubusercontent.com/compound-finance/comet/main/deployments/base/usdc/roots.json`
 - Moonwell Base chain manifest: `https://raw.githubusercontent.com/moonwell-fi/moonwell-contracts-v2/main/chains/8453.json`
 - Pendle contracts docs index: `https://docs.pendle.finance/pendle-v2/Developers/Contracts/Overview`
+
+---
+
+## Implementation Checklist (Repo-Scoped)
+
+### Block 1) Registry and ABI Foundation
+
+- [x] Add strategy and ABI types in `src/domain/types.rs`:
+  `StrategyTemplateKey`, `TemplateVersion`, `TemplateStatus`, role/action specs, ABI artifacts, execution/validation/outcome structs.
+- [x] Implement stable persistence and indexes in `src/storage/stable.rs` for versioned templates, ABI artifacts, activation state, revocation/kill-switch, and outcome stats.
+- [x] Create strategy module tree:
+  `src/strategy/mod.rs`, `src/strategy/registry.rs`, `src/strategy/abi.rs`, `src/strategy/compiler.rs`, `src/strategy/validator.rs`, `src/strategy/learner.rs`.
+- [x] Implement ABI normalization and selector verification in `src/strategy/abi.rs` (canonical signatures + recomputed selectors), with mandatory `source_ref` provenance and optional `codehash`.
+
+### Block 2) Compile, Validate, Execute Path
+
+- [x] Implement intent compilation in `src/strategy/compiler.rs`:
+  `(template_version, action_id, typed params) -> ExecutionPlan` with deterministic calldata.
+- [x] Implement fail-closed validation in `src/strategy/validator.rs`:
+  schema/type/bounds, chain/address checks, policy/risk checks, preflight (`eth_call`, `eth_estimateGas`), and postconditions.
+- [x] Reuse existing EVM execution in `src/features/evm.rs` by compiling actions into `send_eth` payloads (`to`, `value_wei`, `data`), not a parallel execution stack.
+- [x] Classify deterministic vs non-deterministic failures and persist structured failure evidence.
+
+### Block 3) Tooling, API, Scheduler, and Learning
+
+- [x] Extend `src/tools.rs` with:
+  `list_strategy_templates`, `simulate_strategy_action`, `execute_strategy_action`, `get_strategy_outcomes`.
+- [x] Add/extend canister methods in `src/lib.rs` for strategy queries/updates and admin lifecycle controls (ingest, activate, deprecate, revoke, kill-switch), with controller gating.
+- [x] Add scheduler tasks in `src/scheduler.rs` for template freshness checks, ABI provenance re-verification, and canary probes before activation.
+- [x] Implement `src/strategy/learner.rs` updates for confidence/priors/ranking only; never auto-mutate ABI signatures, selector maps, addresses, or critical invariants.
+
+### Block 4) Security, Testing, and Delivery Workflow
+
+- [x] Enforce operational controls: per-template budgets, max notional caps, runtime kill-switch, and auto-deactivation after repeated deterministic failures; log compile/validate/execute trail with `canlog`.
+- [x] Follow TDD with unit tests (strategy modules), integration tests (`src/tools.rs`, `src/scheduler.rs`), and PocketIC end-to-end tests in `tests/`.
+- [x] Run `icp build` after code changes and before `cargo test --features pocketic_tests` to avoid stale wasm artifacts.
+- [x] Keep Candid generated from `ic_cdk::export_candid!()`; do not hand-edit `ic-automaton.did`.
+- [x] Run strict validation before commit:
+  `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and full test suites.
+- [x] If init args change, update defaults in `icp.yaml`; use explicit Candid numeric types (example: `opt (31337 : nat64)`).
+
+---
+
+## Implementation Notes / Keep in Mind
+
+- Execution must always pin an explicit template version; do not float to implicit latest.
+- Provenance is mandatory for role bindings; missing provenance is a hard block.
+- Validation is fail-closed; partial validation is equivalent to rejection.
+- Reuse existing EVM primitives in `src/features/evm.rs` (`eth_call`, `eth_estimateGas`, `send_eth`) instead of introducing parallel transaction stacks.
+- Respect scheduler survival tiers and cycle affordability gates before expensive outcalls/signing/broadcast.
+- Keep host-safe time behavior for native tests; avoid direct `ic_cdk::api::time()` in testable host paths.
+- Preserve immutable execution-critical artifacts (ABI/address/selector/safety invariants) across autonomous learning updates.

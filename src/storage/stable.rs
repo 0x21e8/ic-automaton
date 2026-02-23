@@ -1,14 +1,16 @@
 use crate::domain::types::{
-    AgentEvent, AgentState, ConversationEntry, ConversationLog, ConversationSummary,
-    CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, JobStatus, MemoryFact, MemoryRollup,
-    ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
+    AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, ConversationEntry, ConversationLog,
+    ConversationSummary, CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage,
+    InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider, JobStatus, MemoryFact,
+    MemoryRollup, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
     RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob,
     SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StorageGrowthMetrics,
-    StoragePressureLevel, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
-    TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind,
+    StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
+    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, TemplateVersion, ToolCallRecord,
+    TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
+    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 use crate::features::cycle_topup::TopUpStage;
 use crate::prompt;
@@ -366,6 +368,51 @@ thread_local! {
         StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(24)))
+    ));
+    static STRATEGY_TEMPLATE_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(25)))
+    ));
+    static STRATEGY_TEMPLATE_INDEX_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(26)))
+    ));
+    static ABI_ARTIFACT_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(27)))
+    ));
+    static ABI_ARTIFACT_INDEX_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(28)))
+    ));
+    static STRATEGY_ACTIVATION_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(29)))
+    ));
+    static STRATEGY_REVOCATION_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(30)))
+    ));
+    static STRATEGY_KILL_SWITCH_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(31)))
+    ));
+    static STRATEGY_OUTCOME_STATS_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(32)))
+    ));
+    static STRATEGY_BUDGET_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(33)))
     ));
 }
 
@@ -1699,6 +1746,307 @@ pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact
             .collect::<Vec<_>>()
     });
     sort_memory_facts_desc_by_updated(facts, limit)
+}
+
+pub fn upsert_strategy_template(template: StrategyTemplate) -> Result<StrategyTemplate, String> {
+    validate_strategy_template(&template)?;
+    let lookup_key = strategy_template_lookup_key(&template.key);
+    let record_key = strategy_template_record_key(&lookup_key, &template.version);
+    let index_key = strategy_template_index_key(&lookup_key, &template.version);
+
+    STRATEGY_TEMPLATE_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(record_key.clone(), encode_json(&template));
+    });
+    STRATEGY_TEMPLATE_INDEX_MAP.with(|map| {
+        map.borrow_mut().insert(index_key, record_key.into_bytes());
+    });
+    Ok(template)
+}
+
+pub fn strategy_template(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> Option<StrategyTemplate> {
+    let record_key = strategy_template_record_key(&strategy_template_lookup_key(key), version);
+    STRATEGY_TEMPLATE_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn list_strategy_template_versions(key: &StrategyTemplateKey) -> Vec<TemplateVersion> {
+    let prefix = strategy_template_index_prefix(&strategy_template_lookup_key(key));
+    let mut versions = STRATEGY_TEMPLATE_INDEX_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| {
+                let raw_key = entry.key();
+                if !raw_key.starts_with(&prefix) {
+                    return None;
+                }
+                parse_version_sort_key(raw_key.rsplit(':').next().unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+    });
+    versions.sort();
+    versions.reverse();
+    versions
+}
+
+pub fn list_strategy_templates(key: &StrategyTemplateKey, limit: usize) -> Vec<StrategyTemplate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    list_strategy_template_versions(key)
+        .into_iter()
+        .take(limit)
+        .filter_map(|version| strategy_template(key, &version))
+        .collect()
+}
+
+pub fn list_all_strategy_templates(limit: usize) -> Vec<StrategyTemplate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut templates = STRATEGY_TEMPLATE_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<StrategyTemplate>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+
+    templates.sort_by(|left, right| {
+        right
+            .updated_at_ns
+            .cmp(&left.updated_at_ns)
+            .then_with(|| left.key.protocol.cmp(&right.key.protocol))
+            .then_with(|| left.key.primitive.cmp(&right.key.primitive))
+            .then_with(|| left.key.template_id.cmp(&right.key.template_id))
+            .then_with(|| right.version.cmp(&left.version))
+    });
+    if templates.len() > limit {
+        templates.truncate(limit);
+    }
+    templates
+}
+
+pub fn upsert_abi_artifact(artifact: AbiArtifact) -> Result<AbiArtifact, String> {
+    validate_abi_artifact(&artifact)?;
+    let lookup_key = abi_artifact_lookup_key(&artifact.key);
+    let record_key = abi_artifact_record_key(&lookup_key, &artifact.key.version);
+    let index_key = abi_artifact_index_key(&lookup_key, &artifact.key.version);
+
+    ABI_ARTIFACT_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(record_key.clone(), encode_json(&artifact));
+    });
+    ABI_ARTIFACT_INDEX_MAP.with(|map| {
+        map.borrow_mut().insert(index_key, record_key.into_bytes());
+    });
+    Ok(artifact)
+}
+
+pub fn abi_artifact(key: &AbiArtifactKey) -> Option<AbiArtifact> {
+    let record_key = abi_artifact_record_key(&abi_artifact_lookup_key(key), &key.version);
+    ABI_ARTIFACT_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn list_abi_artifact_versions(
+    protocol: &str,
+    chain_id: u64,
+    role: &str,
+) -> Vec<TemplateVersion> {
+    let lookup_key = abi_artifact_lookup_key(&AbiArtifactKey {
+        protocol: protocol.to_string(),
+        chain_id,
+        role: role.to_string(),
+        version: TemplateVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        },
+    });
+    let prefix = abi_artifact_index_prefix(&lookup_key);
+    let mut versions = ABI_ARTIFACT_INDEX_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| {
+                let raw_key = entry.key();
+                if !raw_key.starts_with(&prefix) {
+                    return None;
+                }
+                parse_version_sort_key(raw_key.rsplit(':').next().unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+    });
+    versions.sort();
+    versions.reverse();
+    versions
+}
+
+pub fn set_strategy_template_activation(
+    state: TemplateActivationState,
+) -> Result<TemplateActivationState, String> {
+    validate_strategy_template_key(&state.key)?;
+    validate_template_version(&state.version)?;
+    let record_key = template_state_record_key("activation", &state.key, &state.version);
+    STRATEGY_ACTIVATION_MAP.with(|map| {
+        map.borrow_mut().insert(record_key, encode_json(&state));
+    });
+    Ok(state)
+}
+
+pub fn strategy_template_activation(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> Option<TemplateActivationState> {
+    let record_key = template_state_record_key("activation", key, version);
+    STRATEGY_ACTIVATION_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn set_strategy_template_revocation(
+    state: TemplateRevocationState,
+) -> Result<TemplateRevocationState, String> {
+    validate_strategy_template_key(&state.key)?;
+    validate_template_version(&state.version)?;
+    let record_key = template_state_record_key("revocation", &state.key, &state.version);
+    STRATEGY_REVOCATION_MAP.with(|map| {
+        map.borrow_mut().insert(record_key, encode_json(&state));
+    });
+    Ok(state)
+}
+
+#[allow(dead_code)]
+pub fn strategy_template_revocation(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> Option<TemplateRevocationState> {
+    let record_key = template_state_record_key("revocation", key, version);
+    STRATEGY_REVOCATION_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn set_strategy_kill_switch(
+    state: StrategyKillSwitchState,
+) -> Result<StrategyKillSwitchState, String> {
+    validate_strategy_template_key(&state.key)?;
+    let record_key = strategy_kill_switch_record_key(&state.key);
+    STRATEGY_KILL_SWITCH_MAP.with(|map| {
+        map.borrow_mut().insert(record_key, encode_json(&state));
+    });
+    Ok(state)
+}
+
+pub fn strategy_kill_switch(key: &StrategyTemplateKey) -> Option<StrategyKillSwitchState> {
+    let record_key = strategy_kill_switch_record_key(key);
+    STRATEGY_KILL_SWITCH_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn strategy_outcome_stats(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> Option<StrategyOutcomeStats> {
+    let record_key = strategy_outcome_stats_record_key(key, version);
+    STRATEGY_OUTCOME_STATS_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn upsert_strategy_outcome_stats(
+    stats: StrategyOutcomeStats,
+) -> Result<StrategyOutcomeStats, String> {
+    validate_strategy_template_key(&stats.key)?;
+    validate_template_version(&stats.version)?;
+    let record_key = strategy_outcome_stats_record_key(&stats.key, &stats.version);
+    STRATEGY_OUTCOME_STATS_MAP.with(|map| {
+        map.borrow_mut().insert(record_key, encode_json(&stats));
+    });
+    Ok(stats)
+}
+
+pub fn strategy_template_budget_spent_wei(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> Option<String> {
+    let record_key = strategy_budget_record_key(key, version);
+    STRATEGY_BUDGET_MAP
+        .with(|map| map.borrow().get(&record_key))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+pub fn set_strategy_template_budget_spent_wei(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+    spent_wei: String,
+) -> Result<String, String> {
+    validate_strategy_template_key(key)?;
+    validate_template_version(version)?;
+    let normalized = normalize_decimal_string(&spent_wei, "strategy budget spent_wei")?;
+    let record_key = strategy_budget_record_key(key, version);
+    STRATEGY_BUDGET_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(record_key, encode_json(&normalized));
+    });
+    Ok(normalized)
+}
+
+pub fn record_strategy_outcome(
+    outcome: StrategyOutcomeEvent,
+) -> Result<StrategyOutcomeStats, String> {
+    validate_strategy_template_key(&outcome.key)?;
+    validate_template_version(&outcome.version)?;
+    if outcome.action_id.trim().is_empty() {
+        return Err("outcome action_id must be non-empty".to_string());
+    }
+
+    let mut stats = strategy_outcome_stats(&outcome.key, &outcome.version).unwrap_or_else(|| {
+        StrategyOutcomeStats {
+            key: outcome.key.clone(),
+            version: outcome.version.clone(),
+            total_runs: 0,
+            success_runs: 0,
+            deterministic_failures: 0,
+            nondeterministic_failures: 0,
+            deterministic_failure_streak: 0,
+            confidence_bps: 0,
+            ranking_score_bps: 0,
+            parameter_priors: crate::domain::types::StrategyParameterPriors::default(),
+            last_error: None,
+            last_tx_hash: None,
+            last_observed_at_ns: None,
+        }
+    });
+
+    stats.total_runs = stats.total_runs.saturating_add(1);
+    match outcome.outcome {
+        StrategyOutcomeKind::Success => {
+            stats.success_runs = stats.success_runs.saturating_add(1);
+            stats.deterministic_failure_streak = 0;
+            stats.last_error = None;
+        }
+        StrategyOutcomeKind::DeterministicFailure => {
+            stats.deterministic_failures = stats.deterministic_failures.saturating_add(1);
+            stats.deterministic_failure_streak =
+                stats.deterministic_failure_streak.saturating_add(1);
+            stats.last_error = outcome.error.clone();
+        }
+        StrategyOutcomeKind::NondeterministicFailure => {
+            stats.nondeterministic_failures = stats.nondeterministic_failures.saturating_add(1);
+            stats.deterministic_failure_streak = 0;
+            stats.last_error = outcome.error.clone();
+        }
+    }
+    stats.last_tx_hash = outcome.tx_hash.clone();
+    stats.last_observed_at_ns = Some(outcome.observed_at_ns);
+    upsert_strategy_outcome_stats(stats)
 }
 
 pub fn autonomy_tool_last_success_ns(fingerprint: &str) -> Option<u64> {
@@ -3312,6 +3660,209 @@ fn task_kind_key(kind: &TaskKind) -> String {
     format!("task:{kind:?}")
 }
 
+fn validate_strategy_template(template: &StrategyTemplate) -> Result<(), String> {
+    validate_strategy_template_key(&template.key)?;
+    validate_template_version(&template.version)?;
+    for role in &template.contract_roles {
+        if role.role.trim().is_empty() {
+            return Err("contract role binding role must be non-empty".to_string());
+        }
+        if role.address.trim().is_empty() {
+            return Err("contract role binding address must be non-empty".to_string());
+        }
+        if role.source_ref.trim().is_empty() {
+            return Err("contract role binding source_ref must be non-empty".to_string());
+        }
+    }
+    for action in &template.actions {
+        if action.action_id.trim().is_empty() {
+            return Err("strategy action_id must be non-empty".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_abi_artifact(artifact: &AbiArtifact) -> Result<(), String> {
+    validate_abi_artifact_key(&artifact.key)?;
+    if artifact.source_ref.trim().is_empty() {
+        return Err("abi artifact source_ref must be non-empty".to_string());
+    }
+    if artifact.functions.is_empty() {
+        return Err("abi artifact must include at least one function".to_string());
+    }
+    Ok(())
+}
+
+fn validate_abi_artifact_key(key: &AbiArtifactKey) -> Result<(), String> {
+    if key.protocol.trim().is_empty() {
+        return Err("abi artifact protocol must be non-empty".to_string());
+    }
+    if key.chain_id == 0 {
+        return Err("abi artifact chain_id must be greater than zero".to_string());
+    }
+    if key.role.trim().is_empty() {
+        return Err("abi artifact role must be non-empty".to_string());
+    }
+    validate_template_version(&key.version)
+}
+
+fn validate_strategy_template_key(key: &StrategyTemplateKey) -> Result<(), String> {
+    if key.protocol.trim().is_empty() {
+        return Err("strategy protocol must be non-empty".to_string());
+    }
+    if key.primitive.trim().is_empty() {
+        return Err("strategy primitive must be non-empty".to_string());
+    }
+    if key.chain_id == 0 {
+        return Err("strategy chain_id must be greater than zero".to_string());
+    }
+    if key.template_id.trim().is_empty() {
+        return Err("strategy template_id must be non-empty".to_string());
+    }
+    Ok(())
+}
+
+fn validate_template_version(version: &TemplateVersion) -> Result<(), String> {
+    if version.major == 0 && version.minor == 0 && version.patch == 0 {
+        return Err("template version must not be 0.0.0".to_string());
+    }
+    Ok(())
+}
+
+fn strategy_template_lookup_key(key: &StrategyTemplateKey) -> String {
+    let normalized = format!(
+        "{}|{}|{}|{}",
+        key.protocol.trim().to_ascii_lowercase(),
+        key.primitive.trim().to_ascii_lowercase(),
+        key.chain_id,
+        key.template_id.trim().to_ascii_lowercase()
+    );
+    lookup_digest("strategy:template", &normalized)
+}
+
+fn abi_artifact_lookup_key(key: &AbiArtifactKey) -> String {
+    let normalized = format!(
+        "{}|{}|{}",
+        key.protocol.trim().to_ascii_lowercase(),
+        key.chain_id,
+        key.role.trim().to_ascii_lowercase()
+    );
+    lookup_digest("strategy:abi", &normalized)
+}
+
+fn lookup_digest(prefix: &str, payload: &str) -> String {
+    let mut hasher = Keccak256::new();
+    hasher.update(payload.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{prefix}:{digest}")
+}
+
+fn template_version_sort_key(version: &TemplateVersion) -> String {
+    format!(
+        "{:05}.{:05}.{:05}",
+        version.major, version.minor, version.patch
+    )
+}
+
+fn parse_version_sort_key(raw: &str) -> Option<TemplateVersion> {
+    let mut parts = raw.split('.');
+    let major = parts.next()?.parse::<u16>().ok()?;
+    let minor = parts.next()?.parse::<u16>().ok()?;
+    let patch = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(TemplateVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+fn strategy_template_record_key(lookup_key: &str, version: &TemplateVersion) -> String {
+    format!(
+        "strategy:template:record:{lookup_key}:{}",
+        template_version_sort_key(version)
+    )
+}
+
+fn strategy_template_index_prefix(lookup_key: &str) -> String {
+    format!("strategy:template:index:{lookup_key}:")
+}
+
+fn strategy_template_index_key(lookup_key: &str, version: &TemplateVersion) -> String {
+    format!(
+        "{}{}",
+        strategy_template_index_prefix(lookup_key),
+        template_version_sort_key(version)
+    )
+}
+
+fn abi_artifact_record_key(lookup_key: &str, version: &TemplateVersion) -> String {
+    format!(
+        "strategy:abi:record:{lookup_key}:{}",
+        template_version_sort_key(version)
+    )
+}
+
+fn abi_artifact_index_prefix(lookup_key: &str) -> String {
+    format!("strategy:abi:index:{lookup_key}:")
+}
+
+fn abi_artifact_index_key(lookup_key: &str, version: &TemplateVersion) -> String {
+    format!(
+        "{}{}",
+        abi_artifact_index_prefix(lookup_key),
+        template_version_sort_key(version)
+    )
+}
+
+fn template_state_record_key(
+    kind: &str,
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> String {
+    format!(
+        "strategy:{kind}:{}:{}",
+        strategy_template_lookup_key(key),
+        template_version_sort_key(version)
+    )
+}
+
+fn strategy_kill_switch_record_key(key: &StrategyTemplateKey) -> String {
+    format!("strategy:kill_switch:{}", strategy_template_lookup_key(key))
+}
+
+fn strategy_outcome_stats_record_key(
+    key: &StrategyTemplateKey,
+    version: &TemplateVersion,
+) -> String {
+    format!(
+        "strategy:outcome:{}:{}",
+        strategy_template_lookup_key(key),
+        template_version_sort_key(version)
+    )
+}
+
+fn strategy_budget_record_key(key: &StrategyTemplateKey, version: &TemplateVersion) -> String {
+    format!(
+        "strategy:budget:{}:{}",
+        strategy_template_lookup_key(key),
+        template_version_sort_key(version)
+    )
+}
+
+fn normalize_decimal_string(raw: &str, field: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} must be non-empty"));
+    }
+    if !trimmed.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{field} must be a decimal string"));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn parse_task_kind(raw_key: &str) -> Option<TaskKind> {
     if !raw_key.starts_with("task:") {
         return None;
@@ -4820,8 +5371,11 @@ mod canbench_pilots {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer, RetentionConfig,
-        RuntimeSnapshot, StoragePressureLevel, TaskKind, TaskLane, WalletBalanceSnapshot,
+        AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ConversationEntry,
+        InboxMessageStatus, MemoryFact, PromptLayer, RetentionConfig, RuntimeSnapshot,
+        StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind,
+        StrategyTemplate, StrategyTemplateKey, TaskKind, TaskLane, TemplateActivationState,
+        TemplateRevocationState, TemplateStatus, TemplateVersion, WalletBalanceSnapshot,
         WalletBalanceSyncConfig,
     };
 
@@ -4880,6 +5434,125 @@ mod tests {
         MEMORY_ROLLUP_MAP.with(|map| {
             let mut map_ref = map.borrow_mut();
             for key in keys {
+                map_ref.remove(&key);
+            }
+        });
+    }
+
+    fn clear_strategy_maps_for_tests() {
+        let template_keys = STRATEGY_TEMPLATE_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_TEMPLATE_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in template_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let template_index_keys = STRATEGY_TEMPLATE_INDEX_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_TEMPLATE_INDEX_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in template_index_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let abi_keys = ABI_ARTIFACT_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        ABI_ARTIFACT_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in abi_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let abi_index_keys = ABI_ARTIFACT_INDEX_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        ABI_ARTIFACT_INDEX_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in abi_index_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let activation_keys = STRATEGY_ACTIVATION_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_ACTIVATION_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in activation_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let revocation_keys = STRATEGY_REVOCATION_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_REVOCATION_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in revocation_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let kill_switch_keys = STRATEGY_KILL_SWITCH_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_KILL_SWITCH_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in kill_switch_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let outcome_keys = STRATEGY_OUTCOME_STATS_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_OUTCOME_STATS_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in outcome_keys {
+                map_ref.remove(&key);
+            }
+        });
+
+        let budget_keys = STRATEGY_BUDGET_MAP.with(|map| {
+            map.borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>()
+        });
+        STRATEGY_BUDGET_MAP.with(|map| {
+            let mut map_ref = map.borrow_mut();
+            for key in budget_keys {
                 map_ref.remove(&key);
             }
         });
@@ -6322,6 +6995,282 @@ mod tests {
         assert_eq!(summaries[0].last_activity_ns, 20);
         assert_eq!(summaries[0].entry_count, 1);
         assert_eq!(summaries[1].sender, sender_a);
+    }
+
+    fn sample_strategy_key() -> StrategyTemplateKey {
+        StrategyTemplateKey {
+            protocol: "aave-v3".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: "supply-usdc".to_string(),
+        }
+    }
+
+    fn sample_strategy_template(
+        version: TemplateVersion,
+        status: TemplateStatus,
+    ) -> StrategyTemplate {
+        StrategyTemplate {
+            key: sample_strategy_key(),
+            version,
+            status,
+            contract_roles: vec![crate::domain::types::ContractRoleBinding {
+                role: "pool".to_string(),
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                source_ref: "https://example.com/aave/base".to_string(),
+                codehash: None,
+            }],
+            actions: vec![crate::domain::types::ActionSpec {
+                action_id: "supply".to_string(),
+                call_sequence: vec![AbiFunctionSpec {
+                    role: "pool".to_string(),
+                    name: "supply".to_string(),
+                    selector_hex: "0x617ba037".to_string(),
+                    inputs: vec![
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            kind: "uint256".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            kind: "uint16".to_string(),
+                            components: Vec::new(),
+                        },
+                    ],
+                    outputs: Vec::new(),
+                    state_mutability: "nonpayable".to_string(),
+                }],
+                preconditions: vec!["balance_usdc_gte_amount".to_string()],
+                postconditions: vec!["a_token_balance_delta_positive".to_string()],
+                risk_checks: vec!["max_notional_cap".to_string()],
+            }],
+            constraints_json: "{\"max_notional\":\"100000000\"}".to_string(),
+            created_at_ns: 10,
+            updated_at_ns: 10,
+        }
+    }
+
+    #[test]
+    fn strategy_template_storage_persists_versioned_records_and_index() {
+        init_storage();
+        clear_strategy_maps_for_tests();
+
+        let v1 = TemplateVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+        let v2 = TemplateVersion {
+            major: 1,
+            minor: 1,
+            patch: 0,
+        };
+
+        upsert_strategy_template(sample_strategy_template(v1.clone(), TemplateStatus::Draft))
+            .expect("template v1 should persist");
+        upsert_strategy_template(sample_strategy_template(v2.clone(), TemplateStatus::Active))
+            .expect("template v2 should persist");
+
+        let key = sample_strategy_key();
+        let versions = list_strategy_template_versions(&key);
+        assert_eq!(versions, vec![v2.clone(), v1.clone()]);
+
+        let listed = list_strategy_templates(&key, 10);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].version, v2);
+        assert_eq!(listed[1].version, v1);
+
+        let listed_all = list_all_strategy_templates(10);
+        assert!(
+            listed_all
+                .iter()
+                .any(|template| template.key.template_id == key.template_id),
+            "global list should include seeded key"
+        );
+
+        let fetched = strategy_template(
+            &key,
+            &TemplateVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            },
+        )
+        .expect("template v1 should be retrievable");
+        assert_eq!(fetched.actions[0].action_id, "supply");
+    }
+
+    #[test]
+    fn abi_artifact_storage_persists_versioned_records_and_index() {
+        init_storage();
+        clear_strategy_maps_for_tests();
+
+        let base_key = AbiArtifactKey {
+            protocol: "uniswap-v3".to_string(),
+            chain_id: 8453,
+            role: "router".to_string(),
+            version: TemplateVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            },
+        };
+        let v2_key = AbiArtifactKey {
+            version: TemplateVersion {
+                major: 1,
+                minor: 2,
+                patch: 0,
+            },
+            ..base_key.clone()
+        };
+
+        let artifact_v1 = AbiArtifact {
+            key: base_key.clone(),
+            source_ref: "https://example.com/uniswap/deployments".to_string(),
+            codehash: None,
+            abi_json: "[]".to_string(),
+            functions: vec![AbiFunctionSpec {
+                role: "router".to_string(),
+                name: "exactInputSingle".to_string(),
+                selector_hex: "0x414bf389".to_string(),
+                inputs: vec![AbiTypeSpec {
+                    kind: "bytes".to_string(),
+                    components: Vec::new(),
+                }],
+                outputs: vec![AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: Vec::new(),
+                }],
+                state_mutability: "payable".to_string(),
+            }],
+            created_at_ns: 100,
+            updated_at_ns: 100,
+        };
+        let mut artifact_v2 = artifact_v1.clone();
+        artifact_v2.key = v2_key.clone();
+        artifact_v2.updated_at_ns = 200;
+
+        upsert_abi_artifact(artifact_v1).expect("abi artifact v1 should persist");
+        upsert_abi_artifact(artifact_v2).expect("abi artifact v2 should persist");
+
+        let versions = list_abi_artifact_versions("uniswap-v3", 8453, "router");
+        assert_eq!(
+            versions,
+            vec![
+                TemplateVersion {
+                    major: 1,
+                    minor: 2,
+                    patch: 0
+                },
+                TemplateVersion {
+                    major: 1,
+                    minor: 0,
+                    patch: 0
+                }
+            ]
+        );
+
+        let loaded = abi_artifact(&v2_key).expect("abi artifact v2 should be retrievable");
+        assert_eq!(loaded.key.version.minor, 2);
+        assert_eq!(loaded.functions[0].name, "exactInputSingle");
+    }
+
+    #[test]
+    fn strategy_runtime_control_and_outcome_stats_persist() {
+        init_storage();
+        clear_strategy_maps_for_tests();
+
+        let key = sample_strategy_key();
+        let version = TemplateVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        };
+
+        let activation = set_strategy_template_activation(TemplateActivationState {
+            key: key.clone(),
+            version: version.clone(),
+            enabled: true,
+            updated_at_ns: 10,
+            reason: Some("canary passed".to_string()),
+        })
+        .expect("activation should persist");
+        assert!(activation.enabled);
+        assert_eq!(
+            strategy_template_activation(&key, &version)
+                .as_ref()
+                .and_then(|value| value.reason.as_deref()),
+            Some("canary passed")
+        );
+
+        let revocation = set_strategy_template_revocation(TemplateRevocationState {
+            key: key.clone(),
+            version: version.clone(),
+            revoked: true,
+            updated_at_ns: 20,
+            reason: Some("deterministic failure threshold".to_string()),
+        })
+        .expect("revocation should persist");
+        assert!(revocation.revoked);
+
+        let kill_switch = set_strategy_kill_switch(StrategyKillSwitchState {
+            key: key.clone(),
+            enabled: true,
+            updated_at_ns: 30,
+            reason: Some("global protocol halt".to_string()),
+        })
+        .expect("kill switch should persist");
+        assert!(kill_switch.enabled);
+        assert!(strategy_kill_switch(&key)
+            .as_ref()
+            .map(|state| state.enabled)
+            .unwrap_or(false));
+
+        record_strategy_outcome(StrategyOutcomeEvent {
+            key: key.clone(),
+            version: version.clone(),
+            action_id: "supply".to_string(),
+            outcome: StrategyOutcomeKind::Success,
+            tx_hash: Some("0xaaa".to_string()),
+            error: None,
+            observed_at_ns: 40,
+        })
+        .expect("successful outcome should record");
+        record_strategy_outcome(StrategyOutcomeEvent {
+            key: key.clone(),
+            version: version.clone(),
+            action_id: "supply".to_string(),
+            outcome: StrategyOutcomeKind::DeterministicFailure,
+            tx_hash: Some("0xbbb".to_string()),
+            error: Some("slippage breach".to_string()),
+            observed_at_ns: 50,
+        })
+        .expect("failure outcome should record");
+
+        let stats = strategy_outcome_stats(&key, &version).expect("stats should exist");
+        assert_eq!(stats.total_runs, 2);
+        assert_eq!(stats.success_runs, 1);
+        assert_eq!(stats.deterministic_failures, 1);
+        assert_eq!(stats.nondeterministic_failures, 0);
+        assert_eq!(stats.deterministic_failure_streak, 1);
+        assert_eq!(stats.last_error.as_deref(), Some("slippage breach"));
+        assert_eq!(stats.last_tx_hash.as_deref(), Some("0xbbb"));
+        assert_eq!(stats.last_observed_at_ns, Some(50));
+
+        let spent = set_strategy_template_budget_spent_wei(&key, &version, "42".to_string())
+            .expect("budget spent should persist");
+        assert_eq!(spent, "42");
+        assert_eq!(
+            strategy_template_budget_spent_wei(&key, &version).as_deref(),
+            Some("42")
+        );
     }
 
     #[test]

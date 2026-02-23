@@ -9,6 +9,7 @@ use crate::domain::types::{
     EvmEvent, JobStatus, OperationFailure, OperationFailureKind, RecoveryContext, RecoveryFailure,
     RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy,
     RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TemplateActivationState, TemplateStatus,
 };
 use crate::features::cycle_topup::{
     TopUpStage, TOPUP_MIN_OPERATIONAL_CYCLES, TOPUP_MIN_USDC_AVAILABLE_RAW,
@@ -35,6 +36,8 @@ const RESPONSE_BYTES_POLICY_MIN: u64 = 256;
 const RECOVERY_BACKOFF_BASE_SECS: u64 = 1;
 const WALLET_SYNC_MAX_RESPONSE_BYTES_RECOVERY_MAX: u64 = 4 * 1024;
 const TOPUP_FAILED_RECOVERY_BACKOFF_SECS: u64 = 120;
+const STRATEGY_RECONCILE_MAX_TEMPLATES: usize = 200;
+const STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JobDispatchOutcome {
@@ -228,8 +231,94 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> 
                 Ok(JobDispatchOutcome::TopUpWaiting)
             }
         }
-        TaskKind::Reconcile => Ok(JobDispatchOutcome::Completed),
+        TaskKind::Reconcile => {
+            run_reconcile_job(current_time_ns())?;
+            Ok(JobDispatchOutcome::Completed)
+        }
     }
+}
+
+fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
+    let templates = crate::strategy::registry::list_all_templates(STRATEGY_RECONCILE_MAX_TEMPLATES);
+    if templates.is_empty() {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_reconcile_strategy empty=true"
+        );
+        return Ok(());
+    }
+
+    let mut stale_disabled = 0u32;
+    let mut provenance_disabled = 0u32;
+    let mut canary_activated = 0u32;
+
+    for template in templates {
+        let key = template.key.clone();
+        let version = template.version.clone();
+
+        let age_secs = if now_ns >= template.updated_at_ns {
+            now_ns
+                .saturating_sub(template.updated_at_ns)
+                .checked_div(1_000_000_000)
+                .unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        if age_secs > STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS {
+            let _ = stable::set_strategy_template_activation(TemplateActivationState {
+                key: key.clone(),
+                version: version.clone(),
+                enabled: false,
+                updated_at_ns: now_ns,
+                reason: Some(format!(
+                    "stale_template age_secs={age_secs} freshness_window_secs={STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS}"
+                )),
+            });
+            stale_disabled = stale_disabled.saturating_add(1);
+            continue;
+        }
+
+        if let Err(error) = crate::strategy::registry::canary_probe_template(&key, &version) {
+            let _ = stable::set_strategy_template_activation(TemplateActivationState {
+                key: key.clone(),
+                version: version.clone(),
+                enabled: false,
+                updated_at_ns: now_ns,
+                reason: Some(format!("provenance_or_canary_failed: {error}")),
+            });
+            provenance_disabled = provenance_disabled.saturating_add(1);
+            continue;
+        }
+
+        if !matches!(template.status, TemplateStatus::Active) {
+            continue;
+        }
+        let currently_enabled = stable::strategy_template_activation(&key, &version)
+            .map(|state| state.enabled)
+            .unwrap_or(false);
+        if currently_enabled {
+            continue;
+        }
+
+        stable::set_strategy_template_activation(TemplateActivationState {
+            key,
+            version,
+            enabled: true,
+            updated_at_ns: now_ns,
+            reason: Some("scheduler canary probe passed".to_string()),
+        })?;
+        canary_activated = canary_activated.saturating_add(1);
+    }
+
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_reconcile_strategy stale_disabled={} provenance_disabled={} canary_activated={}",
+        stale_disabled,
+        provenance_disabled,
+        canary_activated
+    );
+
+    Ok(())
 }
 
 fn maybe_enqueue_topup_waiting_continuation(outcome: JobDispatchOutcome, now_ns: u64) {
@@ -402,7 +491,10 @@ fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
 }
 
 fn empty_poll_backoff_delay_ns(consecutive_empty_polls: u32) -> u64 {
-    let idx = usize::try_from(consecutive_empty_polls).unwrap_or(usize::MAX);
+    // Use the first backoff slot for both "no empties yet" and "first empty poll observed".
+    // This keeps the first empty-poll retry window at 60s instead of jumping to 120s.
+    let schedule_idx = consecutive_empty_polls.saturating_sub(1);
+    let idx = usize::try_from(schedule_idx).unwrap_or(usize::MAX);
     let secs = EMPTY_POLL_BACKOFF_SCHEDULE_SECS
         .get(idx)
         .copied()
@@ -1020,9 +1112,11 @@ fn lease_ttl_ns(kind: &TaskKind) -> u64 {
 mod tests {
     use super::*;
     use crate::domain::types::{
+        AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding,
         EvmEvent, RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment,
-        RetentionConfig, SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime,
-        WalletBalanceSnapshot, WalletBalanceSyncConfig,
+        RetentionConfig, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
+        TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateStatus,
+        TemplateVersion, WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
     use crate::storage::stable;
     use std::future::Future;
@@ -1092,6 +1186,99 @@ mod tests {
         config.essential = true;
         config.priority = 0;
         stable::upsert_task_config(config);
+    }
+
+    fn strategy_key(template_id: &str) -> StrategyTemplateKey {
+        StrategyTemplateKey {
+            protocol: "erc20".to_string(),
+            primitive: "transfer".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        }
+    }
+
+    fn strategy_version() -> TemplateVersion {
+        TemplateVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        }
+    }
+
+    fn seed_strategy_for_reconcile(
+        template_id: &str,
+        updated_at_ns: u64,
+        call_selector_hex: &str,
+        status: TemplateStatus,
+        activation_enabled: bool,
+    ) {
+        let key = strategy_key(template_id);
+        let version = strategy_version();
+        let function = AbiFunctionSpec {
+            role: "token".to_string(),
+            name: "transfer".to_string(),
+            selector_hex: call_selector_hex.to_string(),
+            inputs: vec![
+                AbiTypeSpec {
+                    kind: "address".to_string(),
+                    components: Vec::new(),
+                },
+                AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: Vec::new(),
+                },
+            ],
+            outputs: vec![AbiTypeSpec {
+                kind: "bool".to_string(),
+                components: Vec::new(),
+            }],
+            state_mutability: "nonpayable".to_string(),
+        };
+        crate::strategy::registry::upsert_template(StrategyTemplate {
+            key: key.clone(),
+            version: version.clone(),
+            status,
+            contract_roles: vec![ContractRoleBinding {
+                role: "token".to_string(),
+                address: "0x2222222222222222222222222222222222222222".to_string(),
+                source_ref: "https://example.com/token-address".to_string(),
+                codehash: None,
+            }],
+            actions: vec![ActionSpec {
+                action_id: "transfer".to_string(),
+                call_sequence: vec![function.clone()],
+                preconditions: vec!["allowance_ok".to_string()],
+                postconditions: vec!["balance_delta_positive".to_string()],
+                risk_checks: vec!["max_notional".to_string()],
+            }],
+            constraints_json: "{}".to_string(),
+            created_at_ns: updated_at_ns,
+            updated_at_ns,
+        })
+        .expect("template should persist");
+        crate::strategy::registry::upsert_abi_artifact(AbiArtifact {
+            key: AbiArtifactKey {
+                protocol: key.protocol.clone(),
+                chain_id: key.chain_id,
+                role: "token".to_string(),
+                version: version.clone(),
+            },
+            source_ref: "https://example.com/token-abi".to_string(),
+            codehash: None,
+            abi_json: "[]".to_string(),
+            functions: vec![function],
+            created_at_ns: updated_at_ns,
+            updated_at_ns,
+        })
+        .expect("abi should persist");
+        crate::strategy::registry::set_activation(TemplateActivationState {
+            key,
+            version,
+            enabled: activation_enabled,
+            updated_at_ns,
+            reason: Some("seed".to_string()),
+        })
+        .expect("activation should persist");
     }
 
     fn encode_message_queued_payload_for_test(
@@ -1735,6 +1922,128 @@ mod tests {
             .expect("reconcile job should be present");
         assert_eq!(poll.status, JobStatus::Succeeded);
         assert_eq!(reconcile.status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn reconcile_job_activates_template_when_canary_passes() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        seed_strategy_for_reconcile(
+            "reconcile-activate",
+            current_time_ns(),
+            "0xa9059cbb",
+            TemplateStatus::Active,
+            false,
+        );
+
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:strategy-activate".to_string(),
+            0,
+            0,
+        );
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+        block_on_with_spin(scheduler_tick());
+
+        let activation = crate::strategy::registry::activation(
+            &strategy_key("reconcile-activate"),
+            &strategy_version(),
+        )
+        .expect("activation should exist");
+        assert!(activation.enabled);
+        assert!(activation
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("canary"));
+    }
+
+    #[test]
+    fn reconcile_job_disables_stale_template_activation() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        let stale_updated_at_ns = current_time_ns().saturating_sub(
+            STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS
+                .saturating_add(1)
+                .saturating_mul(1_000_000_000),
+        );
+        seed_strategy_for_reconcile(
+            "reconcile-stale",
+            stale_updated_at_ns,
+            "0xa9059cbb",
+            TemplateStatus::Active,
+            true,
+        );
+
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:strategy-stale".to_string(),
+            0,
+            0,
+        );
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+        block_on_with_spin(scheduler_tick());
+
+        let activation = crate::strategy::registry::activation(
+            &strategy_key("reconcile-stale"),
+            &strategy_version(),
+        )
+        .expect("activation should exist");
+        assert!(!activation.enabled);
+        assert!(activation
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stale_template"));
+    }
+
+    #[test]
+    fn reconcile_job_disables_activation_when_provenance_fails() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        seed_strategy_for_reconcile(
+            "reconcile-provenance",
+            current_time_ns(),
+            "0xdeadbeef",
+            TemplateStatus::Active,
+            true,
+        );
+
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:strategy-provenance".to_string(),
+            0,
+            0,
+        );
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+        block_on_with_spin(scheduler_tick());
+
+        let activation = crate::strategy::registry::activation(
+            &strategy_key("reconcile-provenance"),
+            &strategy_version(),
+        )
+        .expect("activation should exist");
+        assert!(!activation.enabled);
+        assert!(activation
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provenance_or_canary_failed"));
     }
 
     #[test]
