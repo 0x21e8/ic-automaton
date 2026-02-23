@@ -67,12 +67,14 @@ This is an experiment in **machine autonomy** -- not artificial general intellig
 │              │ remember/recall │──── Persistent Memory      │
 │              │ http_fetch      │──── HTTPS Outcalls         │
 │              │ record_signal   │──── Internal Monologue     │
+│              │ execute_strategy│──── Strategy Engine        │
 │              └─────────────────┘                            │
 │                        │                                    │
 │  ┌─────────────────────┼─────────────────────────────┐     │
 │  │           Stable Memory (Durable State)            │     │
 │  │  Runtime · Turns · Inbox · Outbox · Memory Facts   │     │
 │  │  Conversations · Jobs · EVM Cursors · Config       │     │
+│  │  Strategy Templates · ABI Artifacts · Outcomes     │     │
 │  └────────────────────────────────────────────────────┘     │
 │                                                             │
 │  ┌────────────────┐    ┌──────────────────────────────┐    │
@@ -96,29 +98,31 @@ The agent runtime is modeled as an explicit finite state machine. Every transiti
 ```mermaid
 stateDiagram-v2
     [*] --> Bootstrapping
-    Bootstrapping --> Idle : EVM address derived
+    Bootstrapping --> LoadingContext : TimerTick
     Idle --> LoadingContext : TimerTick
-    LoadingContext --> Inferring : ContextLoaded
+    Sleeping --> LoadingContext : TimerTick
+    Faulted --> LoadingContext : TimerTick
+    LoadingContext --> Inferring : ContextLoaded / has_input
+    LoadingContext --> Sleeping : no_input
     Inferring --> ExecutingActions : InferenceCompleted
-    ExecutingActions --> Inferring : Continuation (up to 3 rounds)
+    ExecutingActions --> Inferring : Continuation (up to 5 rounds)
     ExecutingActions --> Persisting : ActionsCompleted
     Persisting --> Sleeping : PersistCompleted
-    Sleeping --> Idle : SleepFinished
     Inferring --> Faulted : TurnFailed
     ExecutingActions --> Faulted : TurnFailed
-    Faulted --> Idle : ResetFault
+    Faulted --> Bootstrapping : ResetFault
 ```
 
 ### Agent Turn Lifecycle
 
 Each "turn" follows a structured pipeline:
 
-1. **Wake** -- Scheduler fires a 30-second tick and claims a mutating lease
-2. **Load Context** -- Fetch pending inbox messages + poll EVM logs from Base
-3. **Infer** -- Send conversation context + constitution to LLM, receive tool calls
+1. **Wake** -- Scheduler fires a 30-second tick; agent turns are dispatched every 5 minutes
+2. **Load Context** -- Fetch staged inbox messages + check for pending EVM events
+3. **Infer** -- Send layered constitution + dynamic context to LLM, receive tool calls
 4. **Execute** -- Run requested tools (sign transactions, read chain state, store memories)
-5. **Continue** -- Feed tool results back to LLM for further reasoning (up to 3 rounds)
-6. **Persist** -- Write turn record, update state, release lease
+5. **Continue** -- Feed tool results back to LLM for further reasoning (up to 5 rounds)
+6. **Persist** -- Write turn record, update conversation log, post outbox reply
 7. **Sleep** -- Yield until next tick
 
 ## Features
@@ -140,26 +144,71 @@ An [Inbox.sol](contracts/) contract on Base allows anyone to send messages to th
 ### Survival Tiers
 The agent monitors its own cycle balance and adapts behavior under resource pressure:
 
-| Tier | Cycles | Behavior |
-|------|--------|----------|
-| **Normal** | > 200B | All capabilities enabled |
-| **LowCycles** | 50-200B | Reduced poll frequency, cost-optimized operations |
-| **Critical** | 10-50B | High-cost operations disabled (signing, inference) |
-| **OutOfCycles** | < 10B | Agent frozen, awaiting top-up |
+| Tier | Condition | Behavior |
+|------|-----------|----------|
+| **Normal** | Liquid cycles ≥ 15× critical threshold | All capabilities enabled |
+| **LowCycles** | Liquid cycles < 15× critical threshold | Reduced poll frequency, cost-optimized operations |
+| **Critical** | Can't afford reference operation + 200B reserve | High-cost operations gated; non-essential jobs skipped |
+| **OutOfCycles** | (reserved) | Agent frozen |
 
-Pre-flight affordability checks ensure the agent never attempts an operation it can't pay for.
+Tier classification is formula-based using pre-flight cycle affordability checks with a 25% safety margin and a 200B-cycle reserve floor. Tier recovery requires 3 consecutive healthy checks before upgrading to avoid flapping.
+
+Pre-flight affordability checks ensure the agent never attempts an operation it cannot pay for.
 
 ### Persistent Memory
 The agent stores and retrieves facts across turns using a durable key-value memory backed by stable structures.
 
 ### Multi-Layer Constitution
-A layered prompt system (10 layers) defines the agent's identity and behavioral constraints. Core layers are immutable; higher layers can be updated by the controller or by the agent itself during turns. Forbidden-phrase detection prevents prompt injection attacks.
+A layered prompt system defines the agent's identity and behavioral constraints across 11 layers (0–10):
+
+- **Layers 0–5** (immutable): Interpretation rules, safety/non-harm, survival economics, identity, ethics, and tool policies
+- **Layers 6–9** (mutable): Updateable by the controller or the agent itself at runtime
+- **Layer 10** (dynamic): Runtime context injected each turn -- cycle balance, wallet state, memory facts, pending inbox messages, and available tools
+
+Lower-numbered layers take precedence in all conflicts. Forbidden-phrase detection blocks prompt injection attempts that try to override core policy layers.
+
+### Strategy Engine
+A structured DeFi strategy execution framework (in `src/strategy/`) enables the agent to execute template-based on-chain actions safely:
+
+- **Registry** -- Stores `StrategyTemplate` records keyed by `(protocol, primitive, chain_id, template_id)`, with versioned ABI artifact binding and lifecycle states (Draft → Active → Deprecated → Revoked)
+- **Compiler** -- Resolves a `StrategyExecutionIntent` against a registered template and ABI artifacts into a concrete `ExecutionPlan` of typed EVM calls
+- **Validator** -- Multi-layer validation pipeline (Schema → Address → Policy → Preflight → Postcondition) with deterministic/non-deterministic failure classification
+- **Learner** -- Tracks `StrategyOutcomeStats` per template/version, computing confidence scores, ranking scores, and adaptive parameter priors (slippage bps, gas buffer) based on historical success/failure
+- **ABI** -- Stores raw ABI JSON artifacts with function selector assertions for on-chain binding verification
+
+A kill-switch mechanism allows per-strategy emergency disablement independent of template lifecycle state.
+
+### Autonomous Cycle Top-Up
+The agent can replenish its own ICP cycles from its USDC balance without operator intervention:
+
+1. Locks USDC via the [1sec](https://1sec.app) locker contract on Base
+2. Bridges locked USDC to ICP (polls for bridge confirmation)
+3. Swaps bridged USDC for ICP via [KongSwap](https://kongswap.io) (with configurable max slippage)
+4. Converts ICP to cycles via the Cycles Minting Canister
+
+Top-up triggers when liquid cycles fall below a configurable threshold (default: 2T cycles). Configurable limits: minimum USDC reserve, maximum USDC per top-up, max swap slippage.
+
+### Wallet Balance Sync
+The agent maintains a fresh snapshot of its ETH and USDC balances via periodic background sync:
+
+- Normal interval: 5 minutes; low-cycles interval: 15 minutes
+- Freshness window: 10 minutes (stale if older)
+- USDC contract address is auto-discovered from the Inbox contract if not explicitly configured
+- Balance data is injected into each turn's dynamic context (Layer 10)
+
+### Storage Retention & Summarization
+To prevent unbounded stable memory growth, a periodic maintenance job:
+
+- Prunes expired turns, transitions, tool records, inbox/outbox messages, and deduplication entries based on configurable max-age and max-record limits
+- Generates **session summaries** (per-sender conversation windows) to compress old conversation history
+- Generates **turn window summaries** (aggregate turn/tool stats) for observability without raw record retention
+- Generates **memory rollups** (per-namespace canonical value synthesis) to consolidate redundant memory facts
 
 ### Embedded Terminal UI
 A retro phosphor-green terminal UI is served directly from the canister via certified HTTP responses. Users can connect EVM wallets (MetaMask, Coinbase), send messages with payments, and observe the agent's status, logs, and internal monologue.
 
 ### Scheduler & Job Queue
-A serial timer-driven scheduler coordinates all background work -- agent turns, inbox polling, cycle checks, and reconciliation tasks. Lease-based concurrency control ensures only one mutating operation runs at a time, with automatic stale-lease recovery.
+A timer-driven scheduler fires every 30 seconds and dispatches up to 4 mutating jobs per tick. Each task type (AgentTurn, PollInbox, CheckCycles, TopUpCycles, Reconcile) runs on its own 5-minute interval with independent backoff and retry logic. Lease-based concurrency control ensures only one mutating operation runs at a time, with automatic stale-lease recovery. Non-essential jobs are skipped in low-cycles mode.
 
 ## Quick Start
 
@@ -176,11 +225,12 @@ A serial timer-driven scheduler coordinates all background work -- agent turns, 
 git clone https://github.com/domwoe/ic-automaton.git
 cd ic-automaton
 
-# Start local IC network
-icp network start --background
+# Start everything with OpenRouter inference (requires OPENROUTER_API_KEY)
+just bootstrap openrouter
 
-# Build and deploy the canister
-icp deploy
+# Start everything with local IcLlm mode
+# (starts Ollama, deploys local llm canister, wires backend llm_canister_id, configures IcLlm)
+just bootstrap icllm
 
 # Check the agent's status
 icp canister call backend get_runtime_view '()'
@@ -198,11 +248,21 @@ just bootstrap openrouter
 # (starts Ollama, deploys local llm canister, wires backend llm_canister_id, configures IcLlm)
 just bootstrap icllm
 
+# Optional: fork Base mainnet instead of using a blank local chain
+just bootstrap openrouter base-fork "" "$BASE_MAINNET_RPC_URL"
+
+# Optional model defaults can be configured in .env:
+# OPENROUTER_MODEL (default: openai/gpt-4o-mini)
+# IC_LLM_MODEL (default: llama3.1:8b)
+
 # Tear down all local services (IC, Anvil, and tracked Ollama if started)
 just down all
 
-# Send a message to the agent via the Inbox contract
+# Send a message to the agent via the Inbox contract (with USDC + ETH)
 just send-message-usdc "hello automaton"
+
+# Send a message with ETH only
+just send-message-eth-only "hello automaton"
 
 # Enable the agent loop
 icp canister call backend set_loop_enabled '(true)'
@@ -210,35 +270,62 @@ icp canister call backend set_loop_enabled '(true)'
 
 ### Configuration
 
-Key init arguments (configured in `icp.yaml`):
+Key init arguments (set at deploy time via `icp canister install`):
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `ecdsa_key_name` | Threshold ECDSA key identifier | `"dfx_test_key"` (local) |
-| `evm_chain_id` | Target EVM chain | `31337` (local Anvil) |
-| `evm_rpc_url` | JSON-RPC endpoint | `"http://127.0.0.1:18545"` |
-| `evm_confirmation_depth` | Block confirmations before processing | `0` (local) |
+| `evm_chain_id` | Target EVM chain ID | `31337` (local Anvil) / `8453` (Base) |
+| `evm_rpc_url` | JSON-RPC endpoint | `"https://mainnet.base.org"` |
+| `evm_confirmation_depth` | Block confirmations before event processing | `6` (mainnet default) |
 | `inbox_contract_address` | Deployed Inbox.sol address | -- |
+| `llm_canister_id` | IcLlm canister for local inference | `w36hm-eqaaa-aaaal-qr76a-cai` |
+
+Runtime configuration (updatable via canister calls):
+
+| Setting | Description |
+|---------|-------------|
+| `set_inference_provider` | Switch between `OpenRouter` and `IcLlm` |
+| `set_inference_model` | Set model name (e.g. `openai/gpt-4o-mini`, `llama3.1:8b`) |
+| `set_openrouter_api_key` | Configure OpenRouter API key |
+| `set_task_interval_secs` | Adjust per-task scheduling frequency |
+| `set_loop_enabled` | Enable/disable the agent turn loop |
 
 ## Project Structure
 
 ```
 ic-automaton/
 ├── src/
-│   ├── lib.rs              # Canister entrypoint, query/update methods
-│   ├── agent.rs            # Agent loop, turn execution, tool dispatch
-│   ├── tools.rs            # Tool implementations (sign, send, read, remember)
-│   ├── http.rs             # HTTP request handling, API endpoints
+│   ├── lib.rs              # Canister entrypoint, query/update methods, timer setup
+│   ├── agent.rs            # Agent loop, turn execution, continuation logic
+│   ├── tools.rs            # Tool registry, dispatch, prompt injection guards
+│   ├── scheduler.rs        # Job scheduler, survival tier classification, task dispatch
+│   ├── prompt.rs           # Layered constitution (layers 0-9), forbidden phrase detection
+│   ├── http.rs             # HTTP request handling, certified API endpoints
 │   ├── domain/
-│   │   └── types.rs        # All domain types, FSM states, events, transitions
+│   │   ├── types.rs        # All domain types, FSM states, events, config structs
+│   │   ├── state_machine.rs# FSM transition function
+│   │   ├── cycle_admission.rs # Cycle affordability estimation and checks
+│   │   └── recovery_policy.rs # Structured error recovery decisions
 │   ├── features/
-│   │   └── evm.rs          # EVM polling, transaction construction, ECDSA signing
+│   │   ├── evm.rs          # EVM polling, transaction construction, wallet sync
+│   │   ├── inference.rs    # LLM inference dispatch (OpenRouter + IcLlm)
+│   │   ├── http_fetch.rs   # HTTPS outcall tool
+│   │   ├── threshold_signer.rs # Threshold ECDSA signing adapter
+│   │   ├── skills.rs       # Skill/capability definitions
+│   │   └── cycle_topup/    # Autonomous USDC→ICP→cycles top-up pipeline
+│   ├── strategy/
+│   │   ├── registry.rs     # Strategy template and ABI artifact storage
+│   │   ├── compiler.rs     # Intent → ExecutionPlan compiler
+│   │   ├── validator.rs    # Multi-layer validation pipeline
+│   │   ├── learner.rs      # Outcome tracking, confidence scoring, parameter priors
+│   │   └── abi.rs          # ABI parsing and selector verification
 │   ├── storage/
-│   │   └── stable.rs       # Stable memory maps, persistence, observability
+│   │   └── stable.rs       # Stable memory maps, retention, summarization
 │   ├── ui_app.js           # Terminal UI (vanilla JS + viem)
 │   ├── ui_index.html       # UI shell
 │   └── ui_styles.css       # Phosphor-green terminal styling
-├── contracts/              # Solidity contracts (Inbox.sol, MockUSDC)
+├── evm/                    # Solidity contracts (Inbox.sol, MockUSDC)
 ├── tests/                  # PocketIC integration tests
 ├── specs/                  # Locked architectural specifications
 ├── docs/design/            # Design documents and analysis
@@ -251,7 +338,7 @@ ic-automaton/
 ## Testing
 
 ```bash
-# Unit tests (native)
+# Unit tests (native, no WASM required)
 cargo test
 
 # Integration tests with PocketIC
@@ -261,6 +348,9 @@ cargo test --features pocketic_tests
 just anvil-start
 just deploy-inbox
 cargo test --features anvil_e2e
+
+# Benchmark cycle consumption
+cargo bench --features canbench
 ```
 
 ## How It Differs from Off-Chain Agents
@@ -277,9 +367,10 @@ cargo test --features anvil_e2e
 ## Roadmap
 
 - [ ] v0 - Production deployment on Base mainnet
-- [ ] v1 - More tools: Inter-canister calls, replication and improved memory system
-- [ ] v2 - More autonomy: Inference without API key
-- [ ] v3 - More chains: Bitcoin and Solana support
+- [ ] v1 - Strategy execution in production; expanded DeFi protocol coverage
+- [ ] v2 - Inter-canister calls; improved memory and summarization system
+- [ ] v3 - Inference without external API key (fully sovereign)
+- [ ] v4 - Bitcoin and Solana support
 
 (Subject to change)
 
