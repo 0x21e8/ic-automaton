@@ -95,6 +95,9 @@ deploy-inbox:
 deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id:
   #!/usr/bin/env bash
   set -euo pipefail
+  escape_candid_text() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  }
   inbox_address="{{inbox_address}}"
   llm_canister_id="{{llm_canister_id}}"
   if [ -z "$inbox_address" ]; then
@@ -105,6 +108,10 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id:
     echo "backend canister already exists on local"
   fi
   icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ({{anvil_chain_id}} : nat64); evm_rpc_url = opt \"{{anvil_rpc_url}}\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\" })"
+  if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+    api_key_escaped="$(escape_candid_text "$OPENROUTER_API_KEY")"
+    icp canister call backend set_openrouter_api_key "(opt \"$api_key_escaped\")" -e local >/dev/null
+  fi
   canister_id="$(icp canister status backend -e local | awk '/Canister Id:/ { print $3 }')"
   echo "Canister ID: $canister_id"
   echo "UI URL: http://$canister_id.localhost:8000/"

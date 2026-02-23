@@ -931,10 +931,10 @@ impl TaskKind {
 
     pub const fn default_interval_secs(&self) -> u64 {
         match self {
-            Self::AgentTurn => 30,
-            Self::PollInbox => 30,
-            Self::CheckCycles => 60,
-            Self::TopUpCycles => 30,
+            Self::AgentTurn => 60 * 5,
+            Self::PollInbox => 60 * 5,
+            Self::CheckCycles => 60 * 5,
+            Self::TopUpCycles => 60 * 5,
             Self::Reconcile => 300,
         }
     }

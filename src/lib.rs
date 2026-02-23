@@ -24,7 +24,7 @@ use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUp
 use serde::Deserialize;
 use std::time::Duration;
 
-const SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
+const SCHEDULER_TICK_INTERVAL_SECS: u64 = 60;
 
 #[derive(CandidType, Deserialize)]
 struct InitArgs {
