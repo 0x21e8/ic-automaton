@@ -24,7 +24,7 @@ pub struct AffordabilityRequirements {
 }
 
 pub const DEFAULT_SAFETY_MARGIN_BPS: u32 = 2_500;
-pub const DEFAULT_RESERVE_FLOOR_CYCLES: u128 = 10_000_000_000;
+pub const DEFAULT_RESERVE_FLOOR_CYCLES: u128 = 200_000_000_000;
 const NON_REPLICATED_DEFAULT_SUBNET_SIZE: u128 = 13;
 
 pub fn estimate_operation_cost(operation: &OperationClass) -> Result<u128, String> {

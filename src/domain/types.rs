@@ -1312,7 +1312,7 @@ fn default_cycle_topup_enabled() -> bool {
 }
 
 fn default_auto_topup_cycle_threshold() -> u128 {
-    200_000_000_000
+    2_000_000_000_000
 }
 
 fn default_onesec_locker_address() -> String {
@@ -1340,7 +1340,7 @@ fn default_cmc_id() -> String {
 }
 
 fn default_min_usdc_reserve() -> u64 {
-    2_000_000
+    10_000_000
 }
 
 fn default_max_usdc_per_topup() -> u64 {
@@ -1486,7 +1486,7 @@ mod tests {
         assert!(snapshot.cycle_topup.enabled);
         assert_eq!(
             snapshot.cycle_topup.auto_topup_cycle_threshold,
-            200_000_000_000
+            2_000_000_000_000
         );
         assert_eq!(
             snapshot.cycle_topup.onesec_locker_address,

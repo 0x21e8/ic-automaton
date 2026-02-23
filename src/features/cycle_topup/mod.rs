@@ -7,8 +7,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
-pub(crate) const TOPUP_MIN_OPERATIONAL_CYCLES: u128 = 60_000_000_000;
-pub(crate) const TOPUP_MIN_USDC_AVAILABLE_RAW: u64 = 5_000_000;
+pub(crate) const TOPUP_MIN_OPERATIONAL_CYCLES: u128 = 250_000_000_000;
+pub(crate) const TOPUP_MIN_USDC_AVAILABLE_RAW: u64 = 10_000_000;
 const DEFAULT_EVM_GAS_LIMIT: u64 = 250_000;
 const DEFAULT_PRIORITY_FEE_PER_GAS_WEI: u64 = 1_000_000_000;
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
@@ -92,7 +92,7 @@ impl Default for TopUpConfig {
             icp_ledger: Principal::anonymous(),
             cmc: Principal::anonymous(),
             target_canister: None,
-            min_usdc_reserve: 2_000_000,
+            min_usdc_reserve: 10_000_000,
             max_usdc_per_topup: 50_000_000,
             max_slippage_pct: 5.0,
             max_bridge_polls: 60,
@@ -1981,16 +1981,16 @@ mod tests {
         });
 
         let mut config = phase3_test_config();
-        config.max_usdc_per_topup = 9_000_000;
+        config.max_usdc_per_topup = 15_000_000;
 
-        let evm = TestEvmPort::with_rpc_responses(vec![&full_word_hex_u64(12_000_000)]);
+        let evm = TestEvmPort::with_rpc_responses(vec![&full_word_hex_u64(30_000_000)]);
         let evm_spy = evm.clone();
         let topup = CycleTopUp::new(config, evm, TestStoragePort::default());
         let next = block_on_with_spin(topup.preflight()).expect("preflight should succeed");
         assert_eq!(
             next,
             TopUpStage::ApprovingLocker {
-                usdc_amount: 9_000_000
+                usdc_amount: 15_000_000
             }
         );
 
@@ -2009,13 +2009,13 @@ mod tests {
             mocks.get_transfer_fees_results.push(Ok(vec![TransferFee {
                 token: Token::USDC,
                 evm_chain: EvmChain::Base,
-                min_amount: Nat::from(10_000_001_u64),
+                min_amount: Nat::from(16_000_000_u64),
                 max_amount: Nat::from(100_000_000_u64),
             }]));
         });
 
         let config = phase3_test_config();
-        let evm = TestEvmPort::with_rpc_responses(vec![&full_word_hex_u64(12_000_000)]);
+        let evm = TestEvmPort::with_rpc_responses(vec![&full_word_hex_u64(25_000_000)]);
         let topup = CycleTopUp::new(config, evm, TestStoragePort::default());
         let error = block_on_with_spin(topup.preflight()).expect_err("preflight should fail");
         assert!(error.contains("outside Onesec bounds"));
