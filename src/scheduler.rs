@@ -27,7 +27,7 @@ use serde_json::json;
 
 const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
 const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
-const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 4;
+const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 15;
 const MAX_MUTATING_JOBS_PER_TICK: u8 = 4;
 const EMPTY_POLL_BACKOFF_SCHEDULE_SECS: &[u64] = &[60, 120, 240, 600];
 const EVM_RPC_MAX_RESPONSE_BYTES_POLICY_MAX: u64 = 2 * 1024 * 1024;
@@ -1447,35 +1447,35 @@ mod tests {
     fn checkcycles_topup_trigger_requires_threshold_usdc_and_idle_state() {
         let mut snapshot = RuntimeSnapshot::default();
         snapshot.cycle_topup.enabled = true;
-        snapshot.cycle_topup.auto_topup_cycle_threshold = 200_000_000_000;
-        snapshot.cycle_topup.min_usdc_reserve = 2_000_000;
+        snapshot.cycle_topup.auto_topup_cycle_threshold = 2_000_000_000_000;
+        snapshot.cycle_topup.min_usdc_reserve = 10_000_000;
 
         assert!(should_trigger_cycle_topup(
-            199_000_000_000,
+            1_900_000_000_000,
             &snapshot,
             None,
-            Some(7_000_001)
+            Some(20_000_001)
         ));
         assert!(!should_trigger_cycle_topup(
-            210_000_000_000,
+            2_100_000_000_000,
             &snapshot,
             None,
-            Some(7_000_001)
+            Some(20_000_001)
         ));
         assert!(!should_trigger_cycle_topup(
-            59_000_000_000,
+            249_000_000_000,
             &snapshot,
             None,
-            Some(7_000_001)
+            Some(20_000_001)
         ));
         assert!(!should_trigger_cycle_topup(
-            199_000_000_000,
+            1_900_000_000_000,
             &snapshot,
             Some(&TopUpStage::Preflight),
-            Some(7_000_001)
+            Some(20_000_001)
         ));
         assert!(!should_trigger_cycle_topup(
-            199_000_000_000,
+            1_900_000_000_000,
             &snapshot,
             Some(&TopUpStage::Failed {
                 stage: "Preflight".to_string(),
@@ -1483,17 +1483,17 @@ mod tests {
                 failed_at_ns: 1,
                 attempts: 1,
             }),
-            Some(7_000_001)
+            Some(20_000_001)
         ));
         assert!(should_trigger_cycle_topup(
-            199_000_000_000,
+            1_900_000_000_000,
             &snapshot,
             Some(&TopUpStage::Completed {
                 cycles_minted: 1,
                 usdc_spent: 1,
                 completed_at_ns: 1,
             }),
-            Some(7_000_000)
+            Some(20_000_000)
         ));
     }
 
