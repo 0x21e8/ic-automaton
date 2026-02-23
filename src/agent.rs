@@ -12,13 +12,12 @@ use crate::features::{
 };
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
-use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeSet;
 
-const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60 * 60;
+const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 10 * 60;
 const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
 const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 5;
 const MAX_AGENT_TURN_DURATION_NS: u64 = 90 * 1_000_000_000;
@@ -83,60 +82,8 @@ fn sanitize_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn parse_hex_quantity_u256(raw: &str) -> Option<U256> {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with("0x") {
-        return None;
-    }
-    let digits = trimmed.trim_start_matches("0x");
-    if digits.is_empty() {
-        return Some(U256::ZERO);
-    }
-    U256::from_str_radix(digits, 16).ok()
-}
-
-fn format_wei_as_eth(wei: U256) -> String {
-    let one_eth = U256::from(1_000_000_000_000_000_000u128);
-    let whole = wei / one_eth;
-    let remainder = wei % one_eth;
-    if remainder.is_zero() {
-        return whole.to_string();
-    }
-
-    let mut frac = format!("{:018}", remainder);
-    while frac.ends_with('0') {
-        frac.pop();
-    }
-    format!("{whole}.{frac}")
-}
-
-fn summarize_eth_balance_call(call: &ToolCallRecord) -> Option<String> {
-    if !call.success || call.tool != "evm_read" {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&call.args_json).ok()?;
-    let method = args.get("method")?.as_str()?;
-    if method != "eth_getBalance" {
-        return None;
-    }
-
-    let address = args
-        .get("address")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let balance_hex = call.output.trim();
-    let balance_wei = parse_hex_quantity_u256(balance_hex)?;
-    let balance_eth = format_wei_as_eth(balance_wei);
-    Some(format!(
-        "balance `{address}` = `{balance_hex}` wei ({balance_eth} ETH)"
-    ))
-}
-
 fn summarize_tool_call(call: &ToolCallRecord) -> String {
     if call.success {
-        if let Some(balance_summary) = summarize_eth_balance_call(call) {
-            return balance_summary;
-        }
         let output = sanitize_preview(call.output.trim(), 220);
         if output.is_empty() {
             return format!("`{}`: ok", call.tool);
@@ -277,76 +224,6 @@ fn continuation_tool_content(record: &ToolCallRecord) -> String {
         "error": record.error,
     })
     .to_string()
-}
-
-fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) -> Result<(), String> {
-    let existing = stable::get_memory_fact(key);
-    stable::set_memory_fact(&MemoryFact {
-        key: key.to_string(),
-        value,
-        created_at_ns: existing
-            .as_ref()
-            .map(|fact| fact.created_at_ns)
-            .unwrap_or(now_ns),
-        updated_at_ns: now_ns,
-        source_turn_id: turn_id.to_string(),
-    })
-}
-
-fn successful_eth_balance_read(call: &ToolCallRecord) -> Option<(String, String)> {
-    if !call.success || call.tool != "evm_read" {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&call.args_json).ok()?;
-    let method = args.get("method")?.as_str()?;
-    if method != "eth_getBalance" {
-        return None;
-    }
-
-    let address = args
-        .get("address")
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().to_ascii_lowercase())?;
-    let balance_hex = call.output.trim().to_ascii_lowercase();
-    let _ = parse_hex_quantity_u256(&balance_hex)?;
-    Some((address, balance_hex))
-}
-
-fn persist_eth_balance_from_tool_calls(tool_calls: &[ToolCallRecord], turn_id: &str, now_ns: u64) {
-    for call in tool_calls {
-        let Some((address, balance_hex)) = successful_eth_balance_read(call) else {
-            continue;
-        };
-        if let Err(error) = upsert_memory_fact("balance.eth", balance_hex.clone(), turn_id, now_ns)
-        {
-            log!(
-                AgentLogPriority::Error,
-                "memory_fact_upsert_failed key=balance.eth err={error}"
-            );
-        }
-        if let Err(error) = upsert_memory_fact(
-            &format!("balance.eth.{address}"),
-            balance_hex,
-            turn_id,
-            now_ns,
-        ) {
-            log!(
-                AgentLogPriority::Error,
-                "memory_fact_upsert_failed key=balance.eth.{address} err={error}"
-            );
-        }
-        if let Err(error) = upsert_memory_fact(
-            "balance.eth.last_checked_ns",
-            now_ns.to_string(),
-            turn_id,
-            now_ns,
-        ) {
-            log!(
-                AgentLogPriority::Error,
-                "memory_fact_upsert_failed key=balance.eth.last_checked_ns err={error}"
-            );
-        }
-    }
 }
 
 fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
@@ -1023,11 +900,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
 
-            persist_eth_balance_from_tool_calls(
-                &round_tool_records,
-                &turn_id,
-                execution_completed_ns,
-            );
             if let Some(tool_results_reply) = render_tool_results_reply(&round_tool_records) {
                 append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
                 assistant_reply = Some(tool_results_reply);
@@ -1241,23 +1113,21 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_results_reply_formats_eth_get_balance_result() {
+    fn render_tool_results_reply_formats_success_tool_result() {
         let calls = vec![ToolCallRecord {
             turn_id: "turn-1".to_string(),
             tool: "evm_read".to_string(),
             args_json:
                 r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
                     .to_string(),
-            output: "0xde0b6b3a7640000".to_string(),
+            output: "0x1".to_string(),
             success: true,
             error: None,
         }];
 
         let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
         assert!(reply.contains("Tool results: 1 succeeded, 0 failed."));
-        assert!(reply.contains("balance `0x1111111111111111111111111111111111111111`"));
-        assert!(reply.contains("0xde0b6b3a7640000"));
-        assert!(reply.contains("1 ETH"));
+        assert!(reply.contains("`evm_read`: 0x1"));
     }
 
     #[test]
@@ -1285,85 +1155,6 @@ mod tests {
         assert!(reply.contains("Tool results: 1 succeeded, 1 failed."));
         assert!(reply.contains("`remember`: stored"));
         assert!(reply.contains("`evm_read` failed: rpc timeout"));
-    }
-
-    #[test]
-    fn persist_eth_balance_from_tool_calls_stores_balance_and_last_checked() {
-        reset_runtime(AgentState::Sleeping, true, false, 8);
-        let calls = vec![ToolCallRecord {
-            turn_id: "turn-9".to_string(),
-            tool: "evm_read".to_string(),
-            args_json:
-                r#"{"method":"eth_getBalance","address":"0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"}"#
-                    .to_string(),
-            output: "0x1".to_string(),
-            success: true,
-            error: None,
-        }];
-
-        persist_eth_balance_from_tool_calls(&calls, "turn-9", 100);
-
-        let global = stable::get_memory_fact("balance.eth").expect("global balance should exist");
-        assert_eq!(global.value, "0x1");
-        assert_eq!(global.created_at_ns, 100);
-        assert_eq!(global.updated_at_ns, 100);
-
-        let by_address =
-            stable::get_memory_fact("balance.eth.0xabcdefabcdefabcdefabcdefabcdefabcdefabcd")
-                .expect("address balance should exist");
-        assert_eq!(by_address.value, "0x1");
-
-        let checked = stable::get_memory_fact("balance.eth.last_checked_ns")
-            .expect("last checked fact should exist");
-        assert_eq!(checked.value, "100");
-
-        let second_calls = vec![ToolCallRecord {
-            output: "0x2".to_string(),
-            ..calls[0].clone()
-        }];
-        persist_eth_balance_from_tool_calls(&second_calls, "turn-10", 200);
-        let updated_global = stable::get_memory_fact("balance.eth").expect("updated balance");
-        assert_eq!(updated_global.value, "0x2");
-        assert_eq!(updated_global.created_at_ns, 100);
-        assert_eq!(updated_global.updated_at_ns, 200);
-    }
-
-    #[test]
-    fn persist_eth_balance_from_tool_calls_respects_memory_fact_capacity() {
-        reset_runtime(AgentState::Sleeping, true, false, 8);
-        for idx in 0..stable::MAX_MEMORY_FACTS {
-            stable::set_memory_fact(&MemoryFact {
-                key: format!("fact.{idx}"),
-                value: "seed".to_string(),
-                created_at_ns: 1,
-                updated_at_ns: 1,
-                source_turn_id: "turn-seed".to_string(),
-            })
-            .expect("seed fact should persist");
-        }
-        assert_eq!(stable::memory_fact_count(), stable::MAX_MEMORY_FACTS);
-
-        let calls = vec![ToolCallRecord {
-            turn_id: "turn-9".to_string(),
-            tool: "evm_read".to_string(),
-            args_json:
-                r#"{"method":"eth_getBalance","address":"0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"}"#
-                    .to_string(),
-            output: "0x1".to_string(),
-            success: true,
-            error: None,
-        }];
-        persist_eth_balance_from_tool_calls(&calls, "turn-9", 100);
-
-        assert_eq!(
-            stable::memory_fact_count(),
-            stable::MAX_MEMORY_FACTS,
-            "agent-internal memory writes must not bypass memory fact cardinality cap"
-        );
-        assert!(
-            stable::get_memory_fact("balance.eth").is_none(),
-            "new balance fact should be rejected when map is at capacity"
-        );
     }
 
     #[test]

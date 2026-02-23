@@ -173,14 +173,14 @@ impl ToolManager {
         policies.insert(
             "top_up_status".to_string(),
             ToolPolicy {
-                enabled: true,
+                enabled: false,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
             },
         );
         policies.insert(
             "trigger_top_up".to_string(),
             ToolPolicy {
-                enabled: true,
+                enabled: false,
                 allowed_states: vec![AgentState::ExecutingActions],
             },
         );
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn top_up_status_tool_reports_state_in_inferring() {
+    fn top_up_status_tool_is_blocked_by_policy() {
         stable::init_storage();
         stable::write_topup_state(&TopUpStage::Completed {
             cycles_minted: 123,
@@ -1765,12 +1765,13 @@ mod tests {
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-status"));
         assert_eq!(records.len(), 1);
-        assert!(records[0].success);
-        assert!(records[0].output.contains("Completed"));
+        assert!(!records[0].success);
+        assert_eq!(records[0].output, "tool blocked by policy");
+        assert_eq!(records[0].error.as_deref(), Some("tool blocked"));
     }
 
     #[test]
-    fn trigger_top_up_tool_starts_preflight_and_enqueues_job() {
+    fn trigger_top_up_tool_is_blocked_by_policy() {
         stable::init_storage();
         stable::set_evm_address(Some(
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -1789,17 +1790,8 @@ mod tests {
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-topup"));
         assert_eq!(records.len(), 1);
-        assert!(records[0].success, "{:?}", records[0]);
-        assert_eq!(records[0].output, "Top-up enqueued.");
-        assert!(matches!(
-            stable::read_topup_state(),
-            Some(TopUpStage::Preflight)
-        ));
-        assert!(
-            stable::list_recent_jobs(10)
-                .into_iter()
-                .any(|job| job.kind == crate::domain::types::TaskKind::TopUpCycles),
-            "trigger should enqueue a TopUpCycles job"
-        );
+        assert!(!records[0].success);
+        assert_eq!(records[0].output, "tool blocked by policy");
+        assert_eq!(records[0].error.as_deref(), Some("tool blocked"));
     }
 }
