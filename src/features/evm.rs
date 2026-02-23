@@ -1087,7 +1087,6 @@ struct EvmReadArgs {
 }
 
 enum EvmReadMethod {
-    GetBalance,
     Call,
 }
 
@@ -1103,17 +1102,15 @@ fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
 
     let address = normalize_address(&args.address)?;
     let method = match args.method.trim() {
-        "eth_getBalance" => EvmReadMethod::GetBalance,
         "eth_call" => EvmReadMethod::Call,
         unsupported => {
             return Err(format!(
-                "evm_read method must be one of eth_getBalance or eth_call, got {unsupported}"
+                "evm_read method must be eth_call (wallet balances come from runtime telemetry), got {unsupported}"
             ));
         }
     };
 
     let calldata = match method {
-        EvmReadMethod::GetBalance => None,
         EvmReadMethod::Call => {
             let value = args
                 .calldata
@@ -1237,7 +1234,6 @@ pub async fn evm_read_tool(args_json: &str) -> Result<String, String> {
     let rpc = HttpEvmRpcClient::from_snapshot(&snapshot)?;
 
     match args.method {
-        EvmReadMethod::GetBalance => rpc.eth_get_balance(&args.address).await,
         EvmReadMethod::Call => {
             let calldata = args
                 .calldata
@@ -1845,12 +1841,16 @@ mod tests {
     #[test]
     fn parse_evm_read_args_enforces_method_and_address() {
         assert!(parse_evm_read_args("{}").is_err());
-        assert!(
-            parse_evm_read_args(r#"{"method":"eth_getBalance","address":"not-an-address"}"#)
-                .is_err()
-        );
+        assert!(parse_evm_read_args(
+            r#"{"method":"eth_call","address":"not-an-address","calldata":"0x00"}"#
+        )
+        .is_err());
         assert!(parse_evm_read_args(
             r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111"}"#
+        )
+        .is_err());
+        assert!(parse_evm_read_args(
+            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
         )
         .is_err());
     }
@@ -2023,17 +2023,17 @@ mod tests {
     }
 
     #[test]
-    fn evm_read_tool_returns_hex_balance_in_host_mode() {
+    fn evm_read_tool_returns_eth_call_result_in_host_mode() {
         stable::init_storage();
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
             .expect("rpc url should be set");
 
         let out = block_on_with_spin(evm_read_tool(
-            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#,
+            r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111","calldata":"0x1234"}"#,
         ))
         .expect("evm_read should succeed in host-mode stub");
 
-        assert_eq!(out, "0x1");
+        assert_eq!(out, "0x");
     }
 
     #[test]

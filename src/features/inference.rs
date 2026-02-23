@@ -421,7 +421,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "evm_read".to_string(),
             description: Some(
-                "Read on-chain state on EVM. Supported methods: eth_getBalance and eth_call."
+                "Read EVM contract state via eth_call. Use Layer-10 wallet telemetry for ETH/USDC balances."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -430,22 +430,24 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "method".to_string(),
-                        description: Some("Either eth_getBalance or eth_call.".to_string()),
+                        description: Some("Must be eth_call.".to_string()),
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "address".to_string(),
-                        description: Some("0x-prefixed 20-byte address target.".to_string()),
+                        description: Some("0x-prefixed 20-byte contract address target.".to_string()),
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "calldata".to_string(),
-                        description: Some(
-                            "For eth_call only: 0x-prefixed ABI-encoded calldata.".to_string(),
-                        ),
+                        description: Some("0x-prefixed ABI-encoded calldata.".to_string()),
                     },
                 ]),
-                required: Some(vec!["method".to_string(), "address".to_string()]),
+                required: Some(vec![
+                    "method".to_string(),
+                    "address".to_string(),
+                    "calldata".to_string(),
+                ]),
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
@@ -527,26 +529,6 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     description: Some("Memory key identifier.".to_string()),
                 }]),
                 required: Some(vec!["key".to_string()]),
-            }),
-        }),
-        IcLlmTool::Function(IcLlmFunction {
-            name: "top_up_status".to_string(),
-            description: Some("Read the current USDC-to-cycles top-up state.".to_string()),
-            parameters: Some(IcLlmParameters {
-                type_: "object".to_string(),
-                properties: Some(vec![]),
-                required: None,
-            }),
-        }),
-        IcLlmTool::Function(IcLlmFunction {
-            name: "trigger_top_up".to_string(),
-            description: Some(
-                "Start a USDC-to-cycles top-up flow and enqueue scheduler execution.".to_string(),
-            ),
-            parameters: Some(IcLlmParameters {
-                type_: "object".to_string(),
-                properties: Some(vec![]),
-                required: None,
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
@@ -1861,8 +1843,6 @@ mod tests {
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"recall".to_string()));
         assert!(names.contains(&"forget".to_string()));
-        assert!(names.contains(&"top_up_status".to_string()));
-        assert!(names.contains(&"trigger_top_up".to_string()));
         assert!(names.contains(&"http_fetch".to_string()));
         assert!(names.contains(&"update_prompt_layer".to_string()));
     }
@@ -1893,8 +1873,6 @@ mod tests {
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"recall"));
         assert!(names.contains(&"forget"));
-        assert!(names.contains(&"top_up_status"));
-        assert!(names.contains(&"trigger_top_up"));
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
     }
@@ -1931,7 +1909,8 @@ mod tests {
         assert!(!names.contains(&"evm_read".to_string()));
         assert!(!names.contains(&"send_eth".to_string()));
         assert!(names.contains(&"remember".to_string()));
-        assert!(names.contains(&"top_up_status".to_string()));
+        assert!(!names.contains(&"top_up_status".to_string()));
+        assert!(!names.contains(&"trigger_top_up".to_string()));
     }
 
     #[test]
@@ -1960,7 +1939,8 @@ mod tests {
         assert!(!names.contains(&"evm_read"));
         assert!(!names.contains(&"send_eth"));
         assert!(names.contains(&"remember"));
-        assert!(names.contains(&"top_up_status"));
+        assert!(!names.contains(&"top_up_status"));
+        assert!(!names.contains(&"trigger_top_up"));
     }
 
     #[test]
