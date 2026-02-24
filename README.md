@@ -105,7 +105,7 @@ The canister derives its own Ethereum address via ICP's [threshold ECDSA](https:
 - **Event polling** -- Continuous polling of Base blocks with cursor tracking, confirmation depth, and automatic backoff
 
 ### On-Chain Inbox
-An [Inbox.sol](contracts/) contract on Base allows anyone to send messages to the agent with attached ETH or USDC payments. The canister polls for `MessageQueued` events and ingests them as input for reasoning turns.
+An [Inbox.sol](evm/src/Inbox.sol) contract on Base allows anyone to send messages to the agent with attached ETH or USDC payments. The canister polls for `MessageQueued` events and ingests them as input for reasoning turns.
 
 ### Survival Tiers
 The agent monitors its own cycle balance and adapts behavior under resource pressure:
