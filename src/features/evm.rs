@@ -1,16 +1,31 @@
+/// EVM chain interaction — RPC, event polling, wallet balance, and transaction signing/broadcast.
+///
+/// Provides:
+/// - `HttpEvmPoller` / `EvmPoller` — polls `MessageQueued` log events from the inbox contract.
+/// - `HttpEvmRpcClient` — thin JSON-RPC client over IC HTTPS outcalls (with optional fallback URL).
+/// - `EvmBroadcaster` / `EvmPoller` mock implementations for unit tests.
+/// - EIP-1559 transaction encoding and signature helpers.
+/// - Failure classification via `classify_evm_failure`.
+///
+/// All outbound HTTP calls are pre-checked with the cycle affordability guard to avoid
+/// wasting the outcall fee on an operation the canister cannot afford.
+// ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, OperationClass,
     DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    EvmEvent, EvmPollCursor, OperationFailure, OperationFailureKind, OutcallFailure,
-    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
+    EvmEvent, EvmPollCursor, ExecutionPlan, OperationFailure, OperationFailureKind, OutcallFailure,
+    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot, StrategyExecutionCall,
+    StrategyOutcomeEvent, StrategyOutcomeKind,
 };
 use crate::storage::stable;
+use crate::timing::current_time_ns;
 use crate::tools::SignerPort;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
+use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,26 +39,75 @@ use ic_cdk::management_canister::{http_request, HttpHeader, HttpMethod, HttpRequ
 #[cfg(target_arch = "wasm32")]
 use sha3::{Digest, Keccak256};
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Hard cap on EVM RPC response bodies — 2 MiB.
+/// Responses larger than this are rejected to prevent excessive cycle spend.
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Maximum block range requested per `eth_getLogs` poll.
+/// Larger ranges risk hitting RPC node limits and very large response bodies.
 const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
+
+// Maximum number of decoded log events returned per poll; prevents unbounded memory use.
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
+
+// Initial catch-up window (blocks) used when the poll cursor is unset (`next_block == 0`).
+// This avoids scanning from genesis on long-lived chains while still catching recent messages.
+const INITIAL_POLL_LOOKBACK_BLOCKS: u64 = MAX_BLOCK_RANGE_PER_POLL;
+
+// If cursor lag exceeds this threshold, skip historical backfill and fast-forward to the
+// recent head window so inbox responsiveness recovers for active users.
+const MAX_CURSOR_LAG_BEFORE_FAST_FORWARD_BLOCKS: u64 = MAX_BLOCK_RANGE_PER_POLL * 20;
+
+// RLP encoding length of an empty EIP-2930 access list `[]`.
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
+
+// Smaller response budget for control-plane calls (block number, nonce, gas price, …).
 const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
+
 const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
 const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
 const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
+
+// Environment variable that switches the host (non-wasm32) RPC client from stub to real mode.
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
 
+#[derive(Clone, Copy, Debug, LogPriorityLevels)]
+enum StrategyExecutionLogPriority {
+    #[log_level(capacity = 2_000, name = "STRATEGY_EXEC_INFO")]
+    Info,
+    #[log_level(capacity = 500, name = "STRATEGY_EXEC_ERROR")]
+    Error,
+}
+
+impl GetLogFilter for StrategyExecutionLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
+
+// ── Log event decoding ───────────────────────────────────────────────────────
+
+/// ABI-decoded fields from a `MessageQueued` log event payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedMessageQueuedPayload {
+    /// EVM sender address (checksummed lowercase hex).
     pub sender: String,
+    /// UTF-8 message string encoded in the event.
     pub message: String,
+    /// USDC amount attached to the message (6-decimal raw units).
     pub usdc_amount: U256,
+    /// ETH amount attached to the message (wei).
     pub eth_amount: U256,
 }
 
+/// Decode a raw `MessageQueued` event data blob into its constituent fields.
+///
+/// `payload_hex` is the `data` field of the log entry (0x-prefixed hex).
+/// Returns an error if the payload is too short or contains invalid encoding.
 pub fn decode_message_queued_payload(
     payload_hex: &str,
 ) -> Result<DecodedMessageQueuedPayload, String> {
@@ -99,27 +163,36 @@ fn read_usize_word(word: &[u8], field: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+// ── Polling types ────────────────────────────────────────────────────────────
+
+/// Output of a single `EvmPoller::poll` call.
 pub struct EvmPollResult {
+    /// Updated cursor to persist after processing `events`.
     pub cursor: EvmPollCursor,
+    /// Decoded inbox events ordered by (block_number, log_index).
     pub events: Vec<EvmEvent>,
 }
 
+/// Result of broadcasting a signed transaction to the EVM network.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct EvmBroadcastResult {
     pub tx_hash: String,
 }
 
+/// Trait for broadcasting pre-signed raw transactions.
 #[allow(dead_code)]
 pub trait EvmBroadcaster {
     fn broadcast(&self, signed_transaction: &str) -> Result<EvmBroadcastResult, String>;
 }
 
+/// Trait for polling EVM log events starting from a persisted cursor.
 #[async_trait(?Send)]
 pub trait EvmPoller {
     async fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String>;
 }
 
+/// Production `EvmPoller` that fetches logs via IC HTTPS outcalls to an EVM JSON-RPC endpoint.
 #[derive(Clone, Debug)]
 pub struct HttpEvmPoller {
     rpc: HttpEvmRpcClient,
@@ -129,6 +202,10 @@ pub struct HttpEvmPoller {
 }
 
 impl HttpEvmPoller {
+    /// Construct from the current `RuntimeSnapshot`.
+    ///
+    /// Resolves the inbox contract address and derives the agent's EVM address
+    /// topic for the `eth_getLogs` filter.
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
         let rpc = HttpEvmRpcClient::from_snapshot(snapshot)?;
         let log_filter_address = snapshot
@@ -162,7 +239,16 @@ impl EvmPoller for HttpEvmPoller {
     async fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String> {
         let latest_block = self.rpc.eth_block_number().await?;
         let confirmed_head = latest_block.saturating_sub(cursor.confirmation_depth);
-        let from_block = cursor.next_block;
+        let from_block = effective_from_block(cursor, confirmed_head);
+        if from_block != cursor.next_block {
+            log!(
+                StrategyExecutionLogPriority::Info,
+                "evm_poll_from_block_adjusted previous_next_block={} effective_from_block={} confirmed_head={}",
+                cursor.next_block,
+                from_block,
+                confirmed_head
+            );
+        }
         let to_block = confirmed_head.min(from_block.saturating_add(MAX_BLOCK_RANGE_PER_POLL));
 
         if from_block > to_block {
@@ -220,6 +306,19 @@ impl EvmPoller for HttpEvmPoller {
     }
 }
 
+fn effective_from_block(cursor: &EvmPollCursor, confirmed_head: u64) -> u64 {
+    if cursor.next_block == 0 {
+        return confirmed_head.saturating_sub(INITIAL_POLL_LOOKBACK_BLOCKS);
+    }
+
+    let lag = confirmed_head.saturating_sub(cursor.next_block);
+    if lag > MAX_CURSOR_LAG_BEFORE_FAST_FORWARD_BLOCKS {
+        return confirmed_head.saturating_sub(INITIAL_POLL_LOOKBACK_BLOCKS);
+    }
+
+    cursor.next_block
+}
+
 #[allow(dead_code)]
 pub struct MockEvmPoller;
 
@@ -254,6 +353,9 @@ impl EvmPoller for MockEvmPoller {
     }
 }
 
+// ── Mock implementations (test/stub) ────────────────────────────────────────
+
+/// In-memory broadcaster stub — returns a synthetic tx hash for unit tests.
 #[allow(dead_code)]
 pub struct MockEvmBroadcaster;
 
@@ -265,6 +367,13 @@ impl EvmBroadcaster for MockEvmBroadcaster {
     }
 }
 
+// ── RPC client ───────────────────────────────────────────────────────────────
+
+/// JSON-RPC client that sends requests via IC HTTPS outcalls (wasm32) or ureq (host builds).
+///
+/// Supports an optional `fallback_rpc_url`: if the primary endpoint fails, the
+/// same request is automatically retried against the fallback before propagating
+/// the error.
 #[derive(Clone, Debug)]
 pub struct HttpEvmRpcClient {
     rpc_url: String,
@@ -273,6 +382,8 @@ pub struct HttpEvmRpcClient {
 }
 
 impl HttpEvmRpcClient {
+    /// Construct from the current `RuntimeSnapshot`.  Returns an error if the
+    /// primary RPC URL is not configured.
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
         let rpc_url = snapshot.evm_rpc_url.trim();
         if rpc_url.is_empty() {
@@ -354,11 +465,14 @@ impl HttpEvmRpcClient {
             .map_err(|error| format!("failed to decode eth_getLogs result: {error}"))
     }
 
+    /// Query the ETH balance of `address` at the latest block.
+    /// Returns the balance as a 0x-prefixed hex quantity string (wei).
     pub async fn eth_get_balance(&self, address: &str) -> Result<String, String> {
         self.eth_get_balance_with_limit(address, self.control_plane_max_response_bytes())
             .await
     }
 
+    /// Like `eth_get_balance` but with a caller-supplied response byte cap.
     pub async fn eth_get_balance_with_limit(
         &self,
         address: &str,
@@ -379,11 +493,14 @@ impl HttpEvmRpcClient {
         normalize_hex_quantity(raw, "eth_getBalance result")
     }
 
+    /// Read-only contract call (`eth_call`) at the latest block.
+    /// Returns the raw ABI-encoded result as a 0x-prefixed hex string.
     pub async fn eth_call(&self, address: &str, calldata: &str) -> Result<String, String> {
         self.eth_call_with_limit(address, calldata, self.control_plane_max_response_bytes())
             .await
     }
 
+    /// Like `eth_call` but with a caller-supplied response byte cap.
     pub async fn eth_call_with_limit(
         &self,
         address: &str,
@@ -405,6 +522,7 @@ impl HttpEvmRpcClient {
         normalize_hex_blob(raw, "eth_call result")
     }
 
+    /// Fetch the pending nonce for `address` (`eth_getTransactionCount` with `"pending"`).
     pub async fn eth_get_transaction_count(&self, address: &str) -> Result<u64, String> {
         let response = self
             .rpc_call(
@@ -421,6 +539,7 @@ impl HttpEvmRpcClient {
         parse_hex_u64(raw, "eth_getTransactionCount")
     }
 
+    /// Fetch the current base gas price in wei.
     pub async fn eth_gas_price(&self) -> Result<U256, String> {
         let response = self
             .rpc_call(
@@ -437,6 +556,7 @@ impl HttpEvmRpcClient {
         parse_hex_u256(raw, "eth_gasPrice")
     }
 
+    /// Estimate gas for a transaction — used when building EIP-1559 envelopes.
     pub async fn eth_estimate_gas(
         &self,
         from: &str,
@@ -465,6 +585,8 @@ impl HttpEvmRpcClient {
         parse_hex_u64(raw, "eth_estimateGas")
     }
 
+    /// Broadcast a fully-signed EIP-1559 transaction.
+    /// Returns the transaction hash as a 0x-prefixed hex string.
     pub async fn eth_send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String, String> {
         let payload = format!("0x{}", hex::encode(raw_tx));
         let response = self
@@ -482,6 +604,8 @@ impl HttpEvmRpcClient {
         normalize_hex_blob(raw, "eth_sendRawTransaction result")
     }
 
+    /// Generic JSON-RPC call — used by the `EvmPort` adapter in `cycle_topup_host`.
+    /// `params_json` must be a valid JSON array string.
     pub async fn json_rpc_call(&self, method: &str, params_json: &str) -> Result<String, String> {
         let params: Value = serde_json::from_str(params_json)
             .map_err(|error| format!("invalid {method} params json: {error}"))?;
@@ -643,6 +767,12 @@ fn ensure_http_affordable(request_size_bytes: u64, max_response_bytes: u64) -> R
     Ok(())
 }
 
+// ── Failure classification ───────────────────────────────────────────────────
+
+/// Map a raw EVM RPC error string to a structured `RecoveryFailure`.
+///
+/// The agent uses this to decide retry strategy: transient network errors are
+/// retried immediately, policy/config errors surface to the operator.
 #[allow(dead_code)]
 pub fn classify_evm_failure(error: &str) -> RecoveryFailure {
     let normalized = error.to_ascii_lowercase();
@@ -1071,7 +1201,6 @@ struct EvmReadArgs {
 }
 
 enum EvmReadMethod {
-    GetBalance,
     Call,
 }
 
@@ -1087,17 +1216,15 @@ fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
 
     let address = normalize_address(&args.address)?;
     let method = match args.method.trim() {
-        "eth_getBalance" => EvmReadMethod::GetBalance,
         "eth_call" => EvmReadMethod::Call,
         unsupported => {
             return Err(format!(
-                "evm_read method must be one of eth_getBalance or eth_call, got {unsupported}"
+                "evm_read method must be eth_call (wallet balances come from runtime telemetry), got {unsupported}"
             ));
         }
     };
 
     let calldata = match method {
-        EvmReadMethod::GetBalance => None,
         EvmReadMethod::Call => {
             let value = args
                 .calldata
@@ -1221,7 +1348,6 @@ pub async fn evm_read_tool(args_json: &str) -> Result<String, String> {
     let rpc = HttpEvmRpcClient::from_snapshot(&snapshot)?;
 
     match args.method {
-        EvmReadMethod::GetBalance => rpc.eth_get_balance(&args.address).await,
         EvmReadMethod::Call => {
             let calldata = args
                 .calldata
@@ -1581,6 +1707,182 @@ pub async fn send_eth_tool(args_json: &str, signer: &dyn SignerPort) -> Result<S
     rpc.eth_send_raw_transaction(&signed).await
 }
 
+#[allow(dead_code)]
+pub fn strategy_call_to_send_eth_args_json(call: &StrategyExecutionCall) -> Result<String, String> {
+    let to = normalize_address(&call.to)?;
+    let value_wei = parse_decimal_u256(&call.value_wei, "value_wei")?.to_string();
+    let data = normalize_hex_blob(&call.data, "data")?;
+    Ok(format!(
+        "{{\"to\":\"{to}\",\"value_wei\":\"{value_wei}\",\"data\":\"{data}\"}}"
+    ))
+}
+
+#[allow(dead_code)]
+pub fn classify_strategy_failure_kind(error: &str) -> StrategyOutcomeKind {
+    let normalized = error.to_ascii_lowercase();
+    let nondeterministic_markers = [
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "network",
+        "dns",
+        "tls",
+        "503",
+        "502",
+        "429",
+        "gateway",
+        "rate limit",
+        "deadline exceeded",
+    ];
+    if nondeterministic_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return StrategyOutcomeKind::NondeterministicFailure;
+    }
+    StrategyOutcomeKind::DeterministicFailure
+}
+
+#[allow(dead_code)]
+pub async fn execute_strategy_plan(
+    plan: &ExecutionPlan,
+    signer: &dyn SignerPort,
+) -> Result<Vec<String>, String> {
+    log!(
+        StrategyExecutionLogPriority::Info,
+        "strategy_execute_plan_start protocol={} primitive={} template_id={} version={}.{}.{} action_id={} call_count={}",
+        plan.key.protocol,
+        plan.key.primitive,
+        plan.key.template_id,
+        plan.version.major,
+        plan.version.minor,
+        plan.version.patch,
+        plan.action_id,
+        plan.calls.len()
+    );
+    if plan.calls.is_empty() {
+        let error = "execution plan has no calls".to_string();
+        let outcome = classify_strategy_failure_kind(&error);
+        log!(
+            StrategyExecutionLogPriority::Error,
+            "strategy_execute_plan_rejected protocol={} template_id={} action_id={} error={}",
+            plan.key.protocol,
+            plan.key.template_id,
+            plan.action_id,
+            error
+        );
+        persist_strategy_outcome(plan, outcome, None, Some(error.clone()))?;
+        return Err(error);
+    }
+
+    let mut tx_hashes = Vec::with_capacity(plan.calls.len());
+    for (index, call) in plan.calls.iter().enumerate() {
+        log!(
+            StrategyExecutionLogPriority::Info,
+            "strategy_execute_call_start protocol={} template_id={} action_id={} call_index={} role={} to={} value_wei={}",
+            plan.key.protocol,
+            plan.key.template_id,
+            plan.action_id,
+            index,
+            call.role,
+            call.to,
+            call.value_wei
+        );
+        let args_json = match strategy_call_to_send_eth_args_json(call) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let outcome = classify_strategy_failure_kind(&error);
+                log!(
+                    StrategyExecutionLogPriority::Error,
+                    "strategy_execute_call_encode_failed protocol={} template_id={} action_id={} call_index={} error={}",
+                    plan.key.protocol,
+                    plan.key.template_id,
+                    plan.action_id,
+                    index,
+                    error
+                );
+                persist_strategy_outcome(
+                    plan,
+                    outcome,
+                    tx_hashes.last().cloned(),
+                    Some(error.clone()),
+                )?;
+                return Err(error);
+            }
+        };
+
+        match send_eth_tool(&args_json, signer).await {
+            Ok(tx_hash) => {
+                log!(
+                    StrategyExecutionLogPriority::Info,
+                    "strategy_execute_call_ok protocol={} template_id={} action_id={} call_index={} tx_hash={}",
+                    plan.key.protocol,
+                    plan.key.template_id,
+                    plan.action_id,
+                    index,
+                    tx_hash
+                );
+                tx_hashes.push(tx_hash);
+            }
+            Err(error) => {
+                let outcome = classify_strategy_failure_kind(&error);
+                log!(
+                    StrategyExecutionLogPriority::Error,
+                    "strategy_execute_call_failed protocol={} template_id={} action_id={} call_index={} error={}",
+                    plan.key.protocol,
+                    plan.key.template_id,
+                    plan.action_id,
+                    index,
+                    error
+                );
+                persist_strategy_outcome(
+                    plan,
+                    outcome,
+                    tx_hashes.last().cloned(),
+                    Some(error.clone()),
+                )?;
+                return Err(error);
+            }
+        }
+    }
+
+    persist_strategy_outcome(
+        plan,
+        StrategyOutcomeKind::Success,
+        tx_hashes.last().cloned(),
+        None,
+    )?;
+    log!(
+        StrategyExecutionLogPriority::Info,
+        "strategy_execute_plan_ok protocol={} template_id={} action_id={} tx_hash_count={}",
+        plan.key.protocol,
+        plan.key.template_id,
+        plan.action_id,
+        tx_hashes.len()
+    );
+    Ok(tx_hashes)
+}
+
+#[allow(dead_code)]
+fn persist_strategy_outcome(
+    plan: &ExecutionPlan,
+    outcome: StrategyOutcomeKind,
+    tx_hash: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    crate::strategy::learner::record_outcome(StrategyOutcomeEvent {
+        key: plan.key.clone(),
+        version: plan.version.clone(),
+        action_id: plan.action_id.clone(),
+        outcome,
+        tx_hash,
+        error,
+        observed_at_ns: current_time_ns(),
+    })
+    .map(|_stats| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1644,12 +1946,16 @@ mod tests {
     #[test]
     fn parse_evm_read_args_enforces_method_and_address() {
         assert!(parse_evm_read_args("{}").is_err());
-        assert!(
-            parse_evm_read_args(r#"{"method":"eth_getBalance","address":"not-an-address"}"#)
-                .is_err()
-        );
+        assert!(parse_evm_read_args(
+            r#"{"method":"eth_call","address":"not-an-address","calldata":"0x00"}"#
+        )
+        .is_err());
         assert!(parse_evm_read_args(
             r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111"}"#
+        )
+        .is_err());
+        assert!(parse_evm_read_args(
+            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
         )
         .is_err());
     }
@@ -1670,6 +1976,34 @@ mod tests {
             INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE,
             "MessageQueued(address,uint64,address,string,uint256,uint256)"
         );
+    }
+
+    #[test]
+    fn poll_bootstrap_from_block_uses_recent_head_window_when_cursor_is_unset() {
+        let cursor = EvmPollCursor {
+            next_block: 0,
+            ..EvmPollCursor::default()
+        };
+        assert_eq!(effective_from_block(&cursor, 5_000), 4_000);
+        assert_eq!(effective_from_block(&cursor, 100), 0);
+    }
+
+    #[test]
+    fn poll_bootstrap_from_block_respects_existing_cursor_progress() {
+        let cursor = EvmPollCursor {
+            next_block: 4_321,
+            ..EvmPollCursor::default()
+        };
+        assert_eq!(effective_from_block(&cursor, 9_999), 4_321);
+    }
+
+    #[test]
+    fn poll_bootstrap_from_block_fast_forwards_when_cursor_is_far_behind() {
+        let cursor = EvmPollCursor {
+            next_block: 1_000,
+            ..EvmPollCursor::default()
+        };
+        assert_eq!(effective_from_block(&cursor, 100_000), 99_000);
     }
 
     #[test]
@@ -1822,17 +2156,17 @@ mod tests {
     }
 
     #[test]
-    fn evm_read_tool_returns_hex_balance_in_host_mode() {
+    fn evm_read_tool_returns_eth_call_result_in_host_mode() {
         stable::init_storage();
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
             .expect("rpc url should be set");
 
         let out = block_on_with_spin(evm_read_tool(
-            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#,
+            r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111","calldata":"0x1234"}"#,
         ))
         .expect("evm_read should succeed in host-mode stub");
 
-        assert_eq!(out, "0x1");
+        assert_eq!(out, "0x");
     }
 
     #[test]
@@ -1999,6 +2333,75 @@ mod tests {
             tx_hash,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn strategy_call_to_send_eth_args_json_serializes_expected_payload() {
+        let call = crate::domain::types::StrategyExecutionCall {
+            role: "router".to_string(),
+            to: "0x2222222222222222222222222222222222222222".to_string(),
+            value_wei: "7".to_string(),
+            data: "0xabcdef00".to_string(),
+        };
+        let args_json =
+            strategy_call_to_send_eth_args_json(&call).expect("strategy call should serialize");
+        assert_eq!(
+            args_json,
+            r#"{"to":"0x2222222222222222222222222222222222222222","value_wei":"7","data":"0xabcdef00"}"#
+        );
+    }
+
+    #[test]
+    fn classify_strategy_failure_kind_distinguishes_error_classes() {
+        assert_eq!(
+            classify_strategy_failure_kind("execution reverted: slippage exceeded"),
+            crate::domain::types::StrategyOutcomeKind::DeterministicFailure
+        );
+        assert_eq!(
+            classify_strategy_failure_kind("rpc timeout while broadcasting tx"),
+            crate::domain::types::StrategyOutcomeKind::NondeterministicFailure
+        );
+    }
+
+    #[test]
+    fn execute_strategy_plan_records_deterministic_failure_evidence() {
+        stable::init_storage();
+        let plan = crate::domain::types::ExecutionPlan {
+            key: crate::domain::types::StrategyTemplateKey {
+                protocol: "erc20".to_string(),
+                primitive: "transfer".to_string(),
+                chain_id: 8453,
+                template_id: "execute-strategy-failure".to_string(),
+            },
+            version: crate::domain::types::TemplateVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            },
+            action_id: "transfer".to_string(),
+            calls: vec![crate::domain::types::StrategyExecutionCall {
+                role: "token".to_string(),
+                to: "not-an-address".to_string(),
+                value_wei: "0".to_string(),
+                data: "0x".to_string(),
+            }],
+            preconditions: vec!["ok".to_string()],
+            postconditions: vec!["delta".to_string()],
+        };
+
+        let signer = FixedSignatureSigner;
+        let err = block_on_with_spin(execute_strategy_plan(&plan, &signer))
+            .expect_err("invalid strategy call should fail");
+        assert!(
+            err.contains("address"),
+            "expected address validation error, got {err}"
+        );
+
+        let stats = crate::storage::stable::strategy_outcome_stats(&plan.key, &plan.version)
+            .expect("failure evidence should persist");
+        assert_eq!(stats.total_runs, 1);
+        assert_eq!(stats.deterministic_failures, 1);
+        assert_eq!(stats.nondeterministic_failures, 0);
     }
 
     #[cfg(all(not(feature = "anvil_e2e"), not(target_arch = "wasm32")))]

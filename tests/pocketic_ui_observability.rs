@@ -47,6 +47,16 @@ enum InferenceProvider {
     IcLlm,
 }
 
+#[allow(dead_code)]
+#[derive(CandidType, Clone, Copy, Debug)]
+enum TaskKind {
+    AgentTurn,
+    PollInbox,
+    CheckCycles,
+    TopUpCycles,
+    Reconcile,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -144,6 +154,13 @@ fn set_inference_model(pic: &PocketIc, canister_id: Principal, model: &str) {
     let result: Result<String, String> =
         call_update(pic, canister_id, "set_inference_model", payload);
     assert!(result.is_ok(), "set_inference_model failed: {result:?}");
+}
+
+fn set_task_interval_secs(pic: &PocketIc, canister_id: Principal, kind: TaskKind, interval: u64) {
+    let payload = encode_args((kind, interval)).expect("failed to encode set_task_interval_secs");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "set_task_interval_secs", payload);
+    assert!(result.is_ok(), "set_task_interval_secs failed: {result:?}");
 }
 
 fn response_word_from_address(address: &str) -> String {
@@ -256,6 +273,8 @@ fn parse_json_response(response: &HttpUpdateResponse<'_>, context: &str) -> Valu
 #[test]
 fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
     let (pic, canister_id) = with_backend_canister();
+    set_task_interval_secs(&pic, canister_id, TaskKind::AgentTurn, 30);
+    set_task_interval_secs(&pic, canister_id, TaskKind::PollInbox, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
     set_automaton_evm_address_admin(
         &pic,

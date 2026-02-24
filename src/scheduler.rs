@@ -1,3 +1,30 @@
+/// Scheduler tick — the heartbeat of the IC-Automaton canister.
+///
+/// `scheduler_tick` is called by the IC timer every `BASE_TICK_SECS` seconds.
+/// Each tick performs three main duties:
+///
+/// 1. **Lease recovery** — stale mutating leases (jobs that crashed without
+///    releasing their lock) are reclaimed so the queue can continue.
+/// 2. **Job materialisation** (`refresh_due_jobs`) — for every enabled
+///    `TaskKind`, a pending job is enqueued into the mutating lane when the
+///    task's `next_due_ns` is in the past.
+/// 3. **Job dispatch** — up to `MAX_MUTATING_JOBS_PER_TICK` pending jobs are
+///    popped, individually lease-gated, survival-policy checked, dispatched,
+///    and their outcomes persisted before the next job is attempted.
+///
+/// # Task kinds
+///
+/// | Kind            | Survival gate | Lease TTL             |
+/// |-----------------|---------------|-----------------------|
+/// | `AgentTurn`     | Inference     | `AGENT_TURN_LEASE_TTL_NS` |
+/// | `PollInbox`     | EvmPoll       | `LIGHTWEIGHT_LEASE_TTL_NS` |
+/// | `CheckCycles`   | —             | `LIGHTWEIGHT_LEASE_TTL_NS` |
+/// | `TopUpCycles`   | —             | `LIGHTWEIGHT_LEASE_TTL_NS` |
+/// | `Reconcile`     | —             | `LIGHTWEIGHT_LEASE_TTL_NS` |
+///
+/// Failed jobs are passed through the recovery policy, which may retry
+/// immediately, apply exponential backoff, tune response-byte limits, or
+/// escalate to a fault.
 use crate::agent::run_scheduled_turn_job;
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford_with_reserve, estimate_operation_cost,
@@ -9,6 +36,7 @@ use crate::domain::types::{
     EvmEvent, JobStatus, OperationFailure, OperationFailureKind, RecoveryContext, RecoveryFailure,
     RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy,
     RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TemplateActivationState, TemplateStatus,
 };
 use crate::features::cycle_topup::{
     TopUpStage, TOPUP_MIN_OPERATIONAL_CYCLES, TOPUP_MIN_USDC_AVAILABLE_RAW,
@@ -22,38 +50,56 @@ use crate::features::evm::{
 use crate::features::inference::classify_inference_failure;
 use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
+use crate::timing::{self, current_time_ns};
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde_json::json;
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum inbox messages promoted from pending → staged in one `PollInbox` job.
 const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
+
+/// Reference workflow-envelope cost (cycles) used by `CheckCycles` to
+/// estimate the minimum operational floor.
 const CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES: u128 = 5_000_000_000;
+
+/// Liquid-cycles multiple of the critical floor that triggers `LowCycles` tier.
+/// A canister with fewer than `required × 15` liquid cycles is classified low.
 const CHECKCYCLES_LOW_TIER_MULTIPLIER: u128 = 15;
+
+/// Maximum number of mutating jobs dispatched per scheduler tick.
+/// Prevents a single tick from dominating the IC message queue.
 const MAX_MUTATING_JOBS_PER_TICK: u8 = 4;
-const EMPTY_POLL_BACKOFF_SCHEDULE_SECS: &[u64] = &[60, 120, 240, 600];
+
+/// Upper bound for the EVM RPC `max_response_bytes` tuning policy.
 const EVM_RPC_MAX_RESPONSE_BYTES_POLICY_MAX: u64 = 2 * 1024 * 1024;
+
+/// Lower bound for any response-bytes tuning policy (both EVM and wallet sync).
 const RESPONSE_BYTES_POLICY_MIN: u64 = 256;
+
+/// Base interval (seconds) for exponential backoff on job failures.
 const RECOVERY_BACKOFF_BASE_SECS: u64 = 1;
+
+/// Upper bound for the wallet-balance sync `max_response_bytes` tuning policy.
 const WALLET_SYNC_MAX_RESPONSE_BYTES_RECOVERY_MAX: u64 = 4 * 1024;
+
+/// Minimum wait (seconds) before a failed top-up is automatically retried.
 const TOPUP_FAILED_RECOVERY_BACKOFF_SECS: u64 = 120;
 
+/// Maximum number of strategy templates iterated per `Reconcile` job.
+const STRATEGY_RECONCILE_MAX_TEMPLATES: usize = 200;
+
+/// Templates older than this window (14 days) are disabled by the reconciler.
+const STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
+
+// ── Log types ────────────────────────────────────────────────────────────────
+
+/// Outcome returned by `dispatch_job` to indicate whether a `TopUpCycles` job
+/// needs a follow-up continuation (multi-stage top-up still in progress).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JobDispatchOutcome {
     Completed,
     TopUpWaiting,
-}
-
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
 }
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
@@ -70,6 +116,18 @@ impl GetLogFilter for SchedulerLogPriority {
     }
 }
 
+// ── Tick entry point ─────────────────────────────────────────────────────────
+
+/// Main scheduler heartbeat, invoked by the IC timer every `BASE_TICK_SECS`.
+///
+/// Sequence:
+/// 1. Record tick start timestamp.
+/// 2. Recover any stale mutating leases.
+/// 3. Return early (no-op) if the scheduler is disabled.
+/// 4. Materialise due jobs via `refresh_due_jobs`.
+/// 5. Dispatch up to `MAX_MUTATING_JOBS_PER_TICK` pending jobs.
+/// 6. Run retention maintenance if its interval has elapsed.
+/// 7. Refresh HTTP certification state.
 pub async fn scheduler_tick() {
     let now_ns = current_time_ns();
     stable::record_scheduler_tick_start(now_ns);
@@ -87,6 +145,7 @@ pub async fn scheduler_tick() {
             "scheduler_tick_end disabled now={now_ns}"
         );
         stable::record_scheduler_tick_end(now_ns, None);
+        crate::http::init_certification();
         return;
     }
 
@@ -129,8 +188,16 @@ pub async fn scheduler_tick() {
         current_time_ns()
     );
     stable::record_scheduler_tick_end(current_time_ns(), terminal_error);
+    crate::http::init_certification();
 }
 
+// ── Job dispatch ─────────────────────────────────────────────────────────────
+
+/// Pops the next pending mutating job, acquires its lease, checks the survival
+/// policy, dispatches it, and applies the recovery policy on failure.
+///
+/// Returns `Ok(true)` if a job was processed, `Ok(false)` if the queue is empty
+/// or a mutating lease is already active, and `Err` on a terminal lease error.
 async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
     if stable::mutating_lease_active(now_ns) {
         log!(
@@ -204,6 +271,7 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Routes a job to the appropriate handler based on its `TaskKind`.
 async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> {
     match job.kind {
         TaskKind::AgentTurn => {
@@ -228,10 +296,101 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> 
                 Ok(JobDispatchOutcome::TopUpWaiting)
             }
         }
-        TaskKind::Reconcile => Ok(JobDispatchOutcome::Completed),
+        TaskKind::Reconcile => {
+            run_reconcile_job(current_time_ns())?;
+            Ok(JobDispatchOutcome::Completed)
+        }
     }
 }
 
+/// Runs the strategy reconciliation job: iterates registered templates, disabling
+/// stale or provenance-failed entries and activating those that pass the canary probe.
+fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
+    let templates = crate::strategy::registry::list_all_templates(STRATEGY_RECONCILE_MAX_TEMPLATES);
+    if templates.is_empty() {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_reconcile_strategy empty=true"
+        );
+        return Ok(());
+    }
+
+    let mut stale_disabled = 0u32;
+    let mut provenance_disabled = 0u32;
+    let mut canary_activated = 0u32;
+
+    for template in templates {
+        let key = template.key.clone();
+        let version = template.version.clone();
+
+        let age_secs = if now_ns >= template.updated_at_ns {
+            now_ns
+                .saturating_sub(template.updated_at_ns)
+                .checked_div(1_000_000_000)
+                .unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        if age_secs > STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS {
+            let _ = stable::set_strategy_template_activation(TemplateActivationState {
+                key: key.clone(),
+                version: version.clone(),
+                enabled: false,
+                updated_at_ns: now_ns,
+                reason: Some(format!(
+                    "stale_template age_secs={age_secs} freshness_window_secs={STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS}"
+                )),
+            });
+            stale_disabled = stale_disabled.saturating_add(1);
+            continue;
+        }
+
+        if let Err(error) = crate::strategy::registry::canary_probe_template(&key, &version) {
+            let _ = stable::set_strategy_template_activation(TemplateActivationState {
+                key: key.clone(),
+                version: version.clone(),
+                enabled: false,
+                updated_at_ns: now_ns,
+                reason: Some(format!("provenance_or_canary_failed: {error}")),
+            });
+            provenance_disabled = provenance_disabled.saturating_add(1);
+            continue;
+        }
+
+        if !matches!(template.status, TemplateStatus::Active) {
+            continue;
+        }
+        let currently_enabled = stable::strategy_template_activation(&key, &version)
+            .map(|state| state.enabled)
+            .unwrap_or(false);
+        if currently_enabled {
+            continue;
+        }
+
+        stable::set_strategy_template_activation(TemplateActivationState {
+            key,
+            version,
+            enabled: true,
+            updated_at_ns: now_ns,
+            reason: Some("scheduler canary probe passed".to_string()),
+        })?;
+        canary_activated = canary_activated.saturating_add(1);
+    }
+
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_reconcile_strategy stale_disabled={} provenance_disabled={} canary_activated={}",
+        stale_disabled,
+        provenance_disabled,
+        canary_activated
+    );
+
+    Ok(())
+}
+
+/// If `outcome` is `TopUpWaiting`, enqueues a continuation `TopUpCycles` job
+/// scheduled one task-interval into the future so the multi-stage top-up
+/// resumes on the next eligible tick.
 fn maybe_enqueue_topup_waiting_continuation(outcome: JobDispatchOutcome, now_ns: u64) {
     if !matches!(outcome, JobDispatchOutcome::TopUpWaiting) {
         return;
@@ -250,6 +409,10 @@ fn maybe_enqueue_topup_waiting_continuation(outcome: JobDispatchOutcome, now_ns:
     );
 }
 
+// ── Survival policy helpers ───────────────────────────────────────────────────
+
+/// Maps a task kind + error string to a `RecoveryFailure` classification used
+/// by the recovery policy to decide the appropriate action.
 fn classify_failure_for_task(kind: &TaskKind, error: &str) -> RecoveryFailure {
     match kind {
         TaskKind::AgentTurn => classify_inference_failure(error),
@@ -262,6 +425,7 @@ fn classify_failure_for_task(kind: &TaskKind, error: &str) -> RecoveryFailure {
     }
 }
 
+/// Maps a task kind to the `RecoveryOperation` tag used in recovery contexts.
 fn recovery_operation_for_task(kind: &TaskKind) -> RecoveryOperation {
     match kind {
         TaskKind::AgentTurn => RecoveryOperation::Inference,
@@ -272,6 +436,8 @@ fn recovery_operation_for_task(kind: &TaskKind) -> RecoveryOperation {
     }
 }
 
+/// Builds a `RecoveryContext` for `job`, pulling consecutive-failure counters,
+/// backoff caps, and response-limit policies from stable storage.
 fn recovery_context_for_task_job(job: &ScheduledJob) -> RecoveryContext {
     let task_runtime = stable::get_task_runtime(&job.kind);
     let task_config = stable::get_task_config(&job.kind)
@@ -298,6 +464,8 @@ fn recovery_context_for_task_job(job: &ScheduledJob) -> RecoveryContext {
     }
 }
 
+/// Applies a `ResponseLimitAdjustment` for `operation` by persisting the new
+/// `max_response_bytes` to stable storage.
 fn apply_response_limit_tuning(
     operation: &RecoveryOperation,
     adjustment: &ResponseLimitAdjustment,
@@ -315,6 +483,9 @@ fn apply_response_limit_tuning(
     }
 }
 
+/// Runs the full recovery policy pipeline for a failed job: classifies the
+/// failure, decides the action (skip / retry-immediate / backoff / tune
+/// response-limit / escalate), and completes the job record accordingly.
 fn apply_recovery_policy_for_failed_job(job: &ScheduledJob, error: String, now_ns: u64) {
     let failure = classify_failure_for_task(&job.kind, &error);
     let context = recovery_context_for_task_job(job);
@@ -366,6 +537,9 @@ fn apply_recovery_policy_for_failed_job(job: &ScheduledJob, error: String, now_n
     stable::complete_job(&job.id, status, Some(final_error), now_ns, retry_after_secs);
 }
 
+// ── Recovery ─────────────────────────────────────────────────────────────────
+
+/// Serialises an `EvmEvent` as a JSON fallback body when ABI decoding fails.
 fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
     json!({
         "source": "evm_log",
@@ -379,6 +553,8 @@ fn evm_event_to_inbox_body(event: &EvmEvent) -> String {
     .to_string()
 }
 
+/// Decodes an `EvmEvent` into an `(inbox_body, sender)` pair.
+/// Falls back to the raw JSON envelope when ABI decoding fails.
 fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
     match decode_message_queued_payload(&event.payload) {
         Ok(decoded) => {
@@ -401,15 +577,26 @@ fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
     }
 }
 
+/// Returns the minimum delay in nanoseconds before the next EVM poll, based on
+/// the number of consecutive empty polls and the `EMPTY_POLL_BACKOFF_SCHEDULE_SECS`.
 fn empty_poll_backoff_delay_ns(consecutive_empty_polls: u32) -> u64 {
-    let idx = usize::try_from(consecutive_empty_polls).unwrap_or(usize::MAX);
-    let secs = EMPTY_POLL_BACKOFF_SCHEDULE_SECS
+    // Use the first backoff slot for both "no empties yet" and "first empty poll observed".
+    // This keeps the first empty-poll retry window at 60s instead of jumping to 120s.
+    let schedule_idx = consecutive_empty_polls.saturating_sub(1);
+    let idx = usize::try_from(schedule_idx).unwrap_or(usize::MAX);
+    let secs = timing::EMPTY_POLL_BACKOFF_SCHEDULE_SECS
         .get(idx)
         .copied()
-        .unwrap_or(*EMPTY_POLL_BACKOFF_SCHEDULE_SECS.last().unwrap_or(&300));
+        .unwrap_or(
+            *timing::EMPTY_POLL_BACKOFF_SCHEDULE_SECS
+                .last()
+                .unwrap_or(&300),
+        );
     secs.saturating_mul(1_000_000_000)
 }
 
+/// Returns `true` when enough time has elapsed since `last_poll_at_ns` given
+/// the current empty-poll backoff level.
 fn poll_inbox_rpc_due(now_ns: u64, last_poll_at_ns: u64, consecutive_empty_polls: u32) -> bool {
     if last_poll_at_ns == 0 {
         return true;
@@ -418,6 +605,8 @@ fn poll_inbox_rpc_due(now_ns: u64, last_poll_at_ns: u64, consecutive_empty_polls
     now_ns >= last_poll_at_ns.saturating_add(min_delay_ns)
 }
 
+/// Returns the wallet-balance sync interval for the current survival tier,
+/// or `None` if syncing is disabled or the tier prohibits it (Critical / OutOfCycles).
 fn wallet_balance_sync_interval_secs(
     snapshot: &RuntimeSnapshot,
     tier: &SurvivalTier,
@@ -433,6 +622,9 @@ fn wallet_balance_sync_interval_secs(
     }
 }
 
+/// Returns `true` when a wallet balance sync should be attempted now —
+/// either because the bootstrap gate is pending or because the freshness
+/// interval has elapsed since the last successful sync.
 fn wallet_balance_sync_due(snapshot: &RuntimeSnapshot, now_ns: u64, interval_secs: u64) -> bool {
     if snapshot.wallet_balance_bootstrap_pending {
         return true;
@@ -445,6 +637,8 @@ fn wallet_balance_sync_due(snapshot: &RuntimeSnapshot, now_ns: u64, interval_sec
     now_ns >= last_synced_at_ns.saturating_add(due_ns)
 }
 
+/// Builds a `RecoveryContext` for wallet-balance sync failures, wiring in
+/// the current `max_response_bytes` and the sync-specific backoff cap.
 fn wallet_sync_recovery_context(snapshot: &RuntimeSnapshot) -> RecoveryContext {
     let consecutive_failures = u32::from(snapshot.wallet_balance.last_error.is_some());
     RecoveryContext {
@@ -461,6 +655,12 @@ fn wallet_sync_recovery_context(snapshot: &RuntimeSnapshot) -> RecoveryContext {
     }
 }
 
+/// Conditionally fetches and persists the latest wallet balances.
+///
+/// Skips when syncing is disabled, the canister is on a Critical/OutOfCycles
+/// tier, the required address routes are not yet configured, or the freshness
+/// interval has not elapsed.  On failure, applies the sync recovery policy
+/// (response-limit tuning / immediate retry) before persisting the error.
 async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
     let tier = stable::scheduler_survival_tier();
     let Some(interval_secs) = wallet_balance_sync_interval_secs(snapshot, &tier) else {
@@ -620,6 +820,9 @@ async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
     }
 }
 
+/// Executes the `PollInbox` job: polls the EVM inbox contract for new
+/// `MessageQueued` events, ingests them as inbox messages, advances the cursor,
+/// then calls `maybe_sync_wallet_balances` and stages any pending messages.
 async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
     let mut fetched_events = 0usize;
@@ -711,6 +914,9 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Executes the `CheckCycles` job: reads the canister cycle balances, classifies
+/// the survival tier, persists it, and — when conditions are met — triggers or
+/// recovers an automated cycle top-up.
 async fn run_check_cycles() -> Result<(), String> {
     let now_ns = current_time_ns();
     let total_cycles = ic_cdk::api::canister_cycle_balance();
@@ -782,6 +988,8 @@ async fn run_check_cycles() -> Result<(), String> {
     Ok(())
 }
 
+/// Parses an optional hex string (with or without `0x` prefix) into a `u64`.
+/// Returns `None` when the input is absent or unparseable.
 fn parse_hex_quantity_u64(raw: Option<&str>) -> Option<u64> {
     let raw = raw?;
     let normalized = raw.trim();
@@ -795,10 +1003,14 @@ fn parse_hex_quantity_u64(raw: Option<&str>) -> Option<u64> {
     u64::from_str_radix(without_prefix, 16).ok()
 }
 
+/// Returns `true` when the top-up state machine is idle (no stage in progress),
+/// allowing a new automated top-up to be started.
 fn topup_state_allows_auto_start(state: Option<&TopUpStage>) -> bool {
     matches!(state, None | Some(TopUpStage::Completed { .. }))
 }
 
+/// Returns `true` when the top-up is in a `Failed` state and the
+/// `TOPUP_FAILED_RECOVERY_BACKOFF_SECS` window has elapsed since failure.
 fn topup_failed_recovery_due(state: Option<&TopUpStage>, now_ns: u64) -> bool {
     let Some(TopUpStage::Failed { failed_at_ns, .. }) = state else {
         return false;
@@ -807,6 +1019,9 @@ fn topup_failed_recovery_due(state: Option<&TopUpStage>, now_ns: u64) -> bool {
     now_ns >= failed_at_ns.saturating_add(backoff_ns)
 }
 
+/// Attempts to recover a failed top-up if the backoff window has passed.
+/// Resets the state machine, re-starts the top-up, and enqueues a
+/// continuation job.  Returns `true` on a successful recovery start.
 fn maybe_recover_failed_topup(
     snapshot: &RuntimeSnapshot,
     topup_state: Option<&TopUpStage>,
@@ -873,6 +1088,9 @@ fn maybe_recover_failed_topup(
     true
 }
 
+/// Returns `true` when all conditions for an automated cycle top-up are met:
+/// top-up is enabled, cycles are below the threshold but above the operational
+/// floor, no top-up is already in progress, and the USDC balance is sufficient.
 fn should_trigger_cycle_topup(
     total_cycles: u128,
     snapshot: &RuntimeSnapshot,
@@ -899,6 +1117,8 @@ fn should_trigger_cycle_topup(
     cached_usdc_balance_raw.unwrap_or_default() >= min_required
 }
 
+/// Computes the minimum cycles required to sustain one workflow envelope,
+/// used as the affordability baseline by `classify_survival_tier`.
 fn check_cycles_requirements() -> Result<AffordabilityRequirements, String> {
     let operation_cost = estimate_operation_cost(&OperationClass::WorkflowEnvelope {
         envelope_cycles: CHECKCYCLES_REFERENCE_ENVELOPE_CYCLES,
@@ -910,6 +1130,9 @@ fn check_cycles_requirements() -> Result<AffordabilityRequirements, String> {
     ))
 }
 
+/// Classifies the current canister into `Critical`, `LowCycles`, or `Normal`
+/// based on whether liquid cycles satisfy the reserve floor and the low-tier
+/// multiplier threshold.
 fn classify_survival_tier(total_cycles: u128, liquid_cycles: u128) -> Result<SurvivalTier, String> {
     let can_cover_critical_floor = can_afford_with_reserve(
         total_cycles,
@@ -938,6 +1161,14 @@ fn classify_survival_tier(total_cycles: u128, liquid_cycles: u128) -> Result<Sur
     Ok(SurvivalTier::Normal)
 }
 
+// ── Lease helpers ────────────────────────────────────────────────────────────
+
+/// Materialises pending jobs for every enabled task whose `next_due_ns` has
+/// elapsed, using slot-aligned dedupe keys to prevent duplicate enqueuing.
+///
+/// After enqueuing, `next_due_ns` is advanced by one interval — but never
+/// placed before the current slot start — to avoid bursty catch-up when the
+/// canister is behind wall-clock time.
 pub fn refresh_due_jobs(now_ns: u64) {
     let mut schedules = stable::list_task_configs();
     schedules.sort_by_key(|(_kind, config)| (config.priority, config.kind.as_str().to_string()));
@@ -998,6 +1229,8 @@ pub fn refresh_due_jobs(now_ns: u64) {
     }
 }
 
+/// Returns the `SurvivalOperationClass` that gates execution of `kind`, or
+/// `None` for tasks that are not gated by the survival policy.
 fn operation_class_for_task(kind: &TaskKind) -> Option<SurvivalOperationClass> {
     match kind {
         TaskKind::AgentTurn => Some(SurvivalOperationClass::Inference),
@@ -1006,13 +1239,13 @@ fn operation_class_for_task(kind: &TaskKind) -> Option<SurvivalOperationClass> {
     }
 }
 
+/// Returns the lease TTL in nanoseconds for `kind`.
+/// Agent turns use the extended TTL to accommodate multi-round inference;
+/// all other tasks use the lightweight TTL.
 fn lease_ttl_ns(kind: &TaskKind) -> u64 {
     match kind {
-        TaskKind::AgentTurn => 240_000_000_000,
-        TaskKind::PollInbox => 60_000_000_000,
-        TaskKind::CheckCycles => 60_000_000_000,
-        TaskKind::TopUpCycles => 60_000_000_000,
-        TaskKind::Reconcile => 60_000_000_000,
+        TaskKind::AgentTurn => timing::AGENT_TURN_LEASE_TTL_NS,
+        _ => timing::LIGHTWEIGHT_LEASE_TTL_NS,
     }
 }
 
@@ -1020,9 +1253,11 @@ fn lease_ttl_ns(kind: &TaskKind) -> u64 {
 mod tests {
     use super::*;
     use crate::domain::types::{
+        AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding,
         EvmEvent, RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment,
-        RetentionConfig, SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime,
-        WalletBalanceSnapshot, WalletBalanceSyncConfig,
+        RetentionConfig, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
+        TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateStatus,
+        TemplateVersion, WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
     use crate::storage::stable;
     use std::future::Future;
@@ -1092,6 +1327,99 @@ mod tests {
         config.essential = true;
         config.priority = 0;
         stable::upsert_task_config(config);
+    }
+
+    fn strategy_key(template_id: &str) -> StrategyTemplateKey {
+        StrategyTemplateKey {
+            protocol: "erc20".to_string(),
+            primitive: "transfer".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        }
+    }
+
+    fn strategy_version() -> TemplateVersion {
+        TemplateVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        }
+    }
+
+    fn seed_strategy_for_reconcile(
+        template_id: &str,
+        updated_at_ns: u64,
+        call_selector_hex: &str,
+        status: TemplateStatus,
+        activation_enabled: bool,
+    ) {
+        let key = strategy_key(template_id);
+        let version = strategy_version();
+        let function = AbiFunctionSpec {
+            role: "token".to_string(),
+            name: "transfer".to_string(),
+            selector_hex: call_selector_hex.to_string(),
+            inputs: vec![
+                AbiTypeSpec {
+                    kind: "address".to_string(),
+                    components: Vec::new(),
+                },
+                AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: Vec::new(),
+                },
+            ],
+            outputs: vec![AbiTypeSpec {
+                kind: "bool".to_string(),
+                components: Vec::new(),
+            }],
+            state_mutability: "nonpayable".to_string(),
+        };
+        crate::strategy::registry::upsert_template(StrategyTemplate {
+            key: key.clone(),
+            version: version.clone(),
+            status,
+            contract_roles: vec![ContractRoleBinding {
+                role: "token".to_string(),
+                address: "0x2222222222222222222222222222222222222222".to_string(),
+                source_ref: "https://example.com/token-address".to_string(),
+                codehash: None,
+            }],
+            actions: vec![ActionSpec {
+                action_id: "transfer".to_string(),
+                call_sequence: vec![function.clone()],
+                preconditions: vec!["allowance_ok".to_string()],
+                postconditions: vec!["balance_delta_positive".to_string()],
+                risk_checks: vec!["max_notional".to_string()],
+            }],
+            constraints_json: "{}".to_string(),
+            created_at_ns: updated_at_ns,
+            updated_at_ns,
+        })
+        .expect("template should persist");
+        crate::strategy::registry::upsert_abi_artifact(AbiArtifact {
+            key: AbiArtifactKey {
+                protocol: key.protocol.clone(),
+                chain_id: key.chain_id,
+                role: "token".to_string(),
+                version: version.clone(),
+            },
+            source_ref: "https://example.com/token-abi".to_string(),
+            codehash: None,
+            abi_json: "[]".to_string(),
+            functions: vec![function],
+            created_at_ns: updated_at_ns,
+            updated_at_ns,
+        })
+        .expect("abi should persist");
+        crate::strategy::registry::set_activation(TemplateActivationState {
+            key,
+            version,
+            enabled: activation_enabled,
+            updated_at_ns,
+            reason: Some("seed".to_string()),
+        })
+        .expect("activation should persist");
     }
 
     fn encode_message_queued_payload_for_test(
@@ -1607,11 +1935,26 @@ mod tests {
 
     #[test]
     fn lease_ttl_for_agent_turn_is_extended_for_continuation_rounds() {
-        assert_eq!(lease_ttl_ns(&TaskKind::AgentTurn), 240_000_000_000);
-        assert_eq!(lease_ttl_ns(&TaskKind::PollInbox), 60_000_000_000);
-        assert_eq!(lease_ttl_ns(&TaskKind::CheckCycles), 60_000_000_000);
-        assert_eq!(lease_ttl_ns(&TaskKind::TopUpCycles), 60_000_000_000);
-        assert_eq!(lease_ttl_ns(&TaskKind::Reconcile), 60_000_000_000);
+        assert_eq!(
+            lease_ttl_ns(&TaskKind::AgentTurn),
+            timing::AGENT_TURN_LEASE_TTL_NS
+        );
+        assert_eq!(
+            lease_ttl_ns(&TaskKind::PollInbox),
+            timing::LIGHTWEIGHT_LEASE_TTL_NS
+        );
+        assert_eq!(
+            lease_ttl_ns(&TaskKind::CheckCycles),
+            timing::LIGHTWEIGHT_LEASE_TTL_NS
+        );
+        assert_eq!(
+            lease_ttl_ns(&TaskKind::TopUpCycles),
+            timing::LIGHTWEIGHT_LEASE_TTL_NS
+        );
+        assert_eq!(
+            lease_ttl_ns(&TaskKind::Reconcile),
+            timing::LIGHTWEIGHT_LEASE_TTL_NS
+        );
     }
 
     #[test]
@@ -1735,6 +2078,128 @@ mod tests {
             .expect("reconcile job should be present");
         assert_eq!(poll.status, JobStatus::Succeeded);
         assert_eq!(reconcile.status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn reconcile_job_activates_template_when_canary_passes() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        seed_strategy_for_reconcile(
+            "reconcile-activate",
+            current_time_ns(),
+            "0xa9059cbb",
+            TemplateStatus::Active,
+            false,
+        );
+
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:strategy-activate".to_string(),
+            0,
+            0,
+        );
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+        block_on_with_spin(scheduler_tick());
+
+        let activation = crate::strategy::registry::activation(
+            &strategy_key("reconcile-activate"),
+            &strategy_version(),
+        )
+        .expect("activation should exist");
+        assert!(activation.enabled);
+        assert!(activation
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("canary"));
+    }
+
+    #[test]
+    fn reconcile_job_disables_stale_template_activation() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        let stale_updated_at_ns = current_time_ns().saturating_sub(
+            STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS
+                .saturating_add(1)
+                .saturating_mul(1_000_000_000),
+        );
+        seed_strategy_for_reconcile(
+            "reconcile-stale",
+            stale_updated_at_ns,
+            "0xa9059cbb",
+            TemplateStatus::Active,
+            true,
+        );
+
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:strategy-stale".to_string(),
+            0,
+            0,
+        );
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+        block_on_with_spin(scheduler_tick());
+
+        let activation = crate::strategy::registry::activation(
+            &strategy_key("reconcile-stale"),
+            &strategy_version(),
+        )
+        .expect("activation should exist");
+        assert!(!activation.enabled);
+        assert!(activation
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stale_template"));
+    }
+
+    #[test]
+    fn reconcile_job_disables_activation_when_provenance_fails() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        seed_strategy_for_reconcile(
+            "reconcile-provenance",
+            current_time_ns(),
+            "0xdeadbeef",
+            TemplateStatus::Active,
+            true,
+        );
+
+        let reconcile_job = stable::enqueue_job_if_absent(
+            TaskKind::Reconcile,
+            TaskLane::Mutating,
+            "Reconcile:strategy-provenance".to_string(),
+            0,
+            0,
+        );
+        assert!(reconcile_job.is_some(), "reconcile job should enqueue");
+        block_on_with_spin(scheduler_tick());
+
+        let activation = crate::strategy::registry::activation(
+            &strategy_key("reconcile-provenance"),
+            &strategy_version(),
+        )
+        .expect("activation should exist");
+        assert!(!activation.enabled);
+        assert!(activation
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provenance_or_canary_failed"));
     }
 
     #[test]
@@ -1950,11 +2415,14 @@ mod tests {
         .expect("inbox contract should be configurable");
 
         let now_ns = 500_000_000_000u64;
+        // Gap must be shorter than the backoff for consecutive_empty_polls=2.
+        // Backoff index 1 = BASE_TICK_SECS * 4 seconds.
+        let gap_ns = 1_000_000_000u64; // 1 second — well within any backoff window
         stable::set_evm_cursor(&crate::domain::types::EvmPollCursor {
             chain_id: 8453,
             next_block: 10,
             next_log_index: 0,
-            last_poll_at_ns: now_ns.saturating_sub(30_000_000_000),
+            last_poll_at_ns: now_ns.saturating_sub(gap_ns),
             consecutive_empty_polls: 2,
             ..crate::domain::types::EvmPollCursor::default()
         });
@@ -1967,7 +2435,7 @@ mod tests {
         );
         assert_eq!(
             after.last_poll_at_ns,
-            now_ns.saturating_sub(30_000_000_000),
+            now_ns.saturating_sub(gap_ns),
             "last poll timestamp must stay unchanged when skipping rpc outcall"
         );
     }

@@ -1,3 +1,29 @@
+/// Agent turn execution loop.
+///
+/// This module owns the full lifecycle of a single scheduled agent turn: state
+/// machine entry, inference, tool execution, continuation (multi-round
+/// inference-tool interleave), result persistence, and final state transition.
+///
+/// A "turn" is the unit of autonomous work the agent performs each time the
+/// scheduler fires `AgentTurn`.  Turns are non-reentrant — the `turn_in_flight`
+/// flag in stable storage prevents overlapping execution.
+///
+/// # Turn phases
+///
+/// 1. **Guard checks** — skip immediately if the loop is disabled, a turn is
+///    already in-flight, or the wallet-balance bootstrap gate is pending.
+/// 2. **State machine advance** — `TimerTick` → `EvmPollCompleted` transitions
+///    validate the runtime state before any I/O occurs.
+/// 3. **Context build** — dynamic context (balances, inbox, memory, …) is
+///    assembled and forwarded to the inference provider.
+/// 4. **Continuation loop** — up to `MAX_INFERENCE_ROUNDS_PER_TURN` rounds of
+///    inference + tool execution, bounded by wall-clock (`AGENT_TURN_BUDGET_SECS`)
+///    and a per-turn tool cap (`MAX_TOOL_CALLS_PER_TURN`).
+/// 5. **Persist & reply** — turn record, tool records, outbox reply (if inbox
+///    messages were consumed), and conversation log entries are written atomically.
+/// 6. **Autonomy dedupe** — on turns with no external input, successful tool
+///    calls are fingerprinted and suppressed within `AUTONOMY_DEDUPE_WINDOW_NS`
+///    to avoid redundant work across back-to-back ticks.
 use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, ContinuationStopReason, ConversationEntry, InboxMessage,
@@ -18,12 +44,25 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeSet;
 
-const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 60 * 60;
-const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
-const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 5;
-const MAX_AGENT_TURN_DURATION_NS: u64 = 90 * 1_000_000_000;
+use crate::timing::{self, current_time_ns};
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum number of inference → tool-execution rounds per turn.
+/// Aligns with the default autonomy policy; validated by a test assertion.
+const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 10;
+
+/// Hard cap on tool calls accumulated across all rounds of a single turn.
 const MAX_TOOL_CALLS_PER_TURN: usize = 12;
+/// Maximum staged inbox messages consumed in one turn.
+/// This preserves one-message-one-reply semantics.
+const MAX_STAGED_INBOX_MESSAGES_PER_TURN: usize = 1;
+
+/// Human-readable reason stored in synthetic tool records when a call is
+/// suppressed by the autonomy deduplication window.
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
+
+// ── Log types ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, LogPriorityLevels)]
 enum AgentLogPriority {
@@ -39,20 +78,9 @@ impl GetLogFilter for AgentLogPriority {
     }
 }
 
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
+// ── Turn helpers ─────────────────────────────────────────────────────────────
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
-}
-
+/// Returns the total canister cycle balance, or `None` in non-wasm builds.
 fn current_cycle_balance() -> Option<u128> {
     #[cfg(target_arch = "wasm32")]
     return Some(ic_cdk::api::canister_cycle_balance());
@@ -63,6 +91,7 @@ fn current_cycle_balance() -> Option<u128> {
     }
 }
 
+/// Returns the liquid (spendable) cycle balance, or `None` in non-wasm builds.
 fn current_liquid_cycle_balance() -> Option<u128> {
     #[cfg(target_arch = "wasm32")]
     return Some(ic_cdk::api::canister_liquid_cycle_balance());
@@ -73,6 +102,63 @@ fn current_liquid_cycle_balance() -> Option<u128> {
     }
 }
 
+/// Parses a hex quantity string and formats it as a decimal value with `decimals`
+/// fractional digits, trimming trailing zeroes without floating-point rounding.
+fn format_hex_quantity_with_decimals(hex_quantity: Option<&str>, decimals: usize) -> String {
+    let Some(raw) = hex_quantity
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return "unknown".to_string();
+    };
+    let without_prefix = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    if without_prefix.is_empty() {
+        return "unknown".to_string();
+    }
+    let Ok(quantity) = U256::from_str_radix(without_prefix, 16) else {
+        return "unknown".to_string();
+    };
+    format_decimal_units(quantity, decimals)
+}
+
+fn format_decimal_units(value: U256, decimals: usize) -> String {
+    if decimals == 0 {
+        return value.to_string();
+    }
+
+    let digits = value.to_string();
+    if digits == "0" {
+        return "0".to_string();
+    }
+
+    if digits.len() <= decimals {
+        let mut fractional = String::with_capacity(decimals);
+        fractional.push_str(&"0".repeat(decimals.saturating_sub(digits.len())));
+        fractional.push_str(&digits);
+        let trimmed = fractional.trim_end_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            format!("0.{trimmed}")
+        }
+    } else {
+        let whole_len = digits.len().saturating_sub(decimals);
+        let whole = &digits[..whole_len];
+        let fractional = &digits[whole_len..];
+        let trimmed = fractional.trim_end_matches('0');
+        if trimmed.is_empty() {
+            whole.to_string()
+        } else {
+            format!("{whole}.{trimmed}")
+        }
+    }
+}
+
+/// Collapses whitespace and truncates `text` to `max_chars` characters,
+/// appending `"..."` when truncation occurs.
 fn sanitize_preview(text: &str, max_chars: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
@@ -83,60 +169,9 @@ fn sanitize_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn parse_hex_quantity_u256(raw: &str) -> Option<U256> {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with("0x") {
-        return None;
-    }
-    let digits = trimmed.trim_start_matches("0x");
-    if digits.is_empty() {
-        return Some(U256::ZERO);
-    }
-    U256::from_str_radix(digits, 16).ok()
-}
-
-fn format_wei_as_eth(wei: U256) -> String {
-    let one_eth = U256::from(1_000_000_000_000_000_000u128);
-    let whole = wei / one_eth;
-    let remainder = wei % one_eth;
-    if remainder.is_zero() {
-        return whole.to_string();
-    }
-
-    let mut frac = format!("{:018}", remainder);
-    while frac.ends_with('0') {
-        frac.pop();
-    }
-    format!("{whole}.{frac}")
-}
-
-fn summarize_eth_balance_call(call: &ToolCallRecord) -> Option<String> {
-    if !call.success || call.tool != "evm_read" {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&call.args_json).ok()?;
-    let method = args.get("method")?.as_str()?;
-    if method != "eth_getBalance" {
-        return None;
-    }
-
-    let address = args
-        .get("address")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let balance_hex = call.output.trim();
-    let balance_wei = parse_hex_quantity_u256(balance_hex)?;
-    let balance_eth = format_wei_as_eth(balance_wei);
-    Some(format!(
-        "balance `{address}` = `{balance_hex}` wei ({balance_eth} ETH)"
-    ))
-}
-
+/// Formats a single tool call record as a one-line summary for the inner dialogue.
 fn summarize_tool_call(call: &ToolCallRecord) -> String {
     if call.success {
-        if let Some(balance_summary) = summarize_eth_balance_call(call) {
-            return balance_summary;
-        }
         let output = sanitize_preview(call.output.trim(), 220);
         if output.is_empty() {
             return format!("`{}`: ok", call.tool);
@@ -168,6 +203,8 @@ fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Normalises a tool-call args string to canonical JSON so that fingerprints
+/// are stable regardless of key ordering or whitespace in the original payload.
 fn canonical_tool_args_json(args_json: &str) -> String {
     let trimmed = args_json.trim();
     if trimmed.is_empty() {
@@ -181,6 +218,7 @@ fn canonical_tool_args_json(args_json: &str) -> String {
     trimmed.to_string()
 }
 
+/// Computes a Keccak-256 fingerprint of `tool:canonical_args` for deduplication.
 fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
     let canonical_args = canonical_tool_args_json(args_json);
     let mut hasher = Keccak256::new();
@@ -190,6 +228,11 @@ fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Partitions `calls` into an allowed set and a suppressed set.
+///
+/// A call is suppressed when an identical call (same fingerprint) succeeded
+/// within `AUTONOMY_DEDUPE_WINDOW_NS` of `now_ns`.  Only applied on autonomy
+/// ticks — turns driven by external input always execute all planned calls.
 fn suppress_duplicate_autonomy_tool_calls(
     calls: &[ToolCall],
     now_ns: u64,
@@ -205,7 +248,7 @@ fn suppress_duplicate_autonomy_tool_calls(
         };
 
         let elapsed_ns = now_ns.saturating_sub(last_success_ns);
-        if elapsed_ns < AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS {
+        if elapsed_ns < timing::AUTONOMY_DEDUPE_WINDOW_NS {
             suppressed.push(SuppressedAutonomyToolCall {
                 index,
                 call: call.clone(),
@@ -227,6 +270,9 @@ struct SuppressedAutonomyToolCall {
     age_secs: u64,
 }
 
+/// Produces a synthetic `ToolCallRecord` marked as successful for a suppressed
+/// autonomy call, preserving the call in the turn's record so the continuation
+/// transcript remains consistent.
 fn synthetic_suppressed_autonomy_tool_record(
     turn_id: &str,
     call: &ToolCall,
@@ -238,13 +284,16 @@ fn synthetic_suppressed_autonomy_tool_record(
         args_json: call.args_json.clone(),
         output: format!(
             "{AUTONOMY_DEDUPE_SKIP_REASON}: last success {} seconds ago within {} second window",
-            age_secs, BALANCE_FRESHNESS_WINDOW_SECS
+            age_secs,
+            timing::BALANCE_FRESHNESS_WINDOW_SECS
         ),
         success: true,
         error: None,
     }
 }
 
+/// Persists the fingerprint and timestamp of every successful autonomy tool call
+/// so future ticks can suppress identical calls within the dedup window.
 fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeeded_at_ns: u64) {
     for call in tool_calls.iter().filter(|call| call.success) {
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
@@ -252,6 +301,8 @@ fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeede
     }
 }
 
+/// Guarantees every tool call has a non-empty `tool_call_id` by synthesising
+/// one from the round index and position when the model omits the field.
 fn normalize_tool_call_ids(calls: Vec<ToolCall>, round_index: usize) -> Vec<ToolCall> {
     calls
         .into_iter()
@@ -270,6 +321,8 @@ fn normalize_tool_call_ids(calls: Vec<ToolCall>, round_index: usize) -> Vec<Tool
         .collect()
 }
 
+/// Serialises a `ToolCallRecord` into the JSON content that is fed back to the
+/// model as a `Tool` message in the continuation transcript.
 fn continuation_tool_content(record: &ToolCallRecord) -> String {
     serde_json::json!({
         "success": record.success,
@@ -279,76 +332,8 @@ fn continuation_tool_content(record: &ToolCallRecord) -> String {
     .to_string()
 }
 
-fn upsert_memory_fact(key: &str, value: String, turn_id: &str, now_ns: u64) -> Result<(), String> {
-    let existing = stable::get_memory_fact(key);
-    stable::set_memory_fact(&MemoryFact {
-        key: key.to_string(),
-        value,
-        created_at_ns: existing
-            .as_ref()
-            .map(|fact| fact.created_at_ns)
-            .unwrap_or(now_ns),
-        updated_at_ns: now_ns,
-        source_turn_id: turn_id.to_string(),
-    })
-}
-
-fn successful_eth_balance_read(call: &ToolCallRecord) -> Option<(String, String)> {
-    if !call.success || call.tool != "evm_read" {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&call.args_json).ok()?;
-    let method = args.get("method")?.as_str()?;
-    if method != "eth_getBalance" {
-        return None;
-    }
-
-    let address = args
-        .get("address")
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().to_ascii_lowercase())?;
-    let balance_hex = call.output.trim().to_ascii_lowercase();
-    let _ = parse_hex_quantity_u256(&balance_hex)?;
-    Some((address, balance_hex))
-}
-
-fn persist_eth_balance_from_tool_calls(tool_calls: &[ToolCallRecord], turn_id: &str, now_ns: u64) {
-    for call in tool_calls {
-        let Some((address, balance_hex)) = successful_eth_balance_read(call) else {
-            continue;
-        };
-        if let Err(error) = upsert_memory_fact("balance.eth", balance_hex.clone(), turn_id, now_ns)
-        {
-            log!(
-                AgentLogPriority::Error,
-                "memory_fact_upsert_failed key=balance.eth err={error}"
-            );
-        }
-        if let Err(error) = upsert_memory_fact(
-            &format!("balance.eth.{address}"),
-            balance_hex,
-            turn_id,
-            now_ns,
-        ) {
-            log!(
-                AgentLogPriority::Error,
-                "memory_fact_upsert_failed key=balance.eth.{address} err={error}"
-            );
-        }
-        if let Err(error) = upsert_memory_fact(
-            "balance.eth.last_checked_ns",
-            now_ns.to_string(),
-            turn_id,
-            now_ns,
-        ) {
-            log!(
-                AgentLogPriority::Error,
-                "memory_fact_upsert_failed key=balance.eth.last_checked_ns err={error}"
-            );
-        }
-    }
-}
-
+/// Appends `segment` (trimmed) to the running inner-dialogue string,
+/// separating successive segments with a blank line.
 fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
@@ -363,6 +348,8 @@ fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
     }
 }
 
+/// Returns a `(goal, why)` pair describing the purpose of the current turn for
+/// the inner dialogue and prompt context.
 fn current_turn_goal_and_why(staged_message_count: usize, evm_events: usize) -> (String, String) {
     if staged_message_count > 0 {
         return (
@@ -385,6 +372,9 @@ fn current_turn_goal_and_why(staged_message_count: usize, evm_events: usize) -> 
     )
 }
 
+// ── Context builders ─────────────────────────────────────────────────────────
+
+/// Renders the `### Pending Obligations` section for the dynamic context block.
 fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String {
     let unique_senders = staged_messages
         .iter()
@@ -412,6 +402,8 @@ fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String
     lines.join("\n")
 }
 
+/// Renders the `### Conversation History` section scoped to the senders of
+/// `staged_messages`, including at most `per_sender_limit` recent exchanges.
 fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit: usize) -> String {
     let senders = staged_messages
         .iter()
@@ -462,6 +454,8 @@ fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit
     lines.join("\n")
 }
 
+/// Renders the `### Available Tools` section, annotating each enabled tool
+/// with how many times it has already been called in the current turn.
 fn build_available_tools_section(turn_id: &str) -> String {
     let manager = ToolManager::new();
     let usage = stable::get_tools_for_turn(turn_id).into_iter().fold(
@@ -487,6 +481,8 @@ fn build_available_tools_section(turn_id: &str) -> String {
     lines.join("\n")
 }
 
+/// Returns the per-sender conversation history limit to include in context.
+/// `IcLlm` uses a tighter limit because of its smaller context window.
 fn conversation_history_limit_for_provider(provider: &InferenceProvider) -> usize {
     match provider {
         InferenceProvider::IcLlm => 2,
@@ -494,6 +490,9 @@ fn conversation_history_limit_for_provider(provider: &InferenceProvider) -> usiz
     }
 }
 
+/// Assembles the full `## Layer 10: Dynamic Context` section injected into
+/// every turn prompt: current state, wallet balances, survival tier, pending
+/// inbox obligations, conversation history, memory facts/rollups, and tool usage.
 fn build_dynamic_context(
     snapshot: &crate::domain::types::RuntimeSnapshot,
     staged_messages: &[InboxMessage],
@@ -526,11 +525,19 @@ fn build_dynamic_context(
         .eth_balance_wei_hex
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+    let eth_balance_eth = format_hex_quantity_with_decimals(
+        snapshot.wallet_balance.eth_balance_wei_hex.as_deref(),
+        18,
+    );
     let usdc_balance = snapshot
         .wallet_balance
         .usdc_balance_raw_hex
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+    let usdc_balance_tokens = format_hex_quantity_with_decimals(
+        snapshot.wallet_balance.usdc_balance_raw_hex.as_deref(),
+        usize::from(snapshot.wallet_balance.usdc_decimals),
+    );
 
     let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
         "### Recent Memory\n- none".to_string()
@@ -569,6 +576,7 @@ fn build_dynamic_context(
             snapshot.evm_address.as_deref().unwrap_or("unconfigured")
         ),
         format!("- eth_balance: {eth_balance}"),
+        format!("- eth_balance_eth: {eth_balance_eth}"),
         format!(
             "- wallet_balance_last_synced_at_ns: {}",
             snapshot
@@ -585,6 +593,8 @@ fn build_dynamic_context(
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!("- usdc_balance: {usdc_balance}"),
+        format!("- usdc_balance_tokens: {usdc_balance_tokens}"),
+        format!("- usdc_decimals: {}", snapshot.wallet_balance.usdc_decimals),
         format!(
             "- wallet_balance_freshness_window_secs: {}",
             wallet_freshness.freshness_window_secs
@@ -612,6 +622,8 @@ fn build_dynamic_context(
     .join("\n\n")
 }
 
+/// Persists a `ConversationEntry` for each consumed inbox message so future
+/// turns can include prior exchanges in the context's conversation history.
 fn record_conversation_entries(
     turn_id: &str,
     staged_messages: &[InboxMessage],
@@ -644,14 +656,25 @@ fn record_conversation_entries(
     }
 }
 
+// ── Turn entry point ─────────────────────────────────────────────────────────
+
+/// Executes one scheduled agent turn with the production limits.
+///
+/// Delegates to `run_scheduled_turn_job_with_limits_and_tool_cap` using
+/// `MAX_INFERENCE_ROUNDS_PER_TURN`, `MAX_AGENT_TURN_DURATION_NS`, and
+/// `MAX_TOOL_CALLS_PER_TURN`.  Returns `Err` only on hard failures (invalid
+/// state transition, unrecoverable inference error); guard-skip conditions
+/// return `Ok(())` without mutating state.
 pub async fn run_scheduled_turn_job() -> Result<(), String> {
     run_scheduled_turn_job_with_limits_and_tool_cap(
         MAX_INFERENCE_ROUNDS_PER_TURN,
-        MAX_AGENT_TURN_DURATION_NS,
+        timing::MAX_AGENT_TURN_DURATION_NS,
         MAX_TOOL_CALLS_PER_TURN,
     )
     .await
 }
+
+// ── Continuation loop ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 async fn run_scheduled_turn_job_with_limits(
@@ -714,7 +737,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         return Err(error);
     }
 
-    let staged_messages = stable::list_staged_inbox_messages(50);
+    let staged_messages = stable::list_staged_inbox_messages(MAX_STAGED_INBOX_MESSAGES_PER_TURN);
     let staged_message_ids = staged_messages
         .iter()
         .map(|message| message.id.clone())
@@ -955,7 +978,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         &format!(
                             "autonomy dedupe suppressed {} repeated successful tool call(s) within {} seconds:\n- {}",
                             suppressed_calls.len(),
-                            BALANCE_FRESHNESS_WINDOW_SECS,
+                            timing::BALANCE_FRESHNESS_WINDOW_SECS,
                             details,
                         ),
                     );
@@ -1023,11 +1046,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
 
-            persist_eth_balance_from_tool_calls(
-                &round_tool_records,
-                &turn_id,
-                execution_completed_ns,
-            );
             if let Some(tool_results_reply) = render_tool_results_reply(&round_tool_records) {
                 append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
                 assistant_reply = Some(tool_results_reply);
@@ -1158,6 +1176,11 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     Ok(())
 }
 
+// ── State machine helpers ────────────────────────────────────────────────────
+
+/// Applies `event` to `state` via the state machine, records the transition in
+/// stable storage, and updates `*state` to the resulting successor state.
+/// Returns an `Err` with a formatted message on invalid transitions.
 fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> Result<(), String> {
     let next = state_machine::transition(state, event).map_err(|error| {
         format!(
@@ -1241,23 +1264,21 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_results_reply_formats_eth_get_balance_result() {
+    fn render_tool_results_reply_formats_success_tool_result() {
         let calls = vec![ToolCallRecord {
             turn_id: "turn-1".to_string(),
             tool: "evm_read".to_string(),
             args_json:
                 r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
                     .to_string(),
-            output: "0xde0b6b3a7640000".to_string(),
+            output: "0x1".to_string(),
             success: true,
             error: None,
         }];
 
         let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
         assert!(reply.contains("Tool results: 1 succeeded, 0 failed."));
-        assert!(reply.contains("balance `0x1111111111111111111111111111111111111111`"));
-        assert!(reply.contains("0xde0b6b3a7640000"));
-        assert!(reply.contains("1 ETH"));
+        assert!(reply.contains("`evm_read`: 0x1"));
     }
 
     #[test]
@@ -1288,85 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn persist_eth_balance_from_tool_calls_stores_balance_and_last_checked() {
-        reset_runtime(AgentState::Sleeping, true, false, 8);
-        let calls = vec![ToolCallRecord {
-            turn_id: "turn-9".to_string(),
-            tool: "evm_read".to_string(),
-            args_json:
-                r#"{"method":"eth_getBalance","address":"0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"}"#
-                    .to_string(),
-            output: "0x1".to_string(),
-            success: true,
-            error: None,
-        }];
-
-        persist_eth_balance_from_tool_calls(&calls, "turn-9", 100);
-
-        let global = stable::get_memory_fact("balance.eth").expect("global balance should exist");
-        assert_eq!(global.value, "0x1");
-        assert_eq!(global.created_at_ns, 100);
-        assert_eq!(global.updated_at_ns, 100);
-
-        let by_address =
-            stable::get_memory_fact("balance.eth.0xabcdefabcdefabcdefabcdefabcdefabcdefabcd")
-                .expect("address balance should exist");
-        assert_eq!(by_address.value, "0x1");
-
-        let checked = stable::get_memory_fact("balance.eth.last_checked_ns")
-            .expect("last checked fact should exist");
-        assert_eq!(checked.value, "100");
-
-        let second_calls = vec![ToolCallRecord {
-            output: "0x2".to_string(),
-            ..calls[0].clone()
-        }];
-        persist_eth_balance_from_tool_calls(&second_calls, "turn-10", 200);
-        let updated_global = stable::get_memory_fact("balance.eth").expect("updated balance");
-        assert_eq!(updated_global.value, "0x2");
-        assert_eq!(updated_global.created_at_ns, 100);
-        assert_eq!(updated_global.updated_at_ns, 200);
-    }
-
-    #[test]
-    fn persist_eth_balance_from_tool_calls_respects_memory_fact_capacity() {
-        reset_runtime(AgentState::Sleeping, true, false, 8);
-        for idx in 0..stable::MAX_MEMORY_FACTS {
-            stable::set_memory_fact(&MemoryFact {
-                key: format!("fact.{idx}"),
-                value: "seed".to_string(),
-                created_at_ns: 1,
-                updated_at_ns: 1,
-                source_turn_id: "turn-seed".to_string(),
-            })
-            .expect("seed fact should persist");
-        }
-        assert_eq!(stable::memory_fact_count(), stable::MAX_MEMORY_FACTS);
-
-        let calls = vec![ToolCallRecord {
-            turn_id: "turn-9".to_string(),
-            tool: "evm_read".to_string(),
-            args_json:
-                r#"{"method":"eth_getBalance","address":"0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"}"#
-                    .to_string(),
-            output: "0x1".to_string(),
-            success: true,
-            error: None,
-        }];
-        persist_eth_balance_from_tool_calls(&calls, "turn-9", 100);
-
-        assert_eq!(
-            stable::memory_fact_count(),
-            stable::MAX_MEMORY_FACTS,
-            "agent-internal memory writes must not bypass memory fact cardinality cap"
-        );
-        assert!(
-            stable::get_memory_fact("balance.eth").is_none(),
-            "new balance fact should be rejected when map is at capacity"
-        );
-    }
-
-    #[test]
     fn suppress_duplicate_autonomy_tool_calls_respects_60m_window() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         let call = ToolCall {
@@ -1381,14 +1323,14 @@ mod tests {
 
         let (allowed_early, suppressed_early) = suppress_duplicate_autonomy_tool_calls(
             std::slice::from_ref(&call),
-            1_000 + AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS - 1,
+            1_000 + timing::AUTONOMY_DEDUPE_WINDOW_NS - 1,
         );
         assert!(allowed_early.is_empty());
         assert_eq!(suppressed_early.len(), 1);
 
         let (allowed_late, suppressed_late) = suppress_duplicate_autonomy_tool_calls(
             &[call],
-            1_000 + AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS,
+            1_000 + timing::AUTONOMY_DEDUPE_WINDOW_NS,
         );
         assert_eq!(allowed_late.len(), 1);
         assert!(suppressed_late.is_empty());
@@ -1541,7 +1483,10 @@ mod tests {
         assert!(context.contains("- survival_tier: LowCycles"));
         assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("- eth_balance: 0x42"));
+        assert!(context.contains("- eth_balance_eth: 0.000000000000000066"));
         assert!(context.contains("- usdc_balance: 0x2a"));
+        assert!(context.contains("- usdc_balance_tokens: 0.000042"));
+        assert!(context.contains("- usdc_decimals: 6"));
         assert!(context.contains("- wallet_balance_last_synced_at_ns: 10"));
         assert!(context.contains("- wallet_balance_freshness_window_secs: 600"));
         assert!(context.contains("- wallet_balance_is_stale: true"));
@@ -1575,8 +1520,36 @@ mod tests {
 
         let snapshot = stable::runtime_snapshot();
         let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], "turn-12", 5);
+        assert!(context.contains("- eth_balance_eth: 0.000000000000000016"));
+        assert!(context.contains("- usdc_balance_tokens: 0.000032"));
         assert!(context.contains("- wallet_balance_is_stale: false"));
         assert!(context.contains("- wallet_balance_status: Fresh"));
+    }
+
+    #[test]
+    fn format_hex_quantity_with_decimals_formats_eth_and_usdc_without_float_rounding() {
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("0x16345785d8a0000"), 18),
+            "0.1"
+        );
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("0xde0b6b3a7640000"), 18),
+            "1"
+        );
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("0x2a"), 6),
+            "0.000042"
+        );
+    }
+
+    #[test]
+    fn format_hex_quantity_with_decimals_returns_unknown_for_missing_or_invalid_hex() {
+        assert_eq!(format_hex_quantity_with_decimals(None, 18), "unknown");
+        assert_eq!(format_hex_quantity_with_decimals(Some(""), 18), "unknown");
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("not-a-hex"), 18),
+            "unknown"
+        );
     }
 
     #[test]
@@ -1907,6 +1880,45 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_turn_uses_default_max_inference_rounds_cap() {
+        assert_eq!(
+            MAX_INFERENCE_ROUNDS_PER_TURN, 10,
+            "default per-turn inference cap should remain aligned with autonomy policy"
+        );
+
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_continuation_loop:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "default scheduled turn should stop at the configured round cap without failing"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].inference_round_count, 10);
+        assert_eq!(turns[0].tool_call_count, 10);
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::MaxRounds
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max inference rounds reached (10)"),
+            "inner dialogue should describe the default round-cap stop reason"
+        );
+    }
+
+    #[test]
     fn scheduled_turn_stops_continuation_when_max_duration_reached() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         stable::post_inbox_message(
@@ -2107,10 +2119,24 @@ mod tests {
         assert_eq!(sender_a_log.entries[0].sender_body, "hello sender a");
         assert_eq!(sender_a_log.entries[0].agent_reply, expected_reply);
 
+        assert!(
+            stable::get_conversation_log(&sender_b).is_none(),
+            "sender B must remain unprocessed until the next turn"
+        );
+
+        let after_first_turn = stable::inbox_stats();
+        assert_eq!(after_first_turn.staged_count, 1);
+        assert_eq!(after_first_turn.consumed_count, 1);
+
+        let second_result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            second_result.is_ok(),
+            "second turn should complete successfully"
+        );
+
         let sender_b_log = stable::get_conversation_log(&sender_b)
-            .expect("sender B conversation should be recorded");
+            .expect("sender B conversation should be recorded on second turn");
         assert_eq!(sender_b_log.entries.len(), 1);
         assert_eq!(sender_b_log.entries[0].sender_body, "hello sender b");
-        assert_eq!(sender_b_log.entries[0].agent_reply, expected_reply);
     }
 }

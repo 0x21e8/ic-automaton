@@ -1,3 +1,13 @@
+/// Controlled HTTPS GET tool with allowlist enforcement and response-size limits.
+///
+/// The `http_fetch_tool` function is the runtime entry point for the `http_fetch`
+/// agent tool.  Before dispatching an outbound request it:
+/// 1. Validates the URL is HTTPS and parses the hostname.
+/// 2. Checks the hostname against the configurable domain allowlist (when enforced).
+/// 3. Verifies the canister has enough liquid cycles to pay for the outcall.
+/// 4. Truncates the response body to `HTTP_FETCH_MAX_OUTPUT_CHARS` characters
+///    before returning it to the agent.
+// ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, OperationClass,
     DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
@@ -10,14 +20,27 @@ use candid::Nat;
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::management_canister::{http_request, HttpMethod, HttpRequestArgs};
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum number of bytes the IC HTTPS outcall may return — 64 KiB.
 const HTTP_FETCH_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Maximum number of UTF-8 characters returned to the agent after fetching.
+/// Responses are truncated at this boundary with a `[truncated, N total bytes]` suffix.
 const HTTP_FETCH_MAX_OUTPUT_CHARS: usize = 8_000;
+
+// ── Tool entry point ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct HttpFetchArgs {
     url: String,
 }
 
+/// Execute the `http_fetch` tool — parse args, enforce allowlist, check cycles, fetch.
+///
+/// Returns the response body as a UTF-8 string (truncated to
+/// `HTTP_FETCH_MAX_OUTPUT_CHARS`).  Binary bodies are represented as the
+/// literal string `"binary response (not UTF-8)"`.
 pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     let args = parse_http_fetch_args(args_json)?;
     let host = extract_https_host(&args.url)?;

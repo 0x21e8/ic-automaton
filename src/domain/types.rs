@@ -1,6 +1,34 @@
+/// Canonical type definitions for the entire canister.
+///
+/// This module is the single source of truth for all shared data structures —
+/// every other module imports from here.  The types are grouped into logical
+/// sections:
+///
+/// - **Agent FSM** — the finite-state machine that controls the agent lifecycle
+/// - **EVM** — event polling cursors and ingested events
+/// - **Wallet** — EVM wallet balance snapshots and synchronisation config
+/// - **Inference** — LLM provider configuration and turn I/O
+/// - **Strategy** — templates, execution plans, ABI artefacts, and outcome stats
+/// - **Memory** — persistent key/value knowledge base and rollups
+/// - **Observability** — snapshots, storage metrics, cycle telemetry, and views
+/// - **Scheduler** — jobs, leases, task configs, and survival tiers
+use crate::timing;
 use candid::CandidType;
 use serde::{Deserialize, Serialize};
 
+// ── Agent FSM types ──────────────────────────────────────────────────────────
+
+/// All stable states of the agent finite-state machine.
+///
+/// Transitions are driven by [`AgentEvent`] and recorded in the transition log.
+/// - `Bootstrapping` — canister just installed; awaiting initial configuration.
+/// - `Idle` — ready and waiting for the next timer tick or inbox message.
+/// - `LoadingContext` — building the prompt from stable storage.
+/// - `Inferring` — an LLM call is in progress.
+/// - `ExecutingActions` — tool calls from the inference round are being run.
+/// - `Persisting` — writing turn results and memory facts to stable storage.
+/// - `Sleeping` — the agent requested a voluntary sleep; skips future turns.
+/// - `Faulted` — a non-recoverable error occurred; requires `ResetFault`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum AgentState {
     Bootstrapping,
@@ -13,6 +41,11 @@ pub enum AgentState {
     Faulted,
 }
 
+/// Events that drive FSM transitions in the agent state machine.
+///
+/// Each variant corresponds to a step completing (or failing) during an agent
+/// turn.  The scheduler emits `TimerTick` every `BASE_TICK_SECS`; all other
+/// events are produced internally by the agent or its subsystems.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub enum AgentEvent {
     TimerTick,
@@ -26,6 +59,7 @@ pub enum AgentEvent {
     ResetFault,
 }
 
+/// Describes a rejected FSM transition — logged but never stored in steady state.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct TransitionError {
     pub from: AgentState,
@@ -33,6 +67,7 @@ pub struct TransitionError {
     pub reason: String,
 }
 
+/// A single tool invocation produced by the LLM during an inference round.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct ToolCall {
     #[serde(default)]
@@ -41,6 +76,7 @@ pub struct ToolCall {
     pub args_json: String,
 }
 
+/// Persisted record of a completed tool call, stored under `tools:{turn_id}`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct ToolCallRecord {
     pub turn_id: String,
@@ -51,20 +87,38 @@ pub struct ToolCallRecord {
     pub error: Option<String>,
 }
 
+// ── Memory types ─────────────────────────────────────────────────────────────
+
+/// A single entry in the persistent knowledge base.
+///
+/// Facts are keyed by a dotted namespace path (e.g. `"balance.eth"`,
+/// `"config.chain_id"`) and stored in `MEMORY_FACTS_MAP`.  Critical keys
+/// (those matching `is_critical_exact_memory_key`) are always included in the
+/// agent's context prompt regardless of the fact limit.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct MemoryFact {
     pub key: String,
     pub value: String,
     pub created_at_ns: u64,
     pub updated_at_ns: u64,
+    /// The turn that last wrote this fact — useful for audit.
     pub source_turn_id: String,
 }
 
+// ── EVM types ────────────────────────────────────────────────────────────────
+
+/// Tracks the current EVM log-polling position for a given chain and contract.
+///
+/// The pair (`next_block`, `next_log_index`) is the resume point for the next
+/// `eth_getLogs` call.  `consecutive_empty_polls` drives the exponential
+/// backoff schedule defined in `timing::EMPTY_POLL_BACKOFF_SCHEDULE_SECS`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmPollCursor {
     pub chain_id: u64,
     #[serde(default)]
     pub contract_address: Option<String>,
+    /// The automaton's own address encoded as a 32-byte padded EVM topic,
+    /// used to filter logs directed at this canister.
     #[serde(default)]
     pub automaton_address_topic: Option<String>,
     pub next_block: u64,
@@ -92,26 +146,39 @@ impl Default for EvmPollCursor {
     }
 }
 
+/// A decoded EVM log event received from the inbox contract.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmEvent {
     pub tx_hash: String,
     pub chain_id: u64,
     pub block_number: u64,
     pub log_index: u64,
+    /// Address that emitted the log (the inbox contract).
     pub source: String,
+    /// Decoded message body extracted from the log data.
     pub payload: String,
 }
 
+// ── Wallet types ─────────────────────────────────────────────────────────────
+
+/// Coarse classification of a wallet balance reading.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub enum WalletBalanceStatus {
+    /// No balance has ever been fetched.
     #[default]
     Unknown,
+    /// The most recent reading is within the configured freshness window.
     Fresh,
+    /// The most recent reading is older than the freshness window.
     Stale,
+    /// The last sync attempt returned an error.
     Error,
 }
 
+/// Derived freshness assessment for a [`WalletBalanceSnapshot`].
+///
+/// Computed on demand by [`WalletBalanceSnapshot::derive_freshness`]; not stored.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WalletBalanceFreshness {
@@ -121,6 +188,11 @@ pub struct WalletBalanceFreshness {
     pub status: WalletBalanceStatus,
 }
 
+/// Cached EVM wallet balances for the automaton's key-pair address.
+///
+/// Both ETH and USDC balances are stored as hex strings (wei / raw token units)
+/// so that the agent can include them verbatim in prompts without lossy
+/// floating-point conversion.  `last_synced_at_ns` drives freshness checks.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WalletBalanceSnapshot {
     #[serde(default)]
@@ -185,6 +257,10 @@ impl Default for WalletBalanceSnapshot {
     }
 }
 
+/// Controls when and how the wallet balance sync job runs.
+///
+/// `low_cycles_interval_secs` must be ≥ `normal_interval_secs`; the longer
+/// interval is used while the canister is in a low-cycles survival tier.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WalletBalanceSyncConfig {
     #[serde(default = "default_wallet_balance_sync_enabled")]
@@ -197,6 +273,8 @@ pub struct WalletBalanceSyncConfig {
     pub freshness_window_secs: u64,
     #[serde(default = "default_wallet_balance_sync_max_response_bytes")]
     pub max_response_bytes: u64,
+    /// When `true`, the USDC contract address is discovered by querying the
+    /// inbox contract rather than requiring manual configuration.
     #[serde(default = "default_wallet_balance_sync_discover_usdc_via_inbox")]
     pub discover_usdc_via_inbox: bool,
 }
@@ -214,6 +292,8 @@ impl Default for WalletBalanceSyncConfig {
     }
 }
 
+/// Read-only telemetry view of the wallet balance, returned by the
+/// `wallet_balance_telemetry_view` canister query.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WalletBalanceTelemetryView {
     pub eth_balance_wei_hex: Option<String>,
@@ -227,6 +307,7 @@ pub struct WalletBalanceTelemetryView {
     pub freshness_window_secs: u64,
     pub is_stale: bool,
     pub status: WalletBalanceStatus,
+    /// `true` while the first successful balance sync has not yet completed.
     pub bootstrap_pending: bool,
 }
 
@@ -252,6 +333,7 @@ impl WalletBalanceTelemetryView {
     }
 }
 
+/// Candid-serialisable projection of [`WalletBalanceSyncConfig`] for query responses.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct WalletBalanceSyncConfigView {
     pub enabled: bool,
@@ -275,6 +357,11 @@ impl From<&WalletBalanceSyncConfig> for WalletBalanceSyncConfigView {
     }
 }
 
+/// Configuration for the automatic cycle top-up feature.
+///
+/// When the canister's cycle balance drops below `auto_topup_cycle_threshold`,
+/// the top-up flow bridges USDC from the EVM wallet through the 1Sec locker
+/// and Kong swap to ICP, then converts ICP to cycles via the CMC.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct CycleTopUpConfig {
     #[serde(default = "default_cycle_topup_enabled")]
@@ -331,6 +418,17 @@ impl Default for CycleTopUpConfig {
     }
 }
 
+// ── Runtime snapshot ─────────────────────────────────────────────────────────
+
+/// The canonical in-memory view of all mutable canister state.
+///
+/// A single `RuntimeSnapshot` is serialised and stored under the key
+/// `"runtime.snapshot"` in `RUNTIME_MAP`.  Every subsystem that needs to
+/// mutate persistent state reads this snapshot, modifies it, and writes it
+/// back atomically.
+///
+/// Fields are grouped loosely as: FSM state, EVM cursor, inference config,
+/// wallet balance, and feature configs.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeSnapshot {
     pub state: AgentState,
@@ -412,6 +510,7 @@ impl Default for RuntimeSnapshot {
     }
 }
 
+/// Durable log entry for every FSM state transition, stored in `TRANSITION_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct TransitionLogRecord {
     pub id: String,
@@ -423,6 +522,7 @@ pub struct TransitionLogRecord {
     pub occurred_at_ns: u64,
 }
 
+/// Reason why a multi-round inference loop stopped before receiving a final answer.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ContinuationStopReason {
     #[default]
@@ -433,6 +533,7 @@ pub enum ContinuationStopReason {
     MaxToolCalls,
 }
 
+/// Durable record of a completed agent turn, stored in `TURN_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct TurnRecord {
     pub id: String,
@@ -451,6 +552,7 @@ pub struct TurnRecord {
     pub error: Option<String>,
 }
 
+/// A named, optionally-mutable capability that can be enabled or disabled at runtime.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct SkillRecord {
     pub name: String,
@@ -460,6 +562,13 @@ pub struct SkillRecord {
     pub mutable: bool,
 }
 
+// ── Prompt layer types ───────────────────────────────────────────────────────
+
+/// A versioned, mutable segment of the system prompt, stored in `PROMPT_LAYER_MAP`.
+///
+/// Immutable layers are defined at compile time in `src/prompt.rs`; mutable
+/// layers (layer IDs in `MUTABLE_LAYER_MIN_ID..=MUTABLE_LAYER_MAX_ID`) can be
+/// updated at runtime by a controller or by the agent itself.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PromptLayer {
     pub layer_id: u8,
@@ -469,6 +578,7 @@ pub struct PromptLayer {
     pub version: u32,
 }
 
+/// Read-only view of a prompt layer, returned by `list_prompt_layers`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PromptLayerView {
     pub layer_id: u8,
@@ -479,6 +589,7 @@ pub struct PromptLayerView {
     pub version: Option<u32>,
 }
 
+/// A single request–response exchange between a sender and the agent.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ConversationEntry {
     pub inbox_message_id: String,
@@ -488,6 +599,7 @@ pub struct ConversationEntry {
     pub timestamp_ns: u64,
 }
 
+/// All conversation entries for a given sender, stored in `CONVERSATION_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ConversationLog {
     pub sender: String,
@@ -495,6 +607,7 @@ pub struct ConversationLog {
     pub last_activity_ns: u64,
 }
 
+/// Lightweight summary of a conversation, used in the observability snapshot.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ConversationSummary {
     pub sender: String,
@@ -502,6 +615,8 @@ pub struct ConversationSummary {
     pub entry_count: u32,
 }
 
+/// Aggregated inbox/outbox statistics for one sender over a 24-hour window,
+/// produced during retention maintenance and stored in `SESSION_SUMMARY_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     pub sender: String,
@@ -515,6 +630,8 @@ pub struct SessionSummary {
     pub generated_at_ns: u64,
 }
 
+/// Aggregated turn and tool-call statistics over a 24-hour window,
+/// produced during retention maintenance and stored in `TURN_WINDOW_SUMMARY_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TurnWindowSummary {
     pub window_start_ns: u64,
@@ -531,6 +648,11 @@ pub struct TurnWindowSummary {
     pub generated_at_ns: u64,
 }
 
+/// A condensed snapshot of all memory facts in a namespace, produced by the
+/// retention maintenance pass and stored in `MEMORY_ROLLUP_MAP`.
+///
+/// Rollups compress facts that have not changed recently into a single
+/// `canonical_value` string so that the agent context prompt stays bounded.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRollup {
     pub namespace: String,
@@ -542,6 +664,309 @@ pub struct MemoryRollup {
     pub generated_at_ns: u64,
 }
 
+// ── Strategy types ───────────────────────────────────────────────────────────
+
+/// Composite key that uniquely identifies a strategy template.
+///
+/// The four fields together form a namespaced identifier:
+/// `{protocol}:{primitive}@chain{chain_id}#{template_id}`.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StrategyTemplateKey {
+    pub protocol: String,
+    pub primitive: String,
+    pub chain_id: u64,
+    pub template_id: String,
+}
+
+/// Semantic version for a strategy template or ABI artefact.
+///
+/// Versions are totally ordered; `0.0.0` is reserved and invalid.
+#[derive(
+    CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+pub struct TemplateVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+/// Lifecycle state of a strategy template.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TemplateStatus {
+    /// Not yet approved for execution.
+    #[default]
+    Draft,
+    Active,
+    Deprecated,
+    /// Permanently disabled; cannot be re-activated.
+    Revoked,
+}
+
+/// Binds a logical contract role (e.g. `"vault"`) to a verified on-chain address.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ContractRoleBinding {
+    pub role: String,
+    pub address: String,
+    pub source_ref: String,
+    #[serde(default)]
+    pub codehash: Option<String>,
+}
+
+/// Recursive ABI type specification (mirrors the JSON ABI format).
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiTypeSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub components: Vec<AbiTypeSpec>,
+}
+
+/// A single ABI function entry, including its 4-byte selector for verification.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiFunctionSpec {
+    pub role: String,
+    pub name: String,
+    pub selector_hex: String,
+    pub inputs: Vec<AbiTypeSpec>,
+    pub outputs: Vec<AbiTypeSpec>,
+    pub state_mutability: String,
+}
+
+/// A named action within a strategy template — a sequence of EVM calls with
+/// guard conditions.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActionSpec {
+    pub action_id: String,
+    pub call_sequence: Vec<AbiFunctionSpec>,
+    pub preconditions: Vec<String>,
+    pub postconditions: Vec<String>,
+    pub risk_checks: Vec<String>,
+}
+
+/// A versioned strategy template defining the actions, contract roles, and
+/// constraints for an on-chain DeFi operation (e.g. a Uniswap swap).
+///
+/// Templates are stored in `STRATEGY_TEMPLATE_MAP` and referenced by agents
+/// when building execution plans.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyTemplate {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub status: TemplateStatus,
+    pub contract_roles: Vec<ContractRoleBinding>,
+    pub actions: Vec<ActionSpec>,
+    pub constraints_json: String,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+}
+
+/// Composite key for an ABI artefact: protocol + chain + contract role + version.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbiArtifactKey {
+    pub protocol: String,
+    pub chain_id: u64,
+    pub role: String,
+    pub version: TemplateVersion,
+}
+
+/// A versioned ABI artefact stored in `ABI_ARTIFACT_MAP`, providing the raw
+/// JSON ABI and pre-parsed function specs for selector validation.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiArtifact {
+    pub key: AbiArtifactKey,
+    pub source_ref: String,
+    #[serde(default)]
+    pub codehash: Option<String>,
+    pub abi_json: String,
+    pub functions: Vec<AbiFunctionSpec>,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+}
+
+/// A compile-time / test assertion that a human-readable function signature
+/// produces the expected 4-byte selector.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AbiSelectorAssertion {
+    pub signature: String,
+    pub selector_hex: String,
+}
+
+/// An agent's intention to execute a specific action of a strategy template
+/// with user-supplied typed parameters.  Validated before producing an
+/// [`ExecutionPlan`].
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StrategyExecutionIntent {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub action_id: String,
+    /// JSON object whose fields match the action's typed parameter schema.
+    pub typed_params_json: String,
+}
+
+/// A single EVM call within an execution plan — fully resolved with target
+/// address, value, and ABI-encoded calldata.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StrategyExecutionCall {
+    pub role: String,
+    pub to: String,
+    pub value_wei: String,
+    pub data: String,
+}
+
+/// A fully materialised sequence of EVM calls ready for threshold-signing and
+/// broadcasting.  Produced by expanding a [`StrategyExecutionIntent`] against
+/// the matching [`StrategyTemplate`] and ABI artefacts.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ExecutionPlan {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub action_id: String,
+    pub calls: Vec<StrategyExecutionCall>,
+    pub preconditions: Vec<String>,
+    pub postconditions: Vec<String>,
+}
+
+/// The pipeline stage at which a validation finding was produced.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ValidationLayer {
+    Schema,
+    Address,
+    Policy,
+    Preflight,
+    Postcondition,
+}
+
+/// A single issue found during strategy validation.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ValidationFinding {
+    pub layer: ValidationLayer,
+    pub code: String,
+    pub message: String,
+    /// `true` means the same inputs will always produce this finding.
+    pub deterministic: bool,
+}
+
+/// The aggregate result of validating a strategy execution intent.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ValidationReport {
+    pub passed: bool,
+    pub findings: Vec<ValidationFinding>,
+    pub checked_at_ns: u64,
+}
+
+/// Classification of a strategy execution result used for confidence accounting.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum StrategyOutcomeKind {
+    Success,
+    /// The failure is reproducible — same inputs always fail (e.g. slippage too high).
+    DeterministicFailure,
+    /// The failure was transient (e.g. RPC timeout, gas spike).
+    NondeterministicFailure,
+}
+
+/// A single strategy execution result submitted for outcome accounting.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyOutcomeEvent {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub action_id: String,
+    pub outcome: StrategyOutcomeKind,
+    pub tx_hash: Option<String>,
+    pub error: Option<String>,
+    pub observed_at_ns: u64,
+}
+
+/// Running execution statistics for a strategy version, stored in
+/// `STRATEGY_OUTCOME_STATS_MAP`.
+///
+/// `confidence_bps` and `ranking_score_bps` are derived metrics (basis points,
+/// 0–10000) updated each time `record_strategy_outcome` is called.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyOutcomeStats {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub total_runs: u64,
+    pub success_runs: u64,
+    pub deterministic_failures: u64,
+    pub nondeterministic_failures: u64,
+    #[serde(default)]
+    pub deterministic_failure_streak: u32,
+    #[serde(default)]
+    pub confidence_bps: u16,
+    #[serde(default)]
+    pub ranking_score_bps: u16,
+    #[serde(default)]
+    pub parameter_priors: StrategyParameterPriors,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_tx_hash: Option<String>,
+    #[serde(default)]
+    pub last_observed_at_ns: Option<u64>,
+}
+
+/// Adaptive parameter priors for a strategy, updated from observed outcomes.
+///
+/// Expressed in basis points (100 bps = 1%).  Used to tune slippage tolerance
+/// and gas buffer multipliers before building the next execution plan.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyParameterPriors {
+    #[serde(default = "default_strategy_slippage_bps")]
+    pub slippage_bps: u16,
+    #[serde(default = "default_strategy_gas_buffer_bps")]
+    pub gas_buffer_bps: u16,
+}
+
+impl Default for StrategyParameterPriors {
+    fn default() -> Self {
+        Self {
+            slippage_bps: default_strategy_slippage_bps(),
+            gas_buffer_bps: default_strategy_gas_buffer_bps(),
+        }
+    }
+}
+
+/// Records whether a specific strategy version is enabled for execution.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateActivationState {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub enabled: bool,
+    pub updated_at_ns: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Records whether a specific strategy version has been permanently revoked.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TemplateRevocationState {
+    pub key: StrategyTemplateKey,
+    pub version: TemplateVersion,
+    pub revoked: bool,
+    pub updated_at_ns: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// An emergency circuit-breaker that halts all executions of a strategy
+/// regardless of version, stored in `STRATEGY_KILL_SWITCH_MAP`.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyKillSwitchState {
+    pub key: StrategyTemplateKey,
+    pub enabled: bool,
+    pub updated_at_ns: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+// ── Observability types ──────────────────────────────────────────────────────
+
+/// A lightweight projection of [`RuntimeSnapshot`] suitable for Candid queries.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct RuntimeView {
     pub state: AgentState,
@@ -559,6 +984,7 @@ pub struct RuntimeView {
     pub inference_model: String,
 }
 
+/// Read-only view of the EVM polling configuration and cursor, returned by queries.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmRouteStateView {
     pub chain_id: u64,
@@ -608,6 +1034,11 @@ impl From<&RuntimeSnapshot> for EvmRouteStateView {
     }
 }
 
+/// A point-in-time snapshot of the entire observable state of the canister,
+/// returned by the `observability_snapshot` query.
+///
+/// Building this snapshot also updates the cycle-balance and storage-growth
+/// sample ring buffers, so calling it has a small write side effect.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct ObservabilitySnapshot {
     pub captured_at_ns: u64,
@@ -634,6 +1065,10 @@ pub struct ObservabilitySnapshot {
     pub recent_jobs: Vec<ScheduledJob>,
 }
 
+/// Coarse pressure classification derived from the highest utilisation
+/// percentage across all bounded stable-memory collections.
+///
+/// Thresholds: Elevated ≥ 70 %, High ≥ 85 %, Critical ≥ 95 %.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
 pub enum StoragePressureLevel {
     #[default]
@@ -643,6 +1078,8 @@ pub enum StoragePressureLevel {
     Critical,
 }
 
+/// Detailed stable-memory utilisation metrics included in every
+/// [`ObservabilitySnapshot`].
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct StorageGrowthMetrics {
     pub runtime_map_entries: u64,
@@ -700,6 +1137,10 @@ pub struct StorageGrowthMetrics {
     pub stable_memory_mb: f64,
 }
 
+/// Configuration for the periodic retention maintenance job.
+///
+/// Controls maximum ages and record counts for each stored collection.
+/// Written to stable storage and readable / updatable via `set_retention_config`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RetentionConfig {
     #[serde(default = "default_jobs_max_age_secs")]
@@ -741,6 +1182,10 @@ impl Default for RetentionConfig {
     }
 }
 
+/// Persisted progress state for the incremental retention maintenance job.
+///
+/// Scan cursors allow the job to resume a partially-completed pass without
+/// re-scanning already-processed keys, keeping each tick's work bounded.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RetentionMaintenanceRuntime {
     #[serde(default)]
@@ -789,6 +1234,10 @@ pub struct RetentionMaintenanceRuntime {
     pub summarization_progress_percent: u8,
 }
 
+/// Cycle balance telemetry derived from a ring-buffer of balance samples.
+///
+/// Burn-rate projections and estimated freeze time are `None` until enough
+/// samples have been collected (at least two distinct timestamps).
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CycleTelemetry {
     pub total_cycles: u128,
@@ -806,6 +1255,12 @@ pub struct CycleTelemetry {
     pub usd_per_trillion_cycles: f64,
 }
 
+// ── Inference types ──────────────────────────────────────────────────────────
+
+/// The LLM backend used for inference.
+///
+/// - `IcLlm` — on-chain IC LLM canister (no API key required).
+/// - `OpenRouter` — external HTTP gateway; requires `openrouter_api_key`.
 #[derive(
     CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
 )]
@@ -815,6 +1270,7 @@ pub enum InferenceProvider {
     OpenRouter,
 }
 
+/// Read-only view of the current inference configuration, returned by queries.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct InferenceConfigView {
     pub provider: InferenceProvider,
@@ -840,6 +1296,7 @@ impl From<&RuntimeSnapshot> for InferenceConfigView {
     }
 }
 
+/// The assembled prompt and context passed to the LLM at the start of a turn.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct InferenceInput {
     pub input: String,
@@ -847,6 +1304,11 @@ pub struct InferenceInput {
     pub turn_id: String,
 }
 
+/// Lifecycle state of an inbox message.
+///
+/// - `Pending` — arrived but not yet staged for processing.
+/// - `Staged` — moved to the staged queue; awaiting consumption by a turn.
+/// - `Consumed` — processed by a completed turn.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum InboxMessageStatus {
     Pending,
@@ -854,6 +1316,7 @@ pub enum InboxMessageStatus {
     Consumed,
 }
 
+/// A message posted to the canister inbox, stored in `INBOX_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct InboxMessage {
     pub id: String,
@@ -866,6 +1329,7 @@ pub struct InboxMessage {
     pub consumed_at_ns: Option<u64>,
 }
 
+/// Aggregate counts across all inbox messages by status.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct InboxStats {
     pub total_messages: u64,
@@ -874,6 +1338,7 @@ pub struct InboxStats {
     pub consumed_count: u64,
 }
 
+/// A reply or autonomous output written by the agent, stored in `OUTBOX_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct OutboxMessage {
     pub id: String,
@@ -881,14 +1346,22 @@ pub struct OutboxMessage {
     pub turn_id: String,
     pub body: String,
     pub created_at_ns: u64,
+    /// The inbox message IDs that triggered this reply (empty for autonomous output).
     pub source_inbox_ids: Vec<String>,
 }
 
+/// Aggregate count of all outbox messages.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct OutboxStats {
     pub total_messages: u64,
 }
 
+// ── Scheduler types ──────────────────────────────────────────────────────────
+
+/// The type of recurring work the scheduler dispatches.
+///
+/// Priority order (lower = higher priority): `AgentTurn` → `PollInbox` →
+/// `CheckCycles` → `TopUpCycles` → `Reconcile`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum TaskKind {
     AgentTurn,
@@ -930,13 +1403,7 @@ impl TaskKind {
     }
 
     pub const fn default_interval_secs(&self) -> u64 {
-        match self {
-            Self::AgentTurn => 60 * 5,
-            Self::PollInbox => 60 * 5,
-            Self::CheckCycles => 60 * 5,
-            Self::TopUpCycles => 60 * 5,
-            Self::Reconcile => 300,
-        }
+        timing::DEFAULT_TASK_INTERVAL_SECS
     }
 
     pub const fn all() -> &'static [Self] {
@@ -951,6 +1418,18 @@ impl TaskKind {
     }
 }
 
+/// Cycle-based survival tier that governs which operations are permitted.
+///
+/// Tier escalation / recovery follows a hysteresis rule: the scheduler requires
+/// `SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED` consecutive `Normal` observations
+/// before downgrading from an elevated tier.
+///
+/// | Tier | Blocked operations |
+/// |------|--------------------|
+/// | `Normal` | none |
+/// | `LowCycles` | `ThresholdSign`, `EvmBroadcast` |
+/// | `Critical` | all |
+/// | `OutOfCycles` | all |
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub enum SurvivalTier {
     #[default]
@@ -960,12 +1439,17 @@ pub enum SurvivalTier {
     OutOfCycles,
 }
 
+/// Execution lane for a scheduled job.
+///
+/// - `Mutating` — acquires the global mutating lease; at most one active at a time.
+/// - `ReadOnly` — runs concurrently with other read-only jobs.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum TaskLane {
     Mutating,
     ReadOnly,
 }
 
+/// Categories of outbound operations subject to per-tier blocking and backoff.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum SurvivalOperationClass {
     Inference,
@@ -974,6 +1458,7 @@ pub enum SurvivalOperationClass {
     ThresholdSign,
 }
 
+/// The class of operation that experienced a recoverable failure.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub enum RecoveryOperation {
@@ -985,6 +1470,7 @@ pub enum RecoveryOperation {
     Unknown,
 }
 
+/// Classification of an HTTP outcall failure used by the recovery policy.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum OutcallFailureKind {
@@ -999,6 +1485,7 @@ pub enum OutcallFailureKind {
     Unknown,
 }
 
+/// Details of a failed HTTP outcall, including optional retry guidance.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct OutcallFailure {
@@ -1009,6 +1496,7 @@ pub struct OutcallFailure {
     pub observed_response_bytes: Option<u64>,
 }
 
+/// Classification of a non-outcall operation failure.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum OperationFailureKind {
@@ -1021,12 +1509,14 @@ pub enum OperationFailureKind {
     Unknown,
 }
 
+/// A non-outcall operation failure with its kind.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct OperationFailure {
     pub kind: OperationFailureKind,
 }
 
+/// A failure that may require recovery — either an outcall or an operation failure.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryFailure {
@@ -1034,6 +1524,7 @@ pub enum RecoveryFailure {
     Operation(OperationFailure),
 }
 
+/// The action the recovery policy recommends after analysing a failure.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub enum RecoveryPolicyAction {
@@ -1045,6 +1536,7 @@ pub enum RecoveryPolicyAction {
     EscalateFault,
 }
 
+/// The specific reason that drove a recovery policy decision.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryDecisionReason {
@@ -1059,6 +1551,7 @@ pub enum RecoveryDecisionReason {
     UnknownFailure,
 }
 
+/// Before/after byte counts for a response-limit tuning step.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResponseLimitAdjustment {
@@ -1066,6 +1559,8 @@ pub struct ResponseLimitAdjustment {
     pub to_bytes: u64,
 }
 
+/// The complete recommendation produced by the recovery policy, including the
+/// recommended action and any backoff or response-limit adjustment.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryDecision {
@@ -1077,12 +1572,14 @@ pub struct RecoveryDecision {
     pub response_limit_adjustment: Option<ResponseLimitAdjustment>,
 }
 
+/// Adaptive response-size limits used to recover from `ResponseTooLarge` errors.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResponseLimitPolicy {
     pub current_bytes: u64,
     pub min_bytes: u64,
     pub max_bytes: u64,
+    /// Each successful tune step multiplies `current_bytes` by this value.
     #[serde(default = "default_response_limit_tune_multiplier")]
     pub tune_multiplier: u64,
 }
@@ -1098,6 +1595,8 @@ impl Default for ResponseLimitPolicy {
     }
 }
 
+/// Per-operation recovery state including consecutive failure count and
+/// exponential backoff configuration.
 #[allow(dead_code)]
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryContext {
@@ -1134,10 +1633,12 @@ impl TaskLane {
     }
 }
 
+/// Per-task scheduling configuration stored in `TASK_CONFIG_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct TaskScheduleConfig {
     pub kind: TaskKind,
     pub enabled: bool,
+    /// Essential tasks are preserved in low-cycles mode; non-essential are skipped.
     pub essential: bool,
     pub interval_secs: u64,
     pub priority: u8,
@@ -1158,18 +1659,21 @@ impl TaskScheduleConfig {
     }
 }
 
+/// Mutable runtime state for a task kind, stored in `TASK_RUNTIME_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct TaskScheduleRuntime {
     pub kind: TaskKind,
     pub next_due_ns: u64,
     pub backoff_until_ns: Option<u64>,
     pub consecutive_failures: u32,
+    /// The job ID of the most recently enqueued job for this task, if still active.
     pub pending_job_id: Option<String>,
     pub last_started_ns: Option<u64>,
     pub last_finished_ns: Option<u64>,
     pub last_error: Option<String>,
 }
 
+/// Current execution status of a [`ScheduledJob`].
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum JobStatus {
     Pending,
@@ -1180,6 +1684,7 @@ pub enum JobStatus {
     Skipped,
 }
 
+/// A single scheduler job entry stored in `JOB_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct ScheduledJob {
     pub id: String,
@@ -1206,6 +1711,10 @@ impl ScheduledJob {
     }
 }
 
+/// An exclusive execution lease held for a mutating job.
+///
+/// Only one `Mutating` lease may be active at a time.  The scheduler checks
+/// `expires_at_ns` on every tick; expired leases are recovered automatically.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct SchedulerLease {
     pub lane: TaskLane,
@@ -1214,6 +1723,7 @@ pub struct SchedulerLease {
     pub expires_at_ns: u64,
 }
 
+/// The top-level scheduler runtime state, stored in `SCHEDULER_RUNTIME_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct SchedulerRuntime {
     pub enabled: bool,
@@ -1293,6 +1803,14 @@ fn default_wallet_balance_sync_low_cycles_interval_secs() -> u64 {
 
 fn default_wallet_balance_sync_freshness_window_secs() -> u64 {
     600
+}
+
+fn default_strategy_slippage_bps() -> u16 {
+    100
+}
+
+fn default_strategy_gas_buffer_bps() -> u16 {
+    120
 }
 
 fn default_wallet_balance_sync_max_response_bytes() -> u64 {

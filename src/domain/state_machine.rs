@@ -1,5 +1,37 @@
+/// Agent lifecycle state machine.
+///
+/// A pure function (`transition`) maps `(current_state, event)` pairs to the
+/// next `AgentState`.  All valid transitions are listed explicitly; any pair
+/// not covered returns a `TransitionError`, making illegal state transitions
+/// compile-time visible through exhaustive match analysis.
+///
+/// # State diagram (happy path)
+///
+/// ```text
+/// Bootstrapping / Idle / Sleeping / Faulted
+///         │  TimerTick
+///         ▼
+///   LoadingContext
+///         │  ContextLoaded  ──────────────────────────────────┐
+///         │  EvmPollCompleted { has_input: true }             │
+///         ▼                                                    ▼
+///      Inferring  ── InferenceCompleted ──► ExecutingActions
+///                                                 │ ActionsCompleted
+///                                                 ▼
+///                                           Persisting
+///                                                 │ PersistCompleted
+///                                                 ▼
+///                                            Sleeping
+/// ```
+///
+/// Any state transitions to `Faulted` on `TurnFailed`; `Faulted` recovers
+/// to `Bootstrapping` on `ResetFault` or to `LoadingContext` on `TimerTick`.
 use crate::domain::types::{AgentEvent, AgentState, TransitionError};
 
+/// Attempt the state transition `(current, event) → next`.
+///
+/// Returns the new `AgentState` on success, or a `TransitionError` describing
+/// the invalid `(from, event)` pair.
 pub fn transition(current: &AgentState, event: &AgentEvent) -> Result<AgentState, TransitionError> {
     match (current, event) {
         (AgentState::Bootstrapping, AgentEvent::TimerTick) => Ok(AgentState::LoadingContext),

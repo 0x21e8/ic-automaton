@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-push validation..."
+
+echo "1/4 Running pre-commit checks..."
+./.githooks/pre-commit
+
+echo "2/4 Running default test suite..."
+cargo test --all-targets
+
+echo "3/4 Building fresh Wasm artifact for PocketIC integration tests..."
+icp build backend
+
+echo "4/4 Running PocketIC integration tests..."
+cargo test --features pocketic_tests
+
+echo "Pre-push validation passed."
