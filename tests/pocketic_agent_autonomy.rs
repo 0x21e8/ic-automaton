@@ -825,8 +825,9 @@ fn high_volume_agent_turn_flow_keeps_forward_progress_with_retention_enabled() {
     set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
     set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
 
-    // The canister scheduler timer ticks every 60 seconds, so we run a long
-    // enough simulated window to guarantee at least 8 agent turns.
+    // The canister scheduler timer ticks every `timing::SCHEDULER_TICK_INTERVAL_SECS`
+    // (2 s in test builds, 30 s in production), so we run a long enough
+    // simulated window to guarantee at least 8 agent turns.
     for _ in 0..260 {
         pic.advance_time(Duration::from_secs(2));
         pic.tick();
