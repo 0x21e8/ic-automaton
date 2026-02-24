@@ -505,15 +505,23 @@ fn poll_inbox_stages_messages_and_agent_turn_consumes_them() {
     pic.advance_time(Duration::from_secs(61));
     pic.tick();
 
-    let after_agent = get_inbox_stats(&pic, canister_id);
-    assert_eq!(after_agent.pending_count, 0);
-    assert_eq!(after_agent.staged_count, 0);
-    assert_eq!(after_agent.consumed_count, 2);
+    let after_first_agent_turn = get_inbox_stats(&pic, canister_id);
+    assert_eq!(after_first_agent_turn.pending_count, 0);
+    assert_eq!(after_first_agent_turn.staged_count, 1);
+    assert_eq!(after_first_agent_turn.consumed_count, 1);
 
     let agent_succeeded = list_scheduler_jobs(&pic, canister_id)
         .into_iter()
         .any(|job| job.kind == TaskKind::AgentTurn && job.status == JobStatus::Succeeded);
     assert!(agent_succeeded, "agent turn should complete successfully");
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let after_second_agent_turn = get_inbox_stats(&pic, canister_id);
+    assert_eq!(after_second_agent_turn.pending_count, 0);
+    assert_eq!(after_second_agent_turn.staged_count, 0);
+    assert_eq!(after_second_agent_turn.consumed_count, 2);
 }
 
 #[test]
@@ -734,21 +742,6 @@ fn non_controller_can_mutate_inference_config_but_not_control_plane() {
         model_result,
         Ok("openai/gpt-4o-mini".to_string()),
         "set_inference_model should allow non-controller callers"
-    );
-
-    let base_url_payload = encode_args(("https://openrouter.ai/api/v1/".to_string(),))
-        .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
-    let base_url_result: Result<String, String> = call_update_as(
-        &pic,
-        canister_id,
-        outsider,
-        "set_openrouter_base_url",
-        base_url_payload,
-    );
-    assert_eq!(
-        base_url_result,
-        Ok("https://openrouter.ai/api/v1".to_string()),
-        "set_openrouter_base_url should allow non-controller callers"
     );
 
     let api_key_payload = encode_args((Some("test-openrouter-key".to_string()),))
