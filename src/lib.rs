@@ -18,6 +18,7 @@ mod domain;
 mod features;
 mod http;
 pub mod prompt;
+mod sanitize;
 mod scheduler;
 mod storage;
 #[allow(dead_code)]
@@ -223,23 +224,27 @@ fn set_loop_enabled(enabled: bool) -> String {
     format!("loop_enabled={enabled}")
 }
 
-/// Sets the active inference backend (`IcLlm` or `OpenRouter`).
+/// Sets the active inference backend (`IcLlm` or `OpenRouter`) (controller only).
 #[ic_cdk::update]
 fn set_inference_provider(provider: InferenceProvider) -> String {
+    ensure_controller_or_trap();
     stable::set_inference_provider(provider.clone());
     format!("inference_provider={provider:?}")
 }
 
-/// Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`).
+/// Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
+/// (controller only).
 #[ic_cdk::update]
 fn set_inference_model(model: String) -> Result<String, String> {
+    ensure_controller()?;
     stable::set_inference_model(model)
 }
 
 /// Stores (or clears) the OpenRouter API key in stable storage.
-/// Pass `None` to remove the key.
+/// Pass `None` to remove the key (controller only).
 #[ic_cdk::update]
 fn set_openrouter_api_key(api_key: Option<String>) -> String {
+    ensure_controller_or_trap();
     stable::set_openrouter_api_key(api_key);
     "openrouter_api_key_updated".to_string()
 }
@@ -716,7 +721,7 @@ fn http_request(request: HttpRequest) -> HttpResponse {
 }
 
 /// Mutable HTTP update handler for write routes (`POST /api/inbox`,
-/// `POST /api/inference/config`, `POST /api/conversation`, …).
+/// `POST /api/conversation`, …).
 /// Called automatically by the IC boundary nodes when `http_request` signals
 /// an upgrade.
 #[ic_cdk::update]

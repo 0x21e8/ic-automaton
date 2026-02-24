@@ -472,7 +472,7 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
 }
 
 #[test]
-fn supports_inference_config_http_flow() {
+fn inference_config_http_route_is_read_only() {
     let (pic, canister_id) = with_backend_canister();
 
     let initial_response = call_http_update(
@@ -512,25 +512,13 @@ fn supports_inference_config_http_flow() {
         )
         .build_update();
     let set_response = call_http_update(&pic, canister_id, set_request);
-    assert_eq!(set_response.status_code().as_u16(), 200);
+    assert_eq!(set_response.status_code().as_u16(), 404);
     let set_json = parse_json_response(&set_response, "POST /api/inference/config set");
-    assert_eq!(set_json.get("ok"), Some(&Value::Bool(true)));
-    let set_config = &set_json["config"];
+    assert_eq!(set_json.get("ok"), Some(&Value::Bool(false)));
     assert_eq!(
-        set_config.get("provider").and_then(Value::as_str),
-        Some("OpenRouter")
+        set_json.get("error").and_then(Value::as_str),
+        Some("not found")
     );
-    assert_eq!(
-        set_config.get("model").and_then(Value::as_str),
-        Some("openai/gpt-4o-mini")
-    );
-    assert_eq!(
-        set_config
-            .get("openrouter_has_api_key")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert!(set_config.get("openrouter_api_key").is_none());
 
     let invalid_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
         .with_headers(vec![(
@@ -546,7 +534,7 @@ fn supports_inference_config_http_flow() {
         )
         .build_update();
     let invalid_response = call_http_update(&pic, canister_id, invalid_request);
-    assert_eq!(invalid_response.status_code().as_u16(), 400);
+    assert_eq!(invalid_response.status_code().as_u16(), 404);
     let invalid_json = parse_json_response(&invalid_response, "POST /api/inference/config invalid");
     assert_eq!(invalid_json.get("ok"), Some(&Value::Bool(false)));
     assert_eq!(
@@ -554,7 +542,7 @@ fn supports_inference_config_http_flow() {
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or_default(),
-        "unsupported inference provider: bad-provider"
+        "not found"
     );
 
     let reread_response = call_http_update(
@@ -566,13 +554,13 @@ fn supports_inference_config_http_flow() {
     let reread_json = parse_json_response(&reread_response, "GET /api/inference/config");
     assert_eq!(
         reread_json.get("provider").and_then(Value::as_str),
-        Some("OpenRouter")
+        Some("IcLlm")
     );
     assert_eq!(
         reread_json
             .get("openrouter_has_api_key")
             .and_then(Value::as_bool),
-        Some(true)
+        Some(false)
     );
     assert!(reread_json.get("openrouter_api_key").is_none());
 
@@ -592,14 +580,14 @@ fn supports_inference_config_http_flow() {
         )
         .build_update();
     let clear_openrouter_response = call_http_update(&pic, canister_id, clear_openrouter_request);
-    assert_eq!(clear_openrouter_response.status_code().as_u16(), 200);
+    assert_eq!(clear_openrouter_response.status_code().as_u16(), 404);
     let clear_openrouter_json = parse_json_response(
         &clear_openrouter_response,
         "POST /api/inference/config clear openrouter",
     );
     assert_eq!(
-        clear_openrouter_json["config"]["openrouter_has_api_key"].as_bool(),
-        Some(false)
+        clear_openrouter_json.get("error").and_then(Value::as_str),
+        Some("not found")
     );
 
     let switch_request: HttpUpdateRequest = HttpRequest::post("/api/inference/config")
@@ -617,25 +605,13 @@ fn supports_inference_config_http_flow() {
         )
         .build_update();
     let switch_response = call_http_update(&pic, canister_id, switch_request);
-    assert_eq!(switch_response.status_code().as_u16(), 200);
+    assert_eq!(switch_response.status_code().as_u16(), 404);
     let switch_json = parse_json_response(
         &switch_response,
         "POST /api/inference/config switch provider",
     );
     assert_eq!(
-        switch_json["config"]
-            .get("provider")
-            .and_then(Value::as_str),
-        Some("IcLlm")
-    );
-    assert_eq!(
-        switch_json["config"].get("model").and_then(Value::as_str),
-        Some("llama3.1:8b")
-    );
-    assert_eq!(
-        switch_json["config"]
-            .get("openrouter_has_api_key")
-            .and_then(Value::as_bool),
-        Some(false)
+        switch_json.get("error").and_then(Value::as_str),
+        Some("not found")
     );
 }
