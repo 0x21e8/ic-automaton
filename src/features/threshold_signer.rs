@@ -1,3 +1,17 @@
+/// IC threshold ECDSA signing adapter.
+///
+/// `ThresholdSignerAdapter` implements `SignerPort` by delegating to the IC
+/// management canister's `sign_with_ecdsa` endpoint (secp256k1, EVM derivation
+/// path `b"evm"`).
+///
+/// On non-wasm32 targets (unit/integration tests) the adapter produces a
+/// deterministic mock signature so that tests can verify the signing path
+/// without an actual IC replica.
+///
+/// The EVM address associated with the ECDSA key is derived once at startup
+/// via `derive_and_cache_evm_address` and cached in stable storage so it is
+/// available synchronously during agent turns.
+// ── Imports ──────────────────────────────────────────────────────────────────
 use crate::storage::stable;
 use crate::tools::SignerPort;
 use async_trait::async_trait;
@@ -14,9 +28,19 @@ use ic_cdk::management_canister::{
     SignWithEcdsaArgs,
 };
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+// BIP-32 derivation path component used for the EVM key — the same path is
+// used for both `ecdsa_public_key` and `sign_with_ecdsa` so the addresses match.
 #[cfg(target_arch = "wasm32")]
 const EVM_DERIVATION_PATH: &[u8] = b"evm";
 
+// ── Adapter ──────────────────────────────────────────────────────────────────
+
+/// Production implementation of `SignerPort` backed by IC threshold ECDSA.
+///
+/// Holds the ECDSA key name (e.g. `"dfx_test_key"` or `"key_1"`) that maps
+/// to a key managed by the IC subnet.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct ThresholdSignerAdapter {
@@ -25,6 +49,7 @@ pub struct ThresholdSignerAdapter {
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl ThresholdSignerAdapter {
+    /// Create a new adapter for the given ECDSA `key_name`.
     pub fn new(key_name: String) -> Self {
         Self { key_name }
     }
@@ -32,6 +57,12 @@ impl ThresholdSignerAdapter {
 
 #[async_trait(?Send)]
 impl SignerPort for ThresholdSignerAdapter {
+    /// Sign a 32-byte message hash with the threshold ECDSA key.
+    ///
+    /// Returns the compact 64-byte signature (r || s) as a 0x-prefixed hex string.
+    /// Fails if the EVM address has not yet been derived (call
+    /// `derive_and_cache_evm_address` at canister init) or if the canister
+    /// has insufficient liquid cycles to pay for the signing request.
     async fn sign_message(&self, message_hash: &str) -> Result<String, String> {
         if stable::get_evm_address().is_none() {
             return Err("evm address not derived yet; retry next turn".to_string());
@@ -82,6 +113,18 @@ impl SignerPort for ThresholdSignerAdapter {
     }
 }
 
+// ── Address derivation ───────────────────────────────────────────────────────
+
+/// Derive the Ethereum address for `key_name` and cache it in stable storage.
+///
+/// Should be called once during canister `init` / `post_upgrade` so the
+/// address is available synchronously on subsequent agent turns without
+/// requiring an inter-canister call.
+///
+/// - wasm32: calls `ecdsa_public_key`, converts the SEC1 compressed public key
+///   to an Ethereum address via Keccak256(uncompressed_pubkey[1..]).
+/// - non-wasm32: deterministically derives a mock address from `key_name`
+///   for use in tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub async fn derive_and_cache_evm_address(key_name: &str) -> Result<String, String> {
     if key_name.trim().is_empty() {

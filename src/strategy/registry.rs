@@ -1,3 +1,21 @@
+/// Strategy registry — thin persistence façade over `storage::stable`.
+///
+/// All mutable state for the strategy subsystem lives in IC stable memory; this module
+/// provides a clean typed API so the rest of the strategy code never calls `stable::`
+/// directly.  Functions are intentionally one-liners: they validate nothing themselves
+/// (that is the caller's responsibility) and simply delegate to the appropriate stable
+/// accessor.
+///
+/// # Sections
+/// - **Template CRUD** — upsert/get/list [`StrategyTemplate`]s.
+/// - **ABI artifacts** — upsert/get/list [`AbiArtifact`]s.
+/// - **Lifecycle state** — activation, revocation, and kill-switch records.
+/// - **Outcome stats** — read-only access to accumulated [`StrategyOutcomeStats`].
+/// - **Canary probe** — deep structural health-check of a template + ABI artifact pair.
+///
+/// [`StrategyTemplate`]: crate::domain::types::StrategyTemplate
+/// [`AbiArtifact`]: crate::domain::types::AbiArtifact
+/// [`StrategyOutcomeStats`]: crate::domain::types::StrategyOutcomeStats
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate,
     StrategyTemplateKey, TemplateActivationState, TemplateRevocationState, TemplateStatus,
@@ -7,10 +25,14 @@ use crate::storage::stable;
 use crate::strategy::abi;
 use std::collections::BTreeMap;
 
+// ── Template CRUD ────────────────────────────────────────────────────────────
+
+/// Persist or update a [`StrategyTemplate`] in stable storage.
 pub fn upsert_template(template: StrategyTemplate) -> Result<StrategyTemplate, String> {
     stable::upsert_strategy_template(template)
 }
 
+/// Retrieve a specific version of a [`StrategyTemplate`], or `None` if absent.
 pub fn get_template(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -18,26 +40,34 @@ pub fn get_template(
     stable::strategy_template(key, version)
 }
 
+/// List all stored versions for a given template key.
 pub fn list_template_versions(key: &StrategyTemplateKey) -> Vec<TemplateVersion> {
     stable::list_strategy_template_versions(key)
 }
 
+/// List up to `limit` templates for a given key across all stored versions.
 pub fn list_templates(key: &StrategyTemplateKey, limit: usize) -> Vec<StrategyTemplate> {
     stable::list_strategy_templates(key, limit)
 }
 
+/// List up to `limit` templates across all keys and versions.
 pub fn list_all_templates(limit: usize) -> Vec<StrategyTemplate> {
     stable::list_all_strategy_templates(limit)
 }
 
+// ── ABI artifacts ────────────────────────────────────────────────────────────
+
+/// Persist or update an [`AbiArtifact`] in stable storage.
 pub fn upsert_abi_artifact(artifact: AbiArtifact) -> Result<AbiArtifact, String> {
     stable::upsert_abi_artifact(artifact)
 }
 
+/// Retrieve an [`AbiArtifact`] by its key, or `None` if absent.
 pub fn get_abi_artifact(key: &AbiArtifactKey) -> Option<AbiArtifact> {
     stable::abi_artifact(key)
 }
 
+/// List all stored versions of the ABI artifact for the given protocol/chain/role triple.
 pub fn list_abi_artifact_versions(
     protocol: &str,
     chain_id: u64,
@@ -46,10 +76,17 @@ pub fn list_abi_artifact_versions(
     stable::list_abi_artifact_versions(protocol, chain_id, role)
 }
 
+// ── Lifecycle state ──────────────────────────────────────────────────────────
+
+/// Persist or update the activation state for a template version.
+///
+/// Setting `enabled = false` prevents the validator from accepting execution plans
+/// for this template version.
 pub fn set_activation(state: TemplateActivationState) -> Result<TemplateActivationState, String> {
     stable::set_strategy_template_activation(state)
 }
 
+/// Retrieve the activation state for a template version, or `None` if never set.
 pub fn activation(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -57,10 +94,14 @@ pub fn activation(
     stable::strategy_template_activation(key, version)
 }
 
+/// Persist or update the revocation state for a template version.
+///
+/// A revoked template cannot be canary-probed and is blocked by the validator's policy layer.
 pub fn set_revocation(state: TemplateRevocationState) -> Result<TemplateRevocationState, String> {
     stable::set_strategy_template_revocation(state)
 }
 
+/// Retrieve the revocation state for a template version, or `None` if never set.
 pub fn revocation(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -68,14 +109,23 @@ pub fn revocation(
     stable::strategy_template_revocation(key, version)
 }
 
+/// Persist or update the kill-switch state for a strategy key (all versions).
+///
+/// When `enabled = true` the validator rejects all execution plans for this key regardless
+/// of version, activation state, or revocation state.
 pub fn set_kill_switch(state: StrategyKillSwitchState) -> Result<StrategyKillSwitchState, String> {
     stable::set_strategy_kill_switch(state)
 }
 
+/// Retrieve the kill-switch state for a strategy key, or `None` if never set.
 pub fn kill_switch(key: &StrategyTemplateKey) -> Option<StrategyKillSwitchState> {
     stable::strategy_kill_switch(key)
 }
 
+// ── Outcome stats ────────────────────────────────────────────────────────────
+
+/// Retrieve accumulated outcome statistics for a template version, or `None` if no outcomes
+/// have been recorded yet.  Stats are written by the learner; this function is read-only.
 pub fn outcome_stats(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -83,6 +133,20 @@ pub fn outcome_stats(
     stable::strategy_outcome_stats(key, version)
 }
 
+// ── Canary probe ─────────────────────────────────────────────────────────────
+
+/// Perform a deep structural health-check on a template and its ABI artifacts.
+///
+/// Verifies:
+/// - The template exists and is not revoked.
+/// - Every action has a non-empty `action_id`, at least one call, and at least one
+///   postcondition.
+/// - Every call role is present in `contract_roles` and has a non-empty `source_ref`.
+/// - Every function in the call sequence has a verifiable selector that appears in the
+///   corresponding [`AbiArtifact`].
+///
+/// This probe is intended to be run after template registration to catch integration
+/// mistakes before the first live execution.
 pub fn canary_probe_template(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,

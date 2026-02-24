@@ -1,3 +1,16 @@
+/// ABI artifact normalisation — parse, canonicalise, and selector-verify Solidity ABI JSON.
+///
+/// Consumers supply raw ABI JSON (either a bare array or an object with an `"abi"` key), an
+/// [`AbiArtifactKey`] that identifies the protocol/chain/role/version, and an optional list of
+/// [`AbiSelectorAssertion`]s that act as compile-time pin-tests for known 4-byte selectors.
+///
+/// The public API is intentionally small:
+/// - [`normalize_abi_artifact`] — validate, parse, and return an in-memory [`AbiArtifact`].
+/// - [`normalize_and_store_abi_artifact`] — same, plus persists to stable storage.
+/// - [`verify_function_selector`] — recompute the selector from an [`AbiFunctionSpec`] and
+///   assert it matches the stored `selector_hex`.
+/// - [`canonical_signature`] / [`recompute_selector_hex`] — low-level helpers used by the
+///   compiler and registry canary probe.
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiSelectorAssertion, AbiTypeSpec,
     TemplateVersion,
@@ -8,6 +21,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+// ── Internal deserialization types ──────────────────────────────────────────
+
+/// Deserialised representation of a single JSON ABI entry before canonicalisation.
 #[derive(Clone, Debug, Deserialize)]
 struct RawAbiEntry {
     #[serde(rename = "type")]
@@ -22,6 +38,7 @@ struct RawAbiEntry {
     state_mutability: Option<String>,
 }
 
+/// A single parameter (input or output) in a raw ABI entry, before type canonicalisation.
 #[derive(Clone, Debug, Deserialize)]
 struct RawAbiParam {
     #[serde(rename = "type")]
@@ -30,6 +47,19 @@ struct RawAbiParam {
     components: Vec<RawAbiParam>,
 }
 
+// ── Public surface ───────────────────────────────────────────────────────────
+
+/// Parse and canonicalise a raw Solidity ABI JSON string into an [`AbiArtifact`].
+///
+/// Steps performed:
+/// 1. Validate the [`AbiArtifactKey`] (non-empty protocol/role, non-zero chain_id, valid version).
+/// 2. Decode the JSON (bare array or `{"abi": […]}`).
+/// 3. For every `"function"` entry: canonicalise types, recompute the 4-byte selector, build an
+///    [`AbiFunctionSpec`], and detect duplicate signatures.
+/// 4. Verify any caller-supplied [`AbiSelectorAssertion`]s against the recomputed selectors.
+/// 5. Sort functions by canonical signature to produce a deterministic artifact.
+///
+/// Returns `Err` if any validation step fails; does **not** persist to storage.
 pub fn normalize_abi_artifact(
     key: AbiArtifactKey,
     abi_json: &str,
@@ -115,6 +145,9 @@ pub fn normalize_abi_artifact(
     })
 }
 
+/// Normalise a raw ABI JSON string and persist the resulting [`AbiArtifact`] to stable storage.
+///
+/// Equivalent to calling [`normalize_abi_artifact`] followed by `stable::upsert_abi_artifact`.
 pub fn normalize_and_store_abi_artifact(
     key: AbiArtifactKey,
     abi_json: &str,
@@ -134,6 +167,8 @@ pub fn normalize_and_store_abi_artifact(
     stable::upsert_abi_artifact(artifact)
 }
 
+/// Recompute the 4-byte selector from an [`AbiFunctionSpec`] and assert it matches
+/// the stored `selector_hex`.  Returns the canonical signature on success.
 pub fn verify_function_selector(spec: &AbiFunctionSpec) -> Result<String, String> {
     let signature = canonical_signature(&spec.name, &spec.inputs)?;
     let recomputed = recompute_selector_hex(&signature);
@@ -146,6 +181,8 @@ pub fn verify_function_selector(spec: &AbiFunctionSpec) -> Result<String, String
     Ok(signature)
 }
 
+/// Build the canonical ABI signature string `name(type0,type1,…)` from a function name
+/// and its (already-canonicalised) input types.  Tuples are expanded recursively.
 pub fn canonical_signature(function_name: &str, inputs: &[AbiTypeSpec]) -> Result<String, String> {
     let trimmed_name = function_name.trim();
     if trimmed_name.is_empty() {
@@ -158,10 +195,13 @@ pub fn canonical_signature(function_name: &str, inputs: &[AbiTypeSpec]) -> Resul
     Ok(format!("{trimmed_name}({})", normalized_args.join(",")))
 }
 
+/// Keccak-256 hash `signature` and return the first 4 bytes as a `0x`-prefixed hex string.
 pub fn recompute_selector_hex(signature: &str) -> String {
     let hash = keccak256(signature.as_bytes());
     format!("0x{}", hex::encode(&hash.as_slice()[..4]))
 }
+
+// ── Private helpers ──────────────────────────────────────────────────────────
 
 fn verify_selector_assertions(
     selector_by_signature: &BTreeMap<String, String>,
@@ -239,6 +279,7 @@ fn normalize_raw_param(raw: &RawAbiParam) -> Result<AbiTypeSpec, String> {
 }
 
 fn normalize_raw_kind(raw_kind: &str) -> Result<String, String> {
+    // Strip whitespace and lowercase so "uint256 " and "UINT256" both normalise to "uint256".
     let compact = raw_kind
         .chars()
         .filter(|char| !char.is_whitespace())
@@ -248,6 +289,7 @@ fn normalize_raw_kind(raw_kind: &str) -> Result<String, String> {
         return Err("abi type must be non-empty".to_string());
     }
 
+    // Tuple types are passed through as-is (with their array suffix validated).
     if let Some(suffix) = compact.strip_prefix("tuple") {
         validate_array_suffix(suffix)?;
         return Ok(format!("tuple{suffix}"));
@@ -255,6 +297,7 @@ fn normalize_raw_kind(raw_kind: &str) -> Result<String, String> {
 
     let (base, suffix) = split_base_and_suffix(&compact);
     validate_array_suffix(suffix)?;
+    // Solidity allows bare "uint"/"int" as shorthands for "uint256"/"int256".
     let canonical_base = match base {
         "uint" => "uint256".to_string(),
         "int" => "int256".to_string(),

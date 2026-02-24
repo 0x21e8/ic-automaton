@@ -1,13 +1,41 @@
+/// Multi-layer execution plan validation.
+///
+/// [`validate_execution_plan`] runs five ordered validation layers against an
+/// [`ExecutionPlan`] before it is submitted on-chain.  Each layer appends
+/// [`ValidationFinding`]s to a shared list; the plan passes only when the list is empty.
+///
+/// # Validation layers
+///
+/// | Layer           | Description |
+/// |-----------------|-------------|
+/// | **Schema**      | Required fields are non-empty; `chain_id > 0`; calls list is non-empty; per-call `value_wei` is a decimal string and `data` is valid `0x`-hex with a 4-byte selector. |
+/// | **Address**     | Runtime `chain_id` matches the plan; `to` addresses are valid 20-byte hex; each call's `to` agrees with the template's `contract_roles` binding. |
+/// | **Policy**      | Template status is `Active`; activation record exists and is enabled; no revocation; no kill-switch; numeric constraint limits (`max_calls`, `max_notional_wei`, etc.) are respected; required postconditions are present. |
+/// | **Preflight**   | Skipped if earlier layers produced findings.  For each call: `eth_estimateGas` and `eth_call` are simulated against the live EVM node.  Failures are classified as deterministic or nondeterministic by [`classify_failure_determinism`]. |
+/// | **Postcondition** | The plan declares at least one non-empty postcondition string. |
+///
+/// # Determinism classification
+///
+/// [`classify_failure_determinism`] inspects the error message to decide whether a
+/// failure is repeatable (deterministic — e.g. `"execution reverted"`) or transient
+/// (nondeterministic — e.g. `"timeout"`).  This drives the learner's penalty model.
+///
+/// [`ExecutionPlan`]: crate::domain::types::ExecutionPlan
+/// [`ValidationFinding`]: crate::domain::types::ValidationFinding
 use crate::domain::types::{ExecutionPlan, ValidationFinding, ValidationLayer, ValidationReport};
 use crate::features::evm::HttpEvmRpcClient;
 use crate::storage::stable;
 use crate::strategy::registry;
+use crate::timing::current_time_ns;
 use alloy_primitives::U256;
 use serde::Deserialize;
 use std::future::Future;
 use std::str::FromStr;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+// ── Internal types ───────────────────────────────────────────────────────────
+
+/// Deserialised representation of the template's `constraints_json` policy blob.
 #[derive(Clone, Debug, Deserialize, Default)]
 struct ConstraintPolicy {
     #[serde(default)]
@@ -24,6 +52,13 @@ struct ConstraintPolicy {
     required_postconditions: Vec<String>,
 }
 
+// ── Public surface ───────────────────────────────────────────────────────────
+
+/// Run all five validation layers against `plan` and return a [`ValidationReport`].
+///
+/// Returns `Ok(report)` regardless of whether the plan passes; the caller must check
+/// `report.passed` (and `report.findings`) before proceeding with submission.
+/// Returns `Err` only if the validator itself encounters an unrecoverable internal error.
 pub fn validate_execution_plan(plan: &ExecutionPlan) -> Result<ValidationReport, String> {
     let snapshot = stable::runtime_snapshot();
     let mut findings = Vec::new();
@@ -42,6 +77,12 @@ pub fn validate_execution_plan(plan: &ExecutionPlan) -> Result<ValidationReport,
     })
 }
 
+/// Classify an execution failure as deterministic (`true`) or nondeterministic (`false`).
+///
+/// Scans the lowercased error string for known markers in order:
+/// 1. **Nondeterministic markers** (timeout, network, rate-limit, …) → `false`.
+/// 2. **Deterministic markers** (revert, invalid, mismatch, …) → `true`.
+/// 3. **Default** — unknown errors are assumed deterministic (fail-closed).
 pub fn classify_failure_determinism(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     let nondeterministic_markers = [
@@ -59,6 +100,8 @@ pub fn classify_failure_determinism(error: &str) -> bool {
         "rate limit",
         "deadline exceeded",
     ];
+    // Nondeterministic check comes first so transient transport errors are never
+    // misclassified as deterministic even if they also contain a word like "invalid".
     if nondeterministic_markers
         .iter()
         .any(|marker| normalized.contains(marker))
@@ -91,9 +134,13 @@ pub fn classify_failure_determinism(error: &str) -> bool {
         return true;
     }
 
+    // Fail-closed: treat unrecognised errors as deterministic to avoid silent retry loops.
     true
 }
 
+// ── Validation layers ────────────────────────────────────────────────────────
+
+/// Layer 1 — structural schema validation; all checks are purely local (no storage I/O).
 fn validate_schema_layer(plan: &ExecutionPlan, findings: &mut Vec<ValidationFinding>) {
     if plan.key.protocol.trim().is_empty() {
         findings.push(finding(
@@ -179,6 +226,8 @@ fn validate_schema_layer(plan: &ExecutionPlan, findings: &mut Vec<ValidationFind
     }
 }
 
+/// Layer 2 — address consistency: runtime chain-id match, address format, and
+/// per-call `to` agreement with the template's `contract_roles` binding.
 fn validate_address_layer(
     plan: &ExecutionPlan,
     template: Option<&crate::domain::types::StrategyTemplate>,
@@ -257,6 +306,8 @@ fn validate_address_layer(
     }
 }
 
+/// Layer 3 — policy gate: template status, activation, revocation, kill-switch, and all
+/// numeric constraint limits decoded from `constraints_json`.
 fn validate_policy_layer(
     plan: &ExecutionPlan,
     template: Option<&crate::domain::types::StrategyTemplate>,
@@ -466,6 +517,10 @@ fn validate_policy_layer(
     }
 }
 
+/// Layer 4 — live EVM preflight simulation via `eth_estimateGas` and `eth_call`.
+///
+/// Skipped entirely if any earlier layer produced a finding, avoiding unnecessary
+/// RPC calls when the plan is already known to be invalid.
 fn validate_preflight_layer(
     plan: &ExecutionPlan,
     snapshot: &crate::domain::types::RuntimeSnapshot,
@@ -544,6 +599,8 @@ fn validate_preflight_layer(
     }
 }
 
+/// Layer 5 — postcondition presence: the plan must declare at least one non-empty
+/// postcondition string so that outcome verification has something to evaluate.
 fn validate_postcondition_layer(
     plan: &ExecutionPlan,
     _template: Option<&crate::domain::types::StrategyTemplate>,
@@ -570,6 +627,10 @@ fn validate_postcondition_layer(
     }
 }
 
+// ── Utility helpers ──────────────────────────────────────────────────────────
+
+/// Parse `constraints_json` into a [`ConstraintPolicy`].  Appends a finding and returns the
+/// default policy on malformed JSON so that validation continues rather than short-circuits.
 fn parse_constraints_policy(raw: &str, findings: &mut Vec<ValidationFinding>) -> ConstraintPolicy {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -647,14 +708,12 @@ fn finding(
     }
 }
 
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    return 1;
-}
-
+/// Synchronously drive a `Future` to completion using a no-op waker and a busy-spin loop.
+///
+/// Used to call async EVM RPC methods from within the synchronous validator on the IC,
+/// where `tokio` / `async-std` runtimes are unavailable.  Panics if the future does not
+/// resolve within 10 000 spin iterations, which indicates a logic error (futures used here
+/// should be backed by the IC's deterministic message execution and always terminate).
 fn block_on_with_spin<F: Future>(future: F) -> F::Output {
     unsafe fn clone(_ptr: *const ()) -> RawWaker {
         dummy_raw_waker()

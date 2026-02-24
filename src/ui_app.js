@@ -3,7 +3,7 @@
  * Phase 1: Terminal shell, command parser, help/clear, command history,
  *          status-bar canister polling, background canvas animation.
  *
- * Phase 2: read-only commands (status, log, peek, price),
+ * Phase 2: read-only commands (status, config, log, peek, history, price),
  *          EVM config bootstrap, viem public client setup.
  *
  * Phase 3: wallet connection/disconnection via viem (connect, disconnect),
@@ -35,9 +35,9 @@ const state = {
   commandHistory: [],
   historyIndex: -1,
 
-  // Follow mode (log -f, peek -f)
+  // Follow mode / live views
   isFollowMode: false,
-  followType: null,      // 'log' | 'peek'
+  followType: null,      // 'log' | 'peek' | 'status'
   followInterval: null,
 
   // Background polling for status bar
@@ -49,6 +49,10 @@ const state = {
   knownTransitionIds: new Set(),
   knownTurnIds: new Set(),
 };
+
+const STATUS_VIEW_REFRESH_MS = 2000;
+const UI_BASE_TICK_SECS = 30;
+const UI_TICKS_PER_TURN_INTERVAL = 10;
 
 // =============================================================================
 // DOM ELEMENTS
@@ -466,15 +470,17 @@ const HELP_LINES = [
   { text: "  send -m \"message\"    Post a message to the automaton", cls: "system" },
   { text: "       [--usdc]          Pay with USDC + ETH (default: ETH only)", cls: "system dim" },
   { text: "  price                Show message cost (ETH and USDC)", cls: "system" },
-  { text: "  status               System diagnostics and automaton state", cls: "system" },
+  { text: "  status               Live automaton status view", cls: "system" },
+  { text: "  config               Configuration overview", cls: "system" },
   { text: "  log [-f]             Activity log  (jobs + transitions)", cls: "system" },
   { text: "  peek [-f]            Internal monologue (inner dialogue)", cls: "system" },
+  { text: "  history              Past messages and automaton responses", cls: "system" },
   { text: "  donate <amount>      Send ETH directly to automaton", cls: "system" },
   { text: "       [--usdc]          Donate USDC instead", cls: "system dim" },
   { text: "  clear                Clear terminal", cls: "system" },
   { text: "  help                 Show this message", cls: "system" },
   { text: null },
-  { text: "  Tip: use -f for live follow mode; press q or Esc to stop.", cls: "system dim" },
+  { text: "  Tip: status is live by default; use -f for log/peek; press q or Esc to stop.", cls: "system dim" },
 ];
 
 function cmdHelp() {
@@ -497,15 +503,178 @@ function cmdClear() {
 // COMMANDS — Phase 2: status
 // =============================================================================
 
-async function cmdStatus() {
-  printEmpty();
-  const spinner = createSpinner("FETCHING SYSTEM STATUS...");
+async function fetchStatusPayload() {
+  const [snapshot, wallet, evmConfig] = await Promise.all([
+    apiFetch("/api/snapshot"),
+    apiFetch("/api/wallet/balance"),
+    apiFetch("/api/evm/config"),
+  ]);
+  state.automatonEvmAddress = evmConfig?.automaton_address ?? state.automatonEvmAddress;
+  state.inboxContractAddress = evmConfig?.inbox_contract_address ?? state.inboxContractAddress;
+  state.usdcContractAddress = evmConfig?.usdc_address ?? state.usdcContractAddress;
+  state.targetChainId = evmConfig?.chain_id ?? state.targetChainId;
+  state.rpcUrl = evmConfig?.rpc_url ?? state.rpcUrl;
+  return { snapshot, wallet };
+}
 
-  let snapshot, wallet;
+function createStatusViewLines() {
+  const lines = {};
+  lines.title = printLine("LIVE STATUS VIEW (refresh every 2s, q or Esc to stop)", "system dim");
+  printSeparator();
+  lines.updated = printLine("UPDATED: --", "system dim");
+  lines.connection = printLine("CONNECTION: --", "system dim");
+  printEmpty();
+
+  printLine("AUTOMATON STATUS", "system bright");
+  printSeparator();
+  lines.runtimeState = printLine("  STATE:           --", "system");
+  lines.runtimeSoul = printLine("  SOUL:            --", "system");
+  lines.runtimeTurns = printLine("  TURNS:           --", "system");
+  lines.runtimeLoop = printLine("  LOOP:            --", "system");
+  lines.runtimeTransition = printLine("  LAST TRANSITION: --", "system");
+  printEmpty();
+
+  printLine("SCHEDULER", "system bright");
+  printSeparator();
+  lines.schedulerEnabled = printLine("  ENABLED:         --", "system");
+  lines.schedulerLowCycles = printLine("  LOW CYCLES:      --", "system");
+  lines.schedulerPaused = printLine("  PAUSED:          --", "system");
+  lines.schedulerLastTick = printLine("  LAST TICK:       --", "system");
+  lines.schedulerLastError = printLine("  LAST ERROR:      --", "system");
+  printEmpty();
+
+  printLine("WALLET", "system bright");
+  printSeparator();
+  lines.walletAddress = printLine("  EVM ADDRESS:     --", "system");
+  lines.walletEth = printLine("  ETH BALANCE:     --", "system");
+  lines.walletUsdc = printLine("  USDC BALANCE:    --", "system");
+  printEmpty();
+
+  printLine("CYCLES", "system bright");
+  printSeparator();
+  lines.cyclesTotal = printLine("  TOTAL:           --", "system");
+  lines.cyclesLiquid = printLine("  LIQUID:          --", "system");
+  lines.cyclesBurnHour = printLine("  BURN/HOUR:       --", "system");
+  lines.cyclesRunway = printLine("  RUNWAY:          --", "system");
+  printEmpty();
+
+  printLine("MEMORY", "system bright");
+  printSeparator();
+  lines.memoryHeap = printLine("  HEAP:            --", "system");
+  lines.memoryStable = printLine("  STABLE:          --", "system");
+  printEmpty();
+
+  printLine("INBOX", "system bright");
+  printSeparator();
+  lines.inboxTotal = printLine("  TOTAL:           --", "system");
+  lines.inboxPending = printLine("  PENDING:         --", "system");
+  lines.inboxStaged = printLine("  STAGED:          --", "system");
+  lines.inboxConsumed = printLine("  CONSUMED:        --", "system");
+  printEmpty();
+  return lines;
+}
+
+function renderStatusView(lines, snapshot, wallet, errorText = null) {
+  const runtime   = snapshot?.runtime        ?? {};
+  const scheduler = snapshot?.scheduler      ?? {};
+  const cycles    = snapshot?.cycles         ?? {};
+  const inbox     = snapshot?.inbox_stats    ?? {};
+  const storage   = snapshot?.storage_growth ?? {};
+
+  const nowLabel = new Date().toLocaleTimeString("en-US", { hour12: false });
+  lines.updated.textContent = `UPDATED: ${nowLabel} · every ${STATUS_VIEW_REFRESH_MS / 1000}s`;
+  lines.connection.textContent = errorText
+    ? `CONNECTION: OFFLINE · ${errorText}`
+    : "CONNECTION: ONLINE";
+
+  lines.runtimeState.textContent = `  STATE:           ${String(runtime.state ?? "unknown").toUpperCase()}`;
+  lines.runtimeSoul.textContent = `  SOUL:            ${runtime.soul ?? "unknown"}`;
+  lines.runtimeTurns.textContent = `  TURNS:           ${runtime.turn_counter ?? 0}`;
+  lines.runtimeLoop.textContent = `  LOOP:            ${runtime.loop_enabled ? "enabled" : "disabled"}`;
+  lines.runtimeTransition.textContent = `  LAST TRANSITION: ${formatAge(runtime.last_transition_at_ns)}`;
+
+  lines.schedulerEnabled.textContent = `  ENABLED:         ${scheduler.enabled ? "yes" : "no"}`;
+  lines.schedulerLowCycles.textContent = `  LOW CYCLES:      ${scheduler.low_cycles_mode ? "yes" : "no"}`;
+  lines.schedulerPaused.textContent = `  PAUSED:          ${scheduler.paused_reason ?? "none"}`;
+  lines.schedulerLastTick.textContent = `  LAST TICK:       ${formatAge(scheduler.last_tick_finished_ns)}`;
+  lines.schedulerLastError.textContent = `  LAST ERROR:      ${scheduler.last_tick_error ?? "none"}`;
+
+  lines.walletAddress.textContent = `  EVM ADDRESS:     ${state.automatonEvmAddress ?? "not configured"}`;
+  const balanceAge = wallet?.age_secs != null ? ` · ${wallet.age_secs}s ago` : "";
+  lines.walletEth.textContent = `  ETH BALANCE:     ${
+    wallet?.eth_balance_wei_hex ? `${formatWei(wallet.eth_balance_wei_hex)} ETH` : "unknown"
+  }${balanceAge}`;
+  lines.walletUsdc.textContent = `  USDC BALANCE:    ${
+    wallet?.usdc_balance_raw_hex
+      ? `${formatUsdcHex(wallet.usdc_balance_raw_hex, wallet.usdc_decimals ?? 6)} USDC`
+      : "unknown"
+  }${balanceAge}`;
+
+  const burnPerHour = cycles.burn_rate_cycles_per_hour != null
+    ? formatCycles(cycles.burn_rate_cycles_per_hour)
+    : "unknown";
+  const burnUsd = cycles.burn_rate_usd_per_hour != null
+    ? ` · $${Number(cycles.burn_rate_usd_per_hour).toFixed(3)}/h`
+    : "";
+  lines.cyclesTotal.textContent = `  TOTAL:           ${formatCycles(cycles.total_cycles)}`;
+  lines.cyclesLiquid.textContent = `  LIQUID:          ${formatCycles(cycles.liquid_cycles)}`;
+  lines.cyclesBurnHour.textContent = `  BURN/HOUR:       ${burnPerHour}${burnUsd}`;
+  lines.cyclesRunway.textContent = `  RUNWAY:          ${formatRunway(cycles.estimated_seconds_until_freezing_threshold)}`;
+
+  lines.memoryHeap.textContent = `  HEAP:            ${formatMb(storage.heap_memory_mb)}`;
+  lines.memoryStable.textContent = `  STABLE:          ${formatMb(storage.stable_memory_mb)}`;
+
+  lines.inboxTotal.textContent = `  TOTAL:           ${inbox.total_messages ?? 0}`;
+  lines.inboxPending.textContent = `  PENDING:         ${inbox.pending_count ?? 0}`;
+  lines.inboxStaged.textContent = `  STAGED:          ${inbox.staged_count ?? 0}`;
+  lines.inboxConsumed.textContent = `  CONSUMED:        ${inbox.consumed_count ?? 0}`;
+}
+
+async function cmdStatus() {
+  if (state.isFollowMode) {
+    stopFollowMode();
+  }
+
+  printEmpty();
+  const lines = createStatusViewLines();
+
+  state.isFollowMode = true;
+  state.followType   = "status";
+  inputRow.classList.add("follow-mode");
+  inputEl.placeholder = "status view — press q to stop";
+
+  let requestInFlight = false;
+  const refresh = async () => {
+    if (requestInFlight) return;
+    requestInFlight = true;
+    try {
+      const { snapshot, wallet } = await fetchStatusPayload();
+      state.lastSnapshotData = snapshot;
+      renderStatusView(lines, snapshot, wallet);
+      updateStatusBar({ online: true, stateName: snapshot?.runtime?.state });
+    } catch (err) {
+      renderStatusView(lines, state.lastSnapshotData, null, String(err?.message ?? err));
+      updateStatusBar({ online: false });
+    } finally {
+      requestInFlight = false;
+    }
+  };
+
+  await refresh();
+  state.followInterval = setInterval(refresh, STATUS_VIEW_REFRESH_MS);
+}
+
+async function cmdConfig() {
+  printEmpty();
+  const spinner = createSpinner("FETCHING CONFIG...");
+
+  let snapshot, inferenceConfig, walletSyncConfig, evmConfig;
   try {
-    [snapshot, wallet] = await Promise.all([
+    [snapshot, inferenceConfig, walletSyncConfig, evmConfig] = await Promise.all([
       apiFetch("/api/snapshot"),
-      apiFetch("/api/wallet/balance"),
+      apiFetch("/api/inference/config"),
+      apiFetch("/api/wallet/balance/sync-config"),
+      apiFetch("/api/evm/config"),
     ]);
   } catch (err) {
     spinner.stop(`ERROR: ${err.message ?? err}`, "error");
@@ -514,87 +683,74 @@ async function cmdStatus() {
   }
   spinner.stop("");
 
-  const runtime   = snapshot?.runtime        ?? {};
-  const scheduler = snapshot?.scheduler      ?? {};
-  const cycles    = snapshot?.cycles         ?? {};
-  const inbox     = snapshot?.inbox_stats    ?? {};
-  const storage   = snapshot?.storage_growth ?? {};
+  state.automatonEvmAddress = evmConfig?.automaton_address ?? state.automatonEvmAddress;
+  state.inboxContractAddress = evmConfig?.inbox_contract_address ?? state.inboxContractAddress;
+  state.usdcContractAddress = evmConfig?.usdc_address ?? state.usdcContractAddress;
+  state.targetChainId = evmConfig?.chain_id ?? state.targetChainId;
+  state.rpcUrl = evmConfig?.rpc_url ?? state.rpcUrl;
+  state.lastSnapshotData = snapshot;
 
-  // — AUTOMATON STATUS —
-  printLine("AUTOMATON STATUS", "system bright");
+  const runtime = snapshot?.runtime ?? {};
+  const scheduler = snapshot?.scheduler ?? {};
+  const llmMode = String(inferenceConfig?.provider ?? runtime.inference_provider ?? "unknown")
+    .toLowerCase();
+  const llmModel = inferenceConfig?.model ?? runtime.inference_model ?? "unknown";
+  const defaultTurnIntervalSecs = UI_BASE_TICK_SECS * UI_TICKS_PER_TURN_INTERVAL;
+
+  printLine("CONFIG", "system bright");
   printSeparator();
-  printLine(`  STATE:           ${String(runtime.state ?? "unknown").toUpperCase()}`, "system");
-  printLine(`  SOUL:            ${runtime.soul ?? "unknown"}`, "system");
-  printLine(`  TURNS:           ${runtime.turn_counter ?? 0}`, "system");
-  printLine(`  LOOP:            ${runtime.loop_enabled ? "enabled" : "disabled"}`, "system");
-  const transAge = runtime.last_transition_at_ns
-    ? formatAge(runtime.last_transition_at_ns)
-    : "never";
-  printLine(`  LAST TRANSITION: ${transAge}`, "system");
+  printLine(`  LLM MODE:                 ${llmMode}`, "system");
+  printLine(`  LLM MODEL:                ${llmModel}`, "system");
+  printLine(`  LOOP ENABLED:             ${runtime.loop_enabled ? "yes" : "no"}`, "system");
+  printLine(`  SCHEDULER ENABLED:        ${scheduler.enabled ? "yes" : "no"}`, "system");
+  printLine(`  LOW CYCLES MODE:          ${scheduler.low_cycles_mode ? "yes" : "no"}`, "system");
+  printLine(`  BASE TICK RATE:           ${UI_BASE_TICK_SECS}s`, "system");
+  printLine(`  DEFAULT TURN INTERVAL:    ${defaultTurnIntervalSecs}s`, "system");
+  printLine(`  STATUS VIEW REFRESH:      ${STATUS_VIEW_REFRESH_MS / 1000}s`, "system");
+  printLine(`  LAST TICK:                ${formatAge(scheduler.last_tick_finished_ns)}`, "system");
   printEmpty();
 
-  // — SCHEDULER —
-  printLine("SCHEDULER", "system bright");
+  printLine("INFERENCE", "system bright");
   printSeparator();
-  printLine(`  ENABLED:         ${scheduler.enabled ? "yes" : "no"}`, "system");
-  printLine(`  LOW CYCLES:      ${scheduler.low_cycles_mode ? "yes" : "no"}`, "system");
-  if (scheduler.paused_reason) {
-    printLine(`  PAUSED:          ${scheduler.paused_reason}`, "system");
-  }
-  const lastTick = scheduler.last_tick_finished_ns
-    ? formatAge(scheduler.last_tick_finished_ns)
-    : "never";
-  printLine(`  LAST TICK:       ${lastTick}`, "system");
-  printLine(`  LAST ERROR:      ${scheduler.last_tick_error ?? "none"}`, "system");
+  printLine(`  PROVIDER:                 ${llmMode}`, "system");
+  printLine(`  MODEL:                    ${llmModel}`, "system");
+  printLine(`  OPENROUTER BASE URL:      ${inferenceConfig?.openrouter_base_url ?? "unknown"}`, "system");
+  printLine(
+    `  OPENROUTER API KEY:       ${inferenceConfig?.openrouter_has_api_key ? "configured" : "not set"}`,
+    "system",
+  );
+  printLine(
+    `  OPENROUTER MAX RESP BYTES: ${inferenceConfig?.openrouter_max_response_bytes ?? "unknown"}`,
+    "system",
+  );
   printEmpty();
 
-  // — WALLET —
-  printLine("WALLET", "system bright");
+  printLine("EVM", "system bright");
   printSeparator();
-  printLine(`  EVM ADDRESS:     ${state.automatonEvmAddress ?? "not configured"}`, "system");
-  const ethStr = wallet?.eth_balance_wei_hex
-    ? `${formatWei(wallet.eth_balance_wei_hex)} ETH`
-    : "unknown";
-  const balAge = wallet?.age_secs != null ? `, ${wallet.age_secs}s ago` : "";
-  printLine(`  ETH BALANCE:     ${ethStr}${balAge}`, "system");
-  const usdcStr = wallet?.usdc_balance_raw_hex
-    ? `${formatUsdcHex(wallet.usdc_balance_raw_hex, wallet.usdc_decimals ?? 6)} USDC`
-    : "unknown";
-  printLine(`  USDC BALANCE:    ${usdcStr}${balAge}`, "system");
+  printLine(`  CHAIN ID:                 ${evmConfig?.chain_id ?? "unknown"}`, "system");
+  printLine(`  RPC URL:                  ${evmConfig?.rpc_url ?? "unknown"}`, "system");
+  printLine(`  AUTOMATON ADDRESS:        ${evmConfig?.automaton_address ?? "not configured"}`, "system");
+  printLine(
+    `  INBOX CONTRACT:           ${evmConfig?.inbox_contract_address ?? "not configured"}`,
+    "system",
+  );
+  printLine(`  USDC CONTRACT:            ${evmConfig?.usdc_address ?? "not configured"}`, "system");
   printEmpty();
 
-  // — CYCLES —
-  if (cycles.total_cycles) {
-    printLine("CYCLES", "system bright");
-    printSeparator();
-    printLine(`  TOTAL:           ${formatCycles(cycles.total_cycles)}`, "system");
-    printLine(`  LIQUID:          ${formatCycles(cycles.liquid_cycles)}`, "system");
-    if (cycles.burn_rate_cycles_per_hour != null) {
-      const usdPart = cycles.burn_rate_usd_per_hour != null
-        ? ` · $${Number(cycles.burn_rate_usd_per_hour).toFixed(3)}/h`
-        : "";
-      printLine(`  BURN/HOUR:       ${formatCycles(cycles.burn_rate_cycles_per_hour)}${usdPart}`, "system");
-    }
-    if (cycles.estimated_seconds_until_freezing_threshold != null) {
-      printLine(`  RUNWAY:          ${formatRunway(cycles.estimated_seconds_until_freezing_threshold)}`, "system");
-    }
-    printEmpty();
-  }
-
-  // — MEMORY —
-  printLine("MEMORY", "system bright");
+  printLine("WALLET SYNC", "system bright");
   printSeparator();
-  printLine(`  HEAP:            ${formatMb(storage.heap_memory_mb)}`, "system");
-  printLine(`  STABLE:          ${formatMb(storage.stable_memory_mb)}`, "system");
-  printEmpty();
-
-  // — INBOX —
-  printLine("INBOX", "system bright");
-  printSeparator();
-  printLine(`  TOTAL:           ${inbox.total_messages ?? 0}`, "system");
-  printLine(`  PENDING:         ${inbox.pending_count ?? 0}`, "system");
-  printLine(`  STAGED:          ${inbox.staged_count ?? 0}`, "system");
-  printLine(`  CONSUMED:        ${inbox.consumed_count ?? 0}`, "system");
+  printLine(`  ENABLED:                  ${walletSyncConfig?.enabled ? "yes" : "no"}`, "system");
+  printLine(`  NORMAL INTERVAL:          ${walletSyncConfig?.normal_interval_secs ?? "unknown"}s`, "system");
+  printLine(
+    `  LOW CYCLES INTERVAL:      ${walletSyncConfig?.low_cycles_interval_secs ?? "unknown"}s`,
+    "system",
+  );
+  printLine(`  FRESHNESS WINDOW:         ${walletSyncConfig?.freshness_window_secs ?? "unknown"}s`, "system");
+  printLine(`  MAX RESPONSE BYTES:       ${walletSyncConfig?.max_response_bytes ?? "unknown"}`, "system");
+  printLine(
+    `  DISCOVER USDC VIA INBOX:  ${walletSyncConfig?.discover_usdc_via_inbox ? "yes" : "no"}`,
+    "system",
+  );
   printEmpty();
 }
 
@@ -726,6 +882,68 @@ function renderTurns(turns) {
       }
     }
 
+    printEmpty();
+  }
+}
+
+async function cmdHistory() {
+  printEmpty();
+
+  if (!state.walletConnected || !state.walletAddress) {
+    printError("No wallet connected. Run 'connect' first.");
+    printEmpty();
+    return;
+  }
+
+  const spinner = createSpinner("FETCHING CONVERSATION HISTORY...");
+  let conversation;
+  try {
+    conversation = await apiFetch("/api/conversation", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sender: state.walletAddress }),
+    });
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    if (message.includes("conversation not found")) {
+      spinner.stop("");
+      printLine("No conversation history for this wallet yet.", "system dim");
+      printLine("Tip: send -m \"message\" to start a conversation.", "system dim");
+      printEmpty();
+      return;
+    }
+    spinner.stop(`ERROR: ${message}`, "error");
+    printEmpty();
+    return;
+  }
+  spinner.stop("");
+
+  const entries = [...(conversation?.entries ?? [])].sort(
+    (a, b) => Number(a.timestamp_ns ?? 0) - Number(b.timestamp_ns ?? 0)
+  );
+
+  if (entries.length === 0) {
+    printLine("No conversation history for this wallet yet.", "system dim");
+    printLine("Tip: send -m \"message\" to start a conversation.", "system dim");
+    printEmpty();
+    return;
+  }
+
+  printLine("CONVERSATION HISTORY", "system bright");
+  printSeparator();
+  printLine(`SENDER: ${state.walletAddress}`, "system dim");
+  printEmpty();
+
+  for (const entry of entries) {
+    const ts = formatTs(entry.timestamp_ns);
+    printLine(`${ts}  YOU`, "system dim");
+    for (const line of String(entry.sender_body ?? "").split("\n")) {
+      printLine(`  ${line}`, "user");
+    }
+    printLine(`${ts}  AUTOMATON`, "system dim");
+    for (const line of String(entry.agent_reply ?? "").split("\n")) {
+      printLine(`  ${line}`, "system");
+    }
     printEmpty();
   }
 }
@@ -1407,6 +1625,10 @@ async function cmdDonate(positional, flags) {
  * snapshot as already-seen so only new entries are appended.
  */
 function startFollowMode(type, initialSnapshot) {
+  if (state.isFollowMode) {
+    stopFollowMode();
+  }
+
   // Reset known-ID sets and populate from the initial snapshot
   state.knownJobIds        = new Set();
   state.knownTransitionIds = new Set();
@@ -1444,6 +1666,7 @@ function stopFollowMode() {
   if (!state.isFollowMode) return;
   clearInterval(state.followInterval);
   state.followInterval = null;
+  const stoppedType = state.followType;
   state.isFollowMode   = false;
   state.followType     = null;
 
@@ -1452,7 +1675,11 @@ function stopFollowMode() {
   inputEl.placeholder = "type 'help' for commands...";
 
   printEmpty();
-  printLine("[follow mode stopped]", "system dim");
+  if (stoppedType === "status") {
+    printLine("[status view closed]", "system dim");
+  } else {
+    printLine("[follow mode stopped]", "system dim");
+  }
   printEmpty();
 }
 
@@ -1530,12 +1757,20 @@ async function handleCommand(raw) {
         await cmdStatus();
         break;
 
+      case "config":
+        await cmdConfig();
+        break;
+
       case "log":
         await cmdLog(flags);
         break;
 
       case "peek":
         await cmdPeek(flags);
+        break;
+
+      case "history":
+        await cmdHistory();
         break;
 
       case "price":

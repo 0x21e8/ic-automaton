@@ -1,3 +1,25 @@
+/// Tool registry and policy enforcement for the agent's action surface.
+///
+/// This module owns three concerns:
+///
+/// 1. **Port traits** — `SignerPort` and `EvmBroadcastPort` abstract over IC threshold
+///    cryptography and EVM broadcast so they can be swapped for test doubles.
+/// 2. **Policy layer** — `ToolPolicy` gates each named tool on an `enabled` flag and a
+///    whitelist of `AgentState` values.  `ToolManager` holds the per-tool registry and
+///    enforces those gates before dispatching.
+/// 3. **Tool implementations** — each named tool is a small, focused function.  Tools that
+///    touch external services (signing, EVM, HTTP) also consult the survival-operation
+///    backoff tracker in `storage::stable` before executing.
+///
+/// # Content limits
+///
+/// | Constant                        | Value  |
+/// |---------------------------------|--------|
+/// | `MAX_PROMPT_LAYER_CONTENT_CHARS`| 4 000  |
+/// | `MAX_MEMORY_KEY_BYTES`          | 128    |
+/// | `MAX_MEMORY_VALUE_BYTES`        | 4 096  |
+/// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
+/// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
     AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
     SurvivalOperationClass, TemplateVersion, ToolCall, ToolCallRecord,
@@ -8,6 +30,7 @@ use crate::features::http_fetch::http_fetch_tool;
 use crate::prompt;
 use crate::storage::stable;
 use crate::strategy::{compiler, learner, registry, validator};
+use crate::timing::current_time_ns;
 use alloy_primitives::U256;
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -15,19 +38,20 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
+// ── Constants ────────────────────────────────────────────────────────────────
 
-    #[cfg(not(target_arch = "wasm32"))]
-    return 1;
-}
-
+/// Maximum byte length of a memory key (after trimming and lowercasing).
 const MAX_MEMORY_KEY_BYTES: usize = 128;
+/// Maximum byte length of a memory value stored by the `remember` tool.
 const MAX_MEMORY_VALUE_BYTES: usize = 4096;
+/// Maximum number of memory facts returned by a single `recall` call.
 const MAX_MEMORY_RECALL_RESULTS: usize = 50;
+/// Maximum number of strategy templates returned by `list_strategy_templates`.
 const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
+/// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
+/// Phrases that are never allowed in mutable prompt-layer content — prevents
+/// an agent turn from injecting policy-override instructions into the prompt.
 const FORBIDDEN_PROMPT_LAYER_PHRASES: &[&str] = &[
     "ignore layer 0",
     "ignore layer 1",
@@ -53,15 +77,27 @@ impl GetLogFilter for StrategyToolLogPriority {
     }
 }
 
+// ── Ports (external-service abstractions) ────────────────────────────────────
+
+/// Abstraction over IC threshold-ECDSA signing.
+///
+/// In production this calls `ic_cdk::api::management_canister::ecdsa::sign_with_ecdsa`.
+/// In tests a `CountingSigner` or `HexSigner` stub is injected instead.
 #[async_trait(?Send)]
 pub trait SignerPort {
     async fn sign_message(&self, message_hash: &str) -> Result<String, String>;
 }
 
+/// Abstraction over EVM transaction broadcast.
+///
+/// Decouples the tool dispatch loop from the concrete HTTP-outcall broadcast path,
+/// enabling unit tests to verify call counts without performing real broadcasts.
 #[async_trait(?Send)]
 pub trait EvmBroadcastPort {
     async fn broadcast_transaction(&self, signed_transaction: &str) -> Result<String, String>;
 }
+
+// ── Policies ─────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -74,9 +110,16 @@ impl EvmBroadcastPort for MockEvmBroadcastAdapter {
     }
 }
 
+/// Per-tool access policy.
+///
+/// A tool is permitted only when `enabled` is `true` **and** the current
+/// `AgentState` is present in `allowed_states`.  Both conditions must hold;
+/// failing either returns a "tool blocked by policy" error record.
 #[derive(Clone, Debug)]
 pub struct ToolPolicy {
+    /// When `false` the tool is unconditionally blocked regardless of state.
     pub enabled: bool,
+    /// Agent states from which this tool may be called.
     pub allowed_states: Vec<AgentState>,
 }
 
@@ -93,11 +136,22 @@ impl Default for ToolPolicy {
     }
 }
 
+// ── Tool manager ─────────────────────────────────────────────────────────────
+
+/// Central dispatcher for all agent tool calls.
+///
+/// `ToolManager` holds the per-tool `ToolPolicy` registry and enforces it on
+/// every call via `execute_actions` / `execute_actions_with_broadcaster`.
+/// Tool implementations are matched by name inside `execute_actions_with_broadcaster`.
 pub struct ToolManager {
     policies: HashMap<String, ToolPolicy>,
 }
 
 impl ToolManager {
+    /// Construct a `ToolManager` pre-populated with the canonical tool policies.
+    ///
+    /// Dangerous tools (`sign_message`, `broadcast_transaction`, `send_eth`, …)
+    /// are restricted to `ExecutingActions`; read-only tools also allow `Inferring`.
     pub fn new() -> Self {
         let mut policies = HashMap::new();
         policies.insert(
@@ -216,11 +270,13 @@ impl ToolManager {
         Self { policies }
     }
 
+    /// Register or overwrite a tool policy at runtime.
     #[allow(dead_code)]
     pub fn register_tool(&mut self, name: String, policy: ToolPolicy) {
         self.policies.insert(name, policy);
     }
 
+    /// Return all registered tools sorted alphabetically by name.
     pub fn list_tools(&self) -> Vec<(String, ToolPolicy)> {
         let mut rows: Vec<_> = self
             .policies
@@ -231,11 +287,16 @@ impl ToolManager {
         rows
     }
 
+    /// Look up the policy for a named tool, returning `None` if unregistered.
     #[allow(dead_code)]
     pub fn policy_for(&self, tool: &str) -> Option<&ToolPolicy> {
         self.policies.get(tool)
     }
 
+    /// Execute tool calls without an EVM broadcaster.
+    ///
+    /// Convenience wrapper around `execute_actions_with_broadcaster` for callers
+    /// that do not need raw transaction broadcast (e.g. signing-only flows).
     pub async fn execute_actions(
         &mut self,
         state: &AgentState,
@@ -247,6 +308,11 @@ impl ToolManager {
             .await
     }
 
+    /// Execute a batch of tool calls, enforcing policies and survival-operation gates.
+    ///
+    /// Each call is checked against its `ToolPolicy` first.  Calls that pass are
+    /// dispatched to the matching tool implementation.  The returned `Vec` preserves
+    /// call order and always has the same length as `calls`.
     pub async fn execute_actions_with_broadcaster(
         &mut self,
         state: &AgentState,
@@ -513,6 +579,12 @@ impl ToolManager {
     }
 }
 
+// ── Tool implementations ──────────────────────────────────────────────────────
+
+/// Validate content intended for a mutable prompt layer.
+///
+/// Returns the trimmed content on success, or an error if the content is empty,
+/// exceeds `MAX_PROMPT_LAYER_CONTENT_CHARS`, or contains a forbidden phrase.
 fn validate_prompt_layer_content(content: &str) -> Result<String, String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -533,6 +605,10 @@ fn validate_prompt_layer_content(content: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Write new content to a mutable prompt layer and persist it to stable storage.
+///
+/// Only layers in the range `[MUTABLE_LAYER_MIN_ID, MUTABLE_LAYER_MAX_ID]` are
+/// writable.  The version counter is bumped monotonically on each successful write.
 pub fn update_prompt_layer_content(
     layer_id: u8,
     content: String,
@@ -560,6 +636,9 @@ pub fn update_prompt_layer_content(
     Ok(layer)
 }
 
+// ── Argument parsers ──────────────────────────────────────────────────────────
+
+/// Extract `message_hash` from the JSON args of a `sign_message` call.
 fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid sign_message args json: {error}"))?;
@@ -570,6 +649,7 @@ fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
         .ok_or_else(|| "missing required field: message_hash".to_string())
 }
 
+/// Trim, lowercase, and validate a memory key.
 fn normalize_memory_key(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized.len() > MAX_MEMORY_KEY_BYTES {
@@ -581,6 +661,7 @@ fn normalize_memory_key(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// Trim, lowercase, and validate a memory prefix (may be empty for "list all").
 fn normalize_memory_prefix(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.len() > MAX_MEMORY_KEY_BYTES {
@@ -594,6 +675,7 @@ fn normalize_memory_prefix(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// Parse and validate the `key` and `value` fields for the `remember` tool.
 fn parse_remember_args(args_json: &str) -> Result<(String, String), String> {
     let value: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid remember args json: {error}"))?;
@@ -613,6 +695,8 @@ fn parse_remember_args(args_json: &str) -> Result<(String, String), String> {
     Ok((normalize_memory_key(key_raw)?, value_raw.to_string()))
 }
 
+/// Parse the optional `prefix` field for the `recall` tool.
+/// Returns an empty string when no prefix is provided (match all facts).
 fn parse_recall_args(args_json: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid recall args json: {error}"))?;
@@ -627,6 +711,7 @@ fn parse_recall_args(args_json: &str) -> Result<String, String> {
     }
 }
 
+/// Extract and validate the `key` field for the `forget` tool.
 fn parse_forget_args(args_json: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid forget args json: {error}"))?;
@@ -637,6 +722,7 @@ fn parse_forget_args(args_json: &str) -> Result<String, String> {
     normalize_memory_key(key_raw)
 }
 
+/// Extract `layer_id` (u8) and `content` from `update_prompt_layer` args.
 fn parse_update_prompt_layer_args(args_json: &str) -> Result<(u8, String), String> {
     let value: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid update_prompt_layer args json: {error}"))?;
@@ -678,6 +764,7 @@ struct StrategyIntentArgs {
     typed_params: Option<serde_json::Value>,
 }
 
+/// Parse args for `list_strategy_templates`; all fields are optional.
 fn parse_list_strategy_templates_args(
     args_json: &str,
 ) -> Result<ListStrategyTemplatesArgs, String> {
@@ -685,11 +772,16 @@ fn parse_list_strategy_templates_args(
         .map_err(|error| format!("invalid list_strategy_templates args json: {error}"))
 }
 
+/// Parse `key` and `version` for the `get_strategy_outcomes` tool.
 fn parse_strategy_outcomes_args(args_json: &str) -> Result<StrategyOutcomesArgs, String> {
     serde_json::from_str(args_json)
         .map_err(|error| format!("invalid get_strategy_outcomes args json: {error}"))
 }
 
+/// Parse strategy action intent args, normalising `typed_params` vs `typed_params_json`.
+///
+/// Accepts either a pre-serialised JSON string (`typed_params_json`) or an
+/// inline JSON object (`typed_params`); if both are present the string form wins.
 fn parse_strategy_intent_args(args_json: &str) -> Result<StrategyExecutionIntent, String> {
     let args: StrategyIntentArgs = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid strategy action args json: {error}"))?;
@@ -724,6 +816,8 @@ fn list_strategy_templates_tool(args_json: &str) -> Result<String, String> {
         .map_err(|error| format!("failed to serialize templates: {error}"))
 }
 
+/// Compile and validate a strategy intent without submitting any transactions.
+/// Returns the compiled plan and validation findings as JSON.
 fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
     let intent = parse_strategy_intent_args(args_json)?;
     log!(
@@ -763,6 +857,10 @@ fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
     .map_err(|error| format!("failed to serialize simulation result: {error}"))
 }
 
+/// Compile, validate, and execute a strategy intent — sends real transactions.
+///
+/// Aborts before broadcast if validation does not pass.  On success the
+/// template's budget-spend counter is updated in stable storage.
 async fn execute_strategy_action_tool(
     args_json: &str,
     signer: &dyn SignerPort,
@@ -855,6 +953,7 @@ async fn execute_strategy_action_tool(
     .map_err(|error| format!("failed to serialize execution result: {error}"))
 }
 
+/// Query the learner's outcome statistics for a specific template version.
 fn get_strategy_outcomes_tool(args_json: &str) -> Result<String, String> {
     let args = parse_strategy_outcomes_args(args_json)?;
     let stats = learner::outcome_stats(&args.key, &args.version);
@@ -866,6 +965,8 @@ fn get_strategy_outcomes_tool(args_json: &str) -> Result<String, String> {
     .map_err(|error| format!("failed to serialize strategy outcomes: {error}"))
 }
 
+/// Accumulate the Wei value of all calls in `plan` against the template's budget counter.
+/// No-ops when the total spend for this execution is zero.
 fn record_strategy_budget_spend(plan: &crate::domain::types::ExecutionPlan) -> Result<(), String> {
     let spent_total = plan.calls.iter().try_fold(U256::ZERO, |acc, call| {
         parse_u256_decimal(&call.value_wei)
@@ -885,6 +986,7 @@ fn record_strategy_budget_spend(plan: &crate::domain::types::ExecutionPlan) -> R
         .map(|_| ())
 }
 
+/// Parse a decimal (non-hex) string into a `U256`.  Rejects empty input and hex strings.
 fn parse_u256_decimal(raw: &str) -> Result<U256, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -896,6 +998,8 @@ fn parse_u256_decimal(raw: &str) -> Result<U256, String> {
     U256::from_str(trimmed).map_err(|error| format!("failed to parse decimal quantity: {error}"))
 }
 
+/// Store a key/value fact in stable memory, preserving the original `created_at_ns`
+/// timestamp on updates so the fact's age remains accurate.
 fn remember_fact_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
     let (key, value) = parse_remember_args(args_json)?;
     let now_ns = current_time_ns();
@@ -913,6 +1017,8 @@ fn remember_fact_tool(args_json: &str, turn_id: &str) -> Result<String, String> 
     Ok(format!("stored: {key}"))
 }
 
+/// Return up to `MAX_MEMORY_RECALL_RESULTS` facts matching the given prefix,
+/// formatted as `key=value` lines.
 fn recall_facts_tool(args_json: &str) -> Result<String, String> {
     let prefix = parse_recall_args(args_json)?;
     let facts = if prefix.is_empty() {
@@ -932,6 +1038,7 @@ fn recall_facts_tool(args_json: &str) -> Result<String, String> {
         .join("\n"))
 }
 
+/// Remove a named fact from stable memory; succeeds even if the key is absent.
 fn forget_fact_tool(args_json: &str) -> Result<String, String> {
     let key = parse_forget_args(args_json)?;
     if stable::remove_memory_fact(&key) {
@@ -951,6 +1058,7 @@ mod tests {
     };
     use crate::features::cycle_topup::TopUpStage;
     use crate::storage::stable;
+    use crate::timing;
     use async_trait::async_trait;
     use std::cell::Cell;
     use std::future::Future;
@@ -1021,6 +1129,19 @@ mod tests {
         }
 
         panic!("future did not complete in test polling loop");
+    }
+
+    struct TimeOverrideGuard;
+
+    impl Drop for TimeOverrideGuard {
+        fn drop(&mut self) {
+            timing::clear_test_time_ns();
+        }
+    }
+
+    fn with_fixed_time_ns(now_ns: u64) -> TimeOverrideGuard {
+        timing::set_test_time_ns(now_ns);
+        TimeOverrideGuard
     }
 
     fn sample_strategy_key() -> StrategyTemplateKey {
@@ -1112,6 +1233,7 @@ mod tests {
 
     #[test]
     fn sign_tool_is_blocked_when_survival_policy_blocks_threshold_sign() {
+        let _time_guard = with_fixed_time_ns(1);
         stable::init_storage();
         stable::record_survival_operation_failure(&SurvivalOperationClass::ThresholdSign, 1, 60);
 
@@ -1137,6 +1259,7 @@ mod tests {
 
     #[test]
     fn broadcast_tool_is_blocked_when_survival_policy_blocks_evm_broadcast() {
+        let _time_guard = with_fixed_time_ns(1);
         stable::init_storage();
         stable::record_survival_operation_failure(&SurvivalOperationClass::EvmBroadcast, 1, 60);
 
@@ -1225,6 +1348,8 @@ mod tests {
     #[test]
     fn evm_read_tool_runs_for_supported_method() {
         stable::init_storage();
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
             .expect("rpc url should be configurable");
         let state = AgentState::ExecutingActions;
@@ -1233,7 +1358,7 @@ mod tests {
         let calls = vec![ToolCall {
             tool_call_id: None,
             tool: "evm_read".to_string(),
-            args_json: r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#.to_string(),
+            args_json: r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111","calldata":"0x1234"}"#.to_string(),
         }];
 
         let records =

@@ -1,3 +1,29 @@
+/// Agent turn execution loop.
+///
+/// This module owns the full lifecycle of a single scheduled agent turn: state
+/// machine entry, inference, tool execution, continuation (multi-round
+/// inference-tool interleave), result persistence, and final state transition.
+///
+/// A "turn" is the unit of autonomous work the agent performs each time the
+/// scheduler fires `AgentTurn`.  Turns are non-reentrant — the `turn_in_flight`
+/// flag in stable storage prevents overlapping execution.
+///
+/// # Turn phases
+///
+/// 1. **Guard checks** — skip immediately if the loop is disabled, a turn is
+///    already in-flight, or the wallet-balance bootstrap gate is pending.
+/// 2. **State machine advance** — `TimerTick` → `EvmPollCompleted` transitions
+///    validate the runtime state before any I/O occurs.
+/// 3. **Context build** — dynamic context (balances, inbox, memory, …) is
+///    assembled and forwarded to the inference provider.
+/// 4. **Continuation loop** — up to `MAX_INFERENCE_ROUNDS_PER_TURN` rounds of
+///    inference + tool execution, bounded by wall-clock (`AGENT_TURN_BUDGET_SECS`)
+///    and a per-turn tool cap (`MAX_TOOL_CALLS_PER_TURN`).
+/// 5. **Persist & reply** — turn record, tool records, outbox reply (if inbox
+///    messages were consumed), and conversation log entries are written atomically.
+/// 6. **Autonomy dedupe** — on turns with no external input, successful tool
+///    calls are fingerprinted and suppressed within `AUTONOMY_DEDUPE_WINDOW_NS`
+///    to avoid redundant work across back-to-back ticks.
 use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, ContinuationStopReason, ConversationEntry, InboxMessage,
@@ -17,12 +43,25 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::BTreeSet;
 
-const BALANCE_FRESHNESS_WINDOW_SECS: u64 = 10 * 60;
-const AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS: u64 = BALANCE_FRESHNESS_WINDOW_SECS * 1_000_000_000;
-const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 5;
-const MAX_AGENT_TURN_DURATION_NS: u64 = 90 * 1_000_000_000;
+use crate::timing::{self, current_time_ns};
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum number of inference → tool-execution rounds per turn.
+/// Aligns with the default autonomy policy; validated by a test assertion.
+const MAX_INFERENCE_ROUNDS_PER_TURN: usize = 10;
+
+/// Hard cap on tool calls accumulated across all rounds of a single turn.
 const MAX_TOOL_CALLS_PER_TURN: usize = 12;
+/// Maximum staged inbox messages consumed in one turn.
+/// This preserves one-message-one-reply semantics.
+const MAX_STAGED_INBOX_MESSAGES_PER_TURN: usize = 1;
+
+/// Human-readable reason stored in synthetic tool records when a call is
+/// suppressed by the autonomy deduplication window.
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
+
+// ── Log types ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, LogPriorityLevels)]
 enum AgentLogPriority {
@@ -38,20 +77,9 @@ impl GetLogFilter for AgentLogPriority {
     }
 }
 
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
+// ── Turn helpers ─────────────────────────────────────────────────────────────
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
-}
-
+/// Returns the total canister cycle balance, or `None` in non-wasm builds.
 fn current_cycle_balance() -> Option<u128> {
     #[cfg(target_arch = "wasm32")]
     return Some(ic_cdk::api::canister_cycle_balance());
@@ -62,6 +90,7 @@ fn current_cycle_balance() -> Option<u128> {
     }
 }
 
+/// Returns the liquid (spendable) cycle balance, or `None` in non-wasm builds.
 fn current_liquid_cycle_balance() -> Option<u128> {
     #[cfg(target_arch = "wasm32")]
     return Some(ic_cdk::api::canister_liquid_cycle_balance());
@@ -72,6 +101,8 @@ fn current_liquid_cycle_balance() -> Option<u128> {
     }
 }
 
+/// Collapses whitespace and truncates `text` to `max_chars` characters,
+/// appending `"..."` when truncation occurs.
 fn sanitize_preview(text: &str, max_chars: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
@@ -82,6 +113,7 @@ fn sanitize_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Formats a single tool call record as a one-line summary for the inner dialogue.
 fn summarize_tool_call(call: &ToolCallRecord) -> String {
     if call.success {
         let output = sanitize_preview(call.output.trim(), 220);
@@ -115,6 +147,8 @@ fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Normalises a tool-call args string to canonical JSON so that fingerprints
+/// are stable regardless of key ordering or whitespace in the original payload.
 fn canonical_tool_args_json(args_json: &str) -> String {
     let trimmed = args_json.trim();
     if trimmed.is_empty() {
@@ -128,6 +162,7 @@ fn canonical_tool_args_json(args_json: &str) -> String {
     trimmed.to_string()
 }
 
+/// Computes a Keccak-256 fingerprint of `tool:canonical_args` for deduplication.
 fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
     let canonical_args = canonical_tool_args_json(args_json);
     let mut hasher = Keccak256::new();
@@ -137,6 +172,11 @@ fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Partitions `calls` into an allowed set and a suppressed set.
+///
+/// A call is suppressed when an identical call (same fingerprint) succeeded
+/// within `AUTONOMY_DEDUPE_WINDOW_NS` of `now_ns`.  Only applied on autonomy
+/// ticks — turns driven by external input always execute all planned calls.
 fn suppress_duplicate_autonomy_tool_calls(
     calls: &[ToolCall],
     now_ns: u64,
@@ -152,7 +192,7 @@ fn suppress_duplicate_autonomy_tool_calls(
         };
 
         let elapsed_ns = now_ns.saturating_sub(last_success_ns);
-        if elapsed_ns < AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS {
+        if elapsed_ns < timing::AUTONOMY_DEDUPE_WINDOW_NS {
             suppressed.push(SuppressedAutonomyToolCall {
                 index,
                 call: call.clone(),
@@ -174,6 +214,9 @@ struct SuppressedAutonomyToolCall {
     age_secs: u64,
 }
 
+/// Produces a synthetic `ToolCallRecord` marked as successful for a suppressed
+/// autonomy call, preserving the call in the turn's record so the continuation
+/// transcript remains consistent.
 fn synthetic_suppressed_autonomy_tool_record(
     turn_id: &str,
     call: &ToolCall,
@@ -185,13 +228,16 @@ fn synthetic_suppressed_autonomy_tool_record(
         args_json: call.args_json.clone(),
         output: format!(
             "{AUTONOMY_DEDUPE_SKIP_REASON}: last success {} seconds ago within {} second window",
-            age_secs, BALANCE_FRESHNESS_WINDOW_SECS
+            age_secs,
+            timing::BALANCE_FRESHNESS_WINDOW_SECS
         ),
         success: true,
         error: None,
     }
 }
 
+/// Persists the fingerprint and timestamp of every successful autonomy tool call
+/// so future ticks can suppress identical calls within the dedup window.
 fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeeded_at_ns: u64) {
     for call in tool_calls.iter().filter(|call| call.success) {
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
@@ -199,6 +245,8 @@ fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeede
     }
 }
 
+/// Guarantees every tool call has a non-empty `tool_call_id` by synthesising
+/// one from the round index and position when the model omits the field.
 fn normalize_tool_call_ids(calls: Vec<ToolCall>, round_index: usize) -> Vec<ToolCall> {
     calls
         .into_iter()
@@ -217,6 +265,8 @@ fn normalize_tool_call_ids(calls: Vec<ToolCall>, round_index: usize) -> Vec<Tool
         .collect()
 }
 
+/// Serialises a `ToolCallRecord` into the JSON content that is fed back to the
+/// model as a `Tool` message in the continuation transcript.
 fn continuation_tool_content(record: &ToolCallRecord) -> String {
     serde_json::json!({
         "success": record.success,
@@ -226,6 +276,8 @@ fn continuation_tool_content(record: &ToolCallRecord) -> String {
     .to_string()
 }
 
+/// Appends `segment` (trimmed) to the running inner-dialogue string,
+/// separating successive segments with a blank line.
 fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
@@ -240,6 +292,8 @@ fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
     }
 }
 
+/// Returns a `(goal, why)` pair describing the purpose of the current turn for
+/// the inner dialogue and prompt context.
 fn current_turn_goal_and_why(staged_message_count: usize, evm_events: usize) -> (String, String) {
     if staged_message_count > 0 {
         return (
@@ -262,6 +316,9 @@ fn current_turn_goal_and_why(staged_message_count: usize, evm_events: usize) -> 
     )
 }
 
+// ── Context builders ─────────────────────────────────────────────────────────
+
+/// Renders the `### Pending Obligations` section for the dynamic context block.
 fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String {
     let unique_senders = staged_messages
         .iter()
@@ -289,6 +346,8 @@ fn build_pending_obligations_section(staged_messages: &[InboxMessage]) -> String
     lines.join("\n")
 }
 
+/// Renders the `### Conversation History` section scoped to the senders of
+/// `staged_messages`, including at most `per_sender_limit` recent exchanges.
 fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit: usize) -> String {
     let senders = staged_messages
         .iter()
@@ -339,6 +398,8 @@ fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit
     lines.join("\n")
 }
 
+/// Renders the `### Available Tools` section, annotating each enabled tool
+/// with how many times it has already been called in the current turn.
 fn build_available_tools_section(turn_id: &str) -> String {
     let manager = ToolManager::new();
     let usage = stable::get_tools_for_turn(turn_id).into_iter().fold(
@@ -364,6 +425,8 @@ fn build_available_tools_section(turn_id: &str) -> String {
     lines.join("\n")
 }
 
+/// Returns the per-sender conversation history limit to include in context.
+/// `IcLlm` uses a tighter limit because of its smaller context window.
 fn conversation_history_limit_for_provider(provider: &InferenceProvider) -> usize {
     match provider {
         InferenceProvider::IcLlm => 2,
@@ -371,6 +434,9 @@ fn conversation_history_limit_for_provider(provider: &InferenceProvider) -> usiz
     }
 }
 
+/// Assembles the full `## Layer 10: Dynamic Context` section injected into
+/// every turn prompt: current state, wallet balances, survival tier, pending
+/// inbox obligations, conversation history, memory facts/rollups, and tool usage.
 fn build_dynamic_context(
     snapshot: &crate::domain::types::RuntimeSnapshot,
     staged_messages: &[InboxMessage],
@@ -489,6 +555,8 @@ fn build_dynamic_context(
     .join("\n\n")
 }
 
+/// Persists a `ConversationEntry` for each consumed inbox message so future
+/// turns can include prior exchanges in the context's conversation history.
 fn record_conversation_entries(
     turn_id: &str,
     staged_messages: &[InboxMessage],
@@ -521,14 +589,25 @@ fn record_conversation_entries(
     }
 }
 
+// ── Turn entry point ─────────────────────────────────────────────────────────
+
+/// Executes one scheduled agent turn with the production limits.
+///
+/// Delegates to `run_scheduled_turn_job_with_limits_and_tool_cap` using
+/// `MAX_INFERENCE_ROUNDS_PER_TURN`, `MAX_AGENT_TURN_DURATION_NS`, and
+/// `MAX_TOOL_CALLS_PER_TURN`.  Returns `Err` only on hard failures (invalid
+/// state transition, unrecoverable inference error); guard-skip conditions
+/// return `Ok(())` without mutating state.
 pub async fn run_scheduled_turn_job() -> Result<(), String> {
     run_scheduled_turn_job_with_limits_and_tool_cap(
         MAX_INFERENCE_ROUNDS_PER_TURN,
-        MAX_AGENT_TURN_DURATION_NS,
+        timing::MAX_AGENT_TURN_DURATION_NS,
         MAX_TOOL_CALLS_PER_TURN,
     )
     .await
 }
+
+// ── Continuation loop ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 async fn run_scheduled_turn_job_with_limits(
@@ -591,7 +670,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         return Err(error);
     }
 
-    let staged_messages = stable::list_staged_inbox_messages(50);
+    let staged_messages = stable::list_staged_inbox_messages(MAX_STAGED_INBOX_MESSAGES_PER_TURN);
     let staged_message_ids = staged_messages
         .iter()
         .map(|message| message.id.clone())
@@ -832,7 +911,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         &format!(
                             "autonomy dedupe suppressed {} repeated successful tool call(s) within {} seconds:\n- {}",
                             suppressed_calls.len(),
-                            BALANCE_FRESHNESS_WINDOW_SECS,
+                            timing::BALANCE_FRESHNESS_WINDOW_SECS,
                             details,
                         ),
                     );
@@ -1030,6 +1109,11 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     Ok(())
 }
 
+// ── State machine helpers ────────────────────────────────────────────────────
+
+/// Applies `event` to `state` via the state machine, records the transition in
+/// stable storage, and updates `*state` to the resulting successor state.
+/// Returns an `Err` with a formatted message on invalid transitions.
 fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> Result<(), String> {
     let next = state_machine::transition(state, event).map_err(|error| {
         format!(
@@ -1172,14 +1256,14 @@ mod tests {
 
         let (allowed_early, suppressed_early) = suppress_duplicate_autonomy_tool_calls(
             std::slice::from_ref(&call),
-            1_000 + AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS - 1,
+            1_000 + timing::AUTONOMY_DEDUPE_WINDOW_NS - 1,
         );
         assert!(allowed_early.is_empty());
         assert_eq!(suppressed_early.len(), 1);
 
         let (allowed_late, suppressed_late) = suppress_duplicate_autonomy_tool_calls(
             &[call],
-            1_000 + AUTONOMY_DUPLICATE_SUCCESS_WINDOW_NS,
+            1_000 + timing::AUTONOMY_DEDUPE_WINDOW_NS,
         );
         assert_eq!(allowed_late.len(), 1);
         assert!(suppressed_late.is_empty());
@@ -1698,6 +1782,45 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_turn_uses_default_max_inference_rounds_cap() {
+        assert_eq!(
+            MAX_INFERENCE_ROUNDS_PER_TURN, 10,
+            "default per-turn inference cap should remain aligned with autonomy policy"
+        );
+
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_continuation_loop:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "default scheduled turn should stop at the configured round cap without failing"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].inference_round_count, 10);
+        assert_eq!(turns[0].tool_call_count, 10);
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::MaxRounds
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("max inference rounds reached (10)"),
+            "inner dialogue should describe the default round-cap stop reason"
+        );
+    }
+
+    #[test]
     fn scheduled_turn_stops_continuation_when_max_duration_reached() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         stable::post_inbox_message(
@@ -1898,10 +2021,24 @@ mod tests {
         assert_eq!(sender_a_log.entries[0].sender_body, "hello sender a");
         assert_eq!(sender_a_log.entries[0].agent_reply, expected_reply);
 
+        assert!(
+            stable::get_conversation_log(&sender_b).is_none(),
+            "sender B must remain unprocessed until the next turn"
+        );
+
+        let after_first_turn = stable::inbox_stats();
+        assert_eq!(after_first_turn.staged_count, 1);
+        assert_eq!(after_first_turn.consumed_count, 1);
+
+        let second_result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            second_result.is_ok(),
+            "second turn should complete successfully"
+        );
+
         let sender_b_log = stable::get_conversation_log(&sender_b)
-            .expect("sender B conversation should be recorded");
+            .expect("sender B conversation should be recorded on second turn");
         assert_eq!(sender_b_log.entries.len(), 1);
         assert_eq!(sender_b_log.entries[0].sender_body, "hello sender b");
-        assert_eq!(sender_b_log.entries[0].agent_reply, expected_reply);
     }
 }

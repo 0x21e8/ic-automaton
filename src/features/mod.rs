@@ -1,3 +1,16 @@
+//! Feature modules — each sub-module implements a distinct capability of the automaton.
+//!
+//! | Module               | Responsibility                                                |
+//! |----------------------|---------------------------------------------------------------|
+//! | `inference`          | LLM inference (IC LLM canister + OpenRouter)                 |
+//! | `evm`                | EVM RPC, event polling, EIP-1559 signing/broadcast           |
+//! | `http_fetch`         | Allowlisted HTTPS GET with cycle-affordability guard         |
+//! | `threshold_signer`   | IC threshold ECDSA signing and EVM address derivation        |
+//! | `cycle_topup`        | Multi-stage USDC → cycles top-up state machine               |
+//! | `cycle_topup_host`   | Host-side orchestration and scheduler integration for top-up |
+//! | `signer`             | Mock signer for unit tests                                   |
+//! | `skills`             | Skill loader abstraction                                     |
+
 #[allow(dead_code)]
 pub mod cycle_topup;
 pub mod cycle_topup_host;
