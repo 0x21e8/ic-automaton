@@ -27,6 +27,9 @@ target/
 # claude
 .claude/
 
+# local-only design docs (not tracked in git)
+docs/design/
+
 # githooks
 .githooks/*
 !.githooks/pre-commit
