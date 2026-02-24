@@ -28,6 +28,7 @@ use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool}
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
 use crate::prompt;
+use crate::sanitize::contains_forbidden_prompt_layer_phrase;
 use crate::storage::stable;
 use crate::strategy::{compiler, learner, registry, validator};
 use crate::timing::current_time_ns;
@@ -50,18 +51,6 @@ const MAX_MEMORY_RECALL_RESULTS: usize = 50;
 const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
-/// Phrases that are never allowed in mutable prompt-layer content — prevents
-/// an agent turn from injecting policy-override instructions into the prompt.
-const FORBIDDEN_PROMPT_LAYER_PHRASES: &[&str] = &[
-    "ignore layer 0",
-    "ignore layer 1",
-    "ignore layer 2",
-    "ignore previous instructions",
-    "override constitution",
-    "disable safety",
-    "bypass safety",
-    "weaken safety",
-];
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum StrategyToolLogPriority {
@@ -595,11 +584,7 @@ fn validate_prompt_layer_content(content: &str) -> Result<String, String> {
             "content must be at most {MAX_PROMPT_LAYER_CONTENT_CHARS} chars"
         ));
     }
-    let normalized = trimmed.to_ascii_lowercase();
-    if FORBIDDEN_PROMPT_LAYER_PHRASES
-        .iter()
-        .any(|phrase| normalized.contains(phrase))
-    {
+    if contains_forbidden_prompt_layer_phrase(trimmed) {
         return Err("content contains forbidden policy-override phrase".to_string());
     }
     Ok(trimmed.to_string())

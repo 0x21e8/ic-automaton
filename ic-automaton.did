@@ -1,3 +1,35 @@
+type AbiArtifact = record {
+  key : AbiArtifactKey;
+  updated_at_ns : nat64;
+  created_at_ns : nat64;
+  source_ref : text;
+  abi_json : text;
+  codehash : opt text;
+  functions : vec AbiFunctionSpec;
+};
+type AbiArtifactKey = record {
+  protocol : text;
+  role : text;
+  version : TemplateVersion;
+  chain_id : nat64;
+};
+type AbiFunctionSpec = record {
+  name : text;
+  role : text;
+  inputs : vec AbiTypeSpec;
+  outputs : vec AbiTypeSpec;
+  selector_hex : text;
+  state_mutability : text;
+};
+type AbiSelectorAssertion = record { signature : text; selector_hex : text };
+type AbiTypeSpec = record { kind : text; components : Vec };
+type ActionSpec = record {
+  postconditions : vec text;
+  action_id : text;
+  risk_checks : vec text;
+  preconditions : vec text;
+  call_sequence : vec AbiFunctionSpec;
+};
 type AgentState = variant {
   Idle;
   Bootstrapping;
@@ -14,6 +46,12 @@ type ContinuationStopReason = variant {
   InferenceError;
   MaxRounds;
   MaxToolCalls;
+};
+type ContractRoleBinding = record {
+  role : text;
+  source_ref : text;
+  codehash : opt text;
+  address : text;
 };
 type ConversationEntry = record {
   timestamp_ns : nat64;
@@ -178,12 +216,17 @@ type PromptLayerView = record {
   updated_by_turn : opt text;
   layer_id : nat8;
 };
-type Result = variant { Ok : text; Err : text };
-type Result_1 = variant { Ok : opt text; Err : text };
-type Result_2 = variant { Ok : nat64; Err : text };
-type Result_3 = variant { Ok : vec text; Err : text };
-type Result_4 = variant { Ok : RetentionConfig; Err : text };
-type Result_5 = variant { Ok : PromptLayer; Err : text };
+type Result = variant { Ok : TemplateActivationState; Err : text };
+type Result_1 = variant { Ok : StrategyTemplate; Err : text };
+type Result_10 = variant { Ok : PromptLayer; Err : text };
+type Result_2 = variant { Ok : AbiArtifact; Err : text };
+type Result_3 = variant { Ok : TemplateRevocationState; Err : text };
+type Result_4 = variant { Ok : opt text; Err : text };
+type Result_5 = variant { Ok : nat64; Err : text };
+type Result_6 = variant { Ok : text; Err : text };
+type Result_7 = variant { Ok : vec text; Err : text };
+type Result_8 = variant { Ok : RetentionConfig; Err : text };
+type Result_9 = variant { Ok : StrategyKillSwitchState; Err : text };
 type RetentionConfig = record {
   transitions_max_age_secs : nat64;
   turns_max_age_secs : nat64;
@@ -323,6 +366,54 @@ type StorageGrowthMetrics = record {
   summarization_progress_percent : nat8;
 };
 type StoragePressureLevel = variant { High; Normal; Critical; Elevated };
+type StrategyAbiIngestArgs = record {
+  key : AbiArtifactKey;
+  source_ref : text;
+  abi_json : text;
+  codehash : opt text;
+  selector_assertions : vec AbiSelectorAssertion;
+};
+type StrategyKillSwitchState = record {
+  key : StrategyTemplateKey;
+  updated_at_ns : nat64;
+  enabled : bool;
+  reason : opt text;
+};
+type StrategyOutcomeStats = record {
+  key : StrategyTemplateKey;
+  last_error : opt text;
+  ranking_score_bps : nat16;
+  total_runs : nat64;
+  nondeterministic_failures : nat64;
+  version : TemplateVersion;
+  parameter_priors : StrategyParameterPriors;
+  last_tx_hash : opt text;
+  success_runs : nat64;
+  deterministic_failure_streak : nat32;
+  last_observed_at_ns : opt nat64;
+  confidence_bps : nat16;
+  deterministic_failures : nat64;
+};
+type StrategyParameterPriors = record {
+  slippage_bps : nat16;
+  gas_buffer_bps : nat16;
+};
+type StrategyTemplate = record {
+  key : StrategyTemplateKey;
+  status : TemplateStatus;
+  updated_at_ns : nat64;
+  actions : vec ActionSpec;
+  created_at_ns : nat64;
+  version : TemplateVersion;
+  constraints_json : text;
+  contract_roles : vec ContractRoleBinding;
+};
+type StrategyTemplateKey = record {
+  protocol : text;
+  primitive : text;
+  template_id : text;
+  chain_id : nat64;
+};
 type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
 type TaskKind = variant {
   Reconcile;
@@ -350,6 +441,22 @@ type TaskScheduleRuntime = record {
   consecutive_failures : nat32;
   last_finished_ns : opt nat64;
 };
+type TemplateActivationState = record {
+  key : StrategyTemplateKey;
+  updated_at_ns : nat64;
+  version : TemplateVersion;
+  enabled : bool;
+  reason : opt text;
+};
+type TemplateRevocationState = record {
+  key : StrategyTemplateKey;
+  revoked : bool;
+  updated_at_ns : nat64;
+  version : TemplateVersion;
+  reason : opt text;
+};
+type TemplateStatus = variant { Active; Draft; Deprecated; Revoked };
+type TemplateVersion = record { major : nat16; minor : nat16; patch : nat16 };
 type ToolCallRecord = record {
   output : text;
   args_json : text;
@@ -394,6 +501,7 @@ type TurnWindowSummary = record {
   tool_failure_count : nat32;
   tool_call_count : nat32;
 };
+type Vec = vec record { kind : text; components : Vec };
 type WalletBalanceStatus = variant { Error; Stale; Fresh; Unknown };
 type WalletBalanceSyncConfigView = record {
   normal_interval_secs : nat64;
@@ -418,57 +526,168 @@ type WalletBalanceTelemetryView = record {
   last_synced_block : opt nat64;
 };
 service : (InitArgs) -> {
+  // Transitions a template to `Active`, runs a canary probe to validate it,
+  // and records an activation state entry (controller only).
+  activate_strategy_template_admin : (
+      StrategyTemplateKey,
+      TemplateVersion,
+      opt text,
+    ) -> (Result);
+  // Marks a template as `Deprecated` and deactivates it.  Use this for orderly
+  // rotation; the template remains readable (controller only).
+  deprecate_strategy_template_admin : (
+      StrategyTemplateKey,
+      TemplateVersion,
+      opt text,
+    ) -> (Result_1);
+  // Returns the automaton's derived EVM address, or `None` before first derivation.
   get_automaton_evm_address : () -> (opt text) query;
+  // Returns the full conversation log for the given sender address, or `None`
+  // if no conversation exists.
   get_conversation : (text) -> (opt ConversationLog) query;
+  // Returns the current EVM route state (chain ID, RPC URL, addresses, …).
   get_evm_route_state_view : () -> (EvmRouteStateView) query;
+  // Returns aggregate inbox statistics (total messages, pending count, …).
   get_inbox_stats : () -> (InboxStats) query;
+  // Returns the current inference configuration (provider, model, key presence flag).
   get_inference_config : () -> (InferenceConfigView) query;
+  // Returns an observability snapshot containing up to `limit` recent events,
+  // combined with the current runtime and scheduler views.
   get_observability_snapshot : (nat32) -> (ObservabilitySnapshot) query;
+  // Returns aggregate outbox statistics (total messages, delivered count, …).
   get_outbox_stats : () -> (OutboxStats) query;
+  // Returns all prompt layers ordered by layer ID.
   get_prompt_layers : () -> (vec PromptLayerView) query;
+  // Returns the current conversation-retention configuration.
   get_retention_config : () -> (RetentionConfig) query;
+  // Returns runtime statistics from the last retention-maintenance pass.
   get_retention_maintenance_runtime : () -> (RetentionMaintenanceRuntime) query;
+  // Returns a combined runtime snapshot (cycles, scheduler state, inference
+  // config, top-up config, …).
   get_runtime_view : () -> (RuntimeView) query;
+  // Returns the scheduler's current runtime state (enabled flag, last tick, …).
   get_scheduler_view : () -> (SchedulerRuntime) query;
+  // Returns the agent's "soul" — the core identity/persona prompt layer.
   get_soul : () -> (text) query;
+  // Returns accumulated outcome statistics (success/failure counts, last outcome)
+  // for the given template, or `None` if no executions have been recorded yet.
+  get_strategy_outcome_stats : (StrategyTemplateKey, TemplateVersion) -> (
+      opt StrategyOutcomeStats,
+    ) query;
+  // Returns a single strategy template by key and version, or `None` if absent.
+  get_strategy_template : (StrategyTemplateKey, TemplateVersion) -> (
+      opt StrategyTemplate,
+    ) query;
+  // Returns all tool call records associated with the given turn ID.
   get_tool_calls_for_turn : (text) -> (vec ToolCallRecord) query;
+  // Returns the wallet balance sync configuration (intervals, freshness window, …).
   get_wallet_balance_sync_config : () -> (WalletBalanceSyncConfigView) query;
+  // Returns the latest synced wallet balance telemetry (ETH, USDC, sync status).
   get_wallet_balance_telemetry : () -> (WalletBalanceTelemetryView) query;
+  // Certified HTTP query handler.  Serves static UI assets and read-only API
+  // routes from the pre-built certification tree.  Mutable routes return an
+  // upgrade signal to be retried via `http_request_update`.
   http_request : (HttpRequest) -> (HttpResponse) query;
+  // Mutable HTTP update handler for write routes (`POST /api/conversation`, …).
+  // Called automatically by the IC boundary nodes when `http_request` signals
+  // an upgrade.
   http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
+  // Normalises and stores an ABI artifact, optionally verifying selector hashes
+  // (controller only).
+  ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_2);
+  // Inserts or updates a strategy template (controller only).
+  // Stamps `created_at_ns` on first insert and always updates `updated_at_ns`.
+  ingest_strategy_template_admin : (StrategyTemplate) -> (Result_1);
+  // Returns summary records for all active conversations (one per sender).
   list_conversations : () -> (vec ConversationSummary) query;
+  // Returns up to `limit` inbox messages ordered by arrival time (newest last).
   list_inbox_messages : (nat32) -> (vec InboxMessage) query;
+  // Returns up to `limit` most-recent memory rollups (compressed long-term context).
   list_memory_rollups : (nat32) -> (vec MemoryRollup) query;
+  // Returns up to `limit` most-recent outbox messages (agent replies queued for delivery).
   list_outbox_messages : (nat32) -> (vec OutboxMessage) query;
+  // Returns up to `limit` recent state-transition event records as debug strings.
   list_recent_events : (nat32) -> (vec text) query;
+  // Returns up to `limit` most-recently enqueued scheduler job records.
   list_scheduler_jobs : (nat32) -> (vec ScheduledJob) query;
+  // Returns up to `limit` most-recent session summaries.
   list_session_summaries : (nat32) -> (vec SessionSummary) query;
+  // Returns all registered skill records.
   list_skills : () -> (vec SkillRecord) query;
+  // Lists strategy templates.  When `key` is supplied only templates matching
+  // that key are returned; otherwise all templates are returned (up to `limit`).
+  list_strategy_templates : (opt StrategyTemplateKey, nat32) -> (
+      vec StrategyTemplate,
+    ) query;
+  // Returns the configured schedule and live runtime state for every task kind.
   list_task_schedules : () -> (
       vec record { TaskScheduleConfig; TaskScheduleRuntime },
     ) query;
+  // Returns the policy (autonomy mode, allowed callers, …) for every registered
+  // tool as human-readable strings.
   list_tool_policies : () -> (vec text) query;
+  // Returns up to `limit` most-recent turn-window summaries used for context compression.
   list_turn_window_summaries : (nat32) -> (vec TurnWindowSummary) query;
+  // Returns up to `limit` recent agent turn records as debug strings.
   list_turns : (nat32) -> (vec text) query;
-  post_inbox_message : (text) -> (Result);
-  set_automaton_evm_address_admin : (opt text) -> (Result_1);
-  set_evm_chain_id_admin : (nat64) -> (Result_2);
-  set_evm_confirmation_depth_admin : (nat64) -> (Result_2);
-  set_evm_rpc_fallback_url : (opt text) -> (Result_1);
-  set_evm_rpc_max_response_bytes : (nat64) -> (Result_2);
-  set_evm_rpc_url : (text) -> (Result);
-  set_http_allowed_domains : (vec text) -> (Result_3);
-  set_inbox_contract_address_admin : (opt text) -> (Result_1);
-  set_inference_model : (text) -> (Result);
+  // Hard-revokes a template: sets status to `Revoked`, deactivates it, and
+  // records an immutable revocation entry.  Use for security incidents
+  // (controller only).
+  revoke_strategy_template_admin : (
+      StrategyTemplateKey,
+      TemplateVersion,
+      opt text,
+    ) -> (Result_3);
+  // Manually overrides the stored automaton EVM address (controller only).
+  set_automaton_evm_address_admin : (opt text) -> (Result_4);
+  // Updates the EVM chain ID used for all on-chain operations (controller only).
+  set_evm_chain_id_admin : (nat64) -> (Result_5);
+  // Sets how many block confirmations must pass before an EVM event is
+  // considered finalised (controller only).
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_5);
+  // Sets an optional fallback EVM RPC URL used when the primary is unavailable (controller only).
+  set_evm_rpc_fallback_url : (opt text) -> (Result_4);
+  // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_5);
+  // Updates the primary EVM JSON-RPC endpoint (controller only).
+  set_evm_rpc_url : (text) -> (Result_6);
+  // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
+  // and permits all domains (controller only).
+  set_http_allowed_domains : (vec text) -> (Result_7);
+  // Overrides the EVM inbox contract address (controller only).
+  set_inbox_contract_address_admin : (opt text) -> (Result_4);
+  // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
+  // (controller only).
+  set_inference_model : (text) -> (Result_6);
+  // Sets the active inference backend (`IcLlm` or `OpenRouter`) (controller only).
   set_inference_provider : (InferenceProvider) -> (text);
+  // Enables or disables the autonomous agent loop (controller only).
   set_loop_enabled : (bool) -> (text);
+  // Stores (or clears) the OpenRouter API key in stable storage.
+  // Pass `None` to remove the key (controller only).
   set_openrouter_api_key : (opt text) -> (text);
-  set_openrouter_base_url : (text) -> (Result);
-  set_retention_config : (RetentionConfig) -> (Result_4);
+  // Replaces the conversation-retention policy (controller only).
+  set_retention_config : (RetentionConfig) -> (Result_8);
+  // Enables or disables the scheduler (controller only).
+  // Disabling prevents new jobs from being dispatched without stopping the timer.
   set_scheduler_enabled : (bool) -> (text);
+  // Activates low-cycles mode, which throttles task dispatch to conserve cycles
+  // (controller only).
   set_scheduler_low_cycles_mode : (bool) -> (text);
+  // Arms or disarms the kill switch for all versions of a strategy template.
+  // When `enabled` is `true` the agent will refuse to execute any action for
+  // that template (controller only).
+  set_strategy_kill_switch_admin : (StrategyTemplateKey, bool, opt text) -> (
+      Result_9,
+    );
+  // Enables or disables a specific task kind without affecting the scheduler
+  // globally (controller only).
   set_task_enabled : (TaskKind, bool) -> (text);
-  set_task_interval_secs : (TaskKind, nat64) -> (Result);
-  update_prompt_layer_admin : (nat8, text) -> (Result_5);
-  update_soul : (text) -> (Result);
+  // Overrides the recurrence interval (seconds) for the given task kind
+  // (controller only).
+  set_task_interval_secs : (TaskKind, nat64) -> (Result_6);
+  // Replaces the content of a prompt layer identified by `layer_id` (controller only).
+  update_prompt_layer_admin : (nat8, text) -> (Result_10);
+  // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
+  update_soul : (text) -> (Result_6);
 }

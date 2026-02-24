@@ -377,13 +377,6 @@ fn get_observability_snapshot(limit: u32) -> ObservabilitySnapshot {
     stable::observability_snapshot(limit as usize)
 }
 
-/// Posts a text message into the inbox on behalf of the calling principal.
-/// Returns the assigned message ID on success.
-#[ic_cdk::update]
-fn post_inbox_message(message: String) -> Result<String, String> {
-    stable::post_inbox_message(message, ic_cdk::api::msg_caller().to_text())
-}
-
 /// Returns up to `limit` inbox messages ordered by arrival time (newest last).
 #[ic_cdk::query]
 fn list_inbox_messages(limit: u32) -> Vec<InboxMessage> {
@@ -720,8 +713,7 @@ fn http_request(request: HttpRequest) -> HttpResponse {
     crate::http::handle_http_request(request)
 }
 
-/// Mutable HTTP update handler for write routes (`POST /api/inbox`,
-/// `POST /api/conversation`, …).
+/// Mutable HTTP update handler for write routes (`POST /api/conversation`, …).
 /// Called automatically by the IC boundary nodes when `http_request` signals
 /// an upgrade.
 #[ic_cdk::update]

@@ -327,8 +327,6 @@ ic-automaton/
 │   └── ui_styles.css       # Phosphor-green terminal styling
 ├── evm/                    # Solidity contracts (Inbox.sol, MockUSDC)
 ├── tests/                  # PocketIC integration tests
-├── specs/                  # Locked architectural specifications
-├── docs/design/            # Design documents and analysis
 ├── ic-automaton.did        # Candid interface (auto-generated)
 ├── icp.yaml                # Canister build & deployment config
 ├── justfile                # Development task runner

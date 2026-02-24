@@ -5,15 +5,20 @@
 /// 1. Validates the URL is HTTPS and parses the hostname.
 /// 2. Checks the hostname against the configurable domain allowlist (when enforced).
 /// 3. Verifies the canister has enough liquid cycles to pay for the outcall.
-/// 4. Truncates the response body to `HTTP_FETCH_MAX_OUTPUT_CHARS` characters
-///    before returning it to the agent.
+/// 4. Optionally extracts structured content (`json_path` or `regex`) from the
+///    response body.
+/// 5. Truncates output to `HTTP_FETCH_MAX_OUTPUT_CHARS` and wraps it with
+///    untrusted-content framing before returning it to the agent.
 // ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, OperationClass,
     DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
+use crate::sanitize::frame_untrusted_content;
 use crate::storage::stable;
+use regex::RegexBuilder;
 use serde::Deserialize;
+use serde_json::Value;
 
 #[cfg(target_arch = "wasm32")]
 use candid::Nat;
@@ -28,19 +33,34 @@ const HTTP_FETCH_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 /// Maximum number of UTF-8 characters returned to the agent after fetching.
 /// Responses are truncated at this boundary with a `[truncated, N total bytes]` suffix.
 const HTTP_FETCH_MAX_OUTPUT_CHARS: usize = 8_000;
+const HTTP_FETCH_REGEX_MAX_PATTERN_CHARS: usize = 256;
+const HTTP_FETCH_REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
+const HTTP_FETCH_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
 // ── Tool entry point ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct HttpFetchArgs {
     url: String,
+    #[serde(default)]
+    extract: Option<ExtractionMode>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode")]
+enum ExtractionMode {
+    #[serde(rename = "json_path")]
+    JsonPath { path: String },
+    #[serde(rename = "regex")]
+    Regex { pattern: String },
 }
 
 /// Execute the `http_fetch` tool — parse args, enforce allowlist, check cycles, fetch.
 ///
-/// Returns the response body as a UTF-8 string (truncated to
-/// `HTTP_FETCH_MAX_OUTPUT_CHARS`).  Binary bodies are represented as the
-/// literal string `"binary response (not UTF-8)"`.
+/// Returns framed untrusted content with either the full response body or an
+/// extracted value (depending on `extract` mode), truncated to
+/// `HTTP_FETCH_MAX_OUTPUT_CHARS`. Binary bodies are represented as the literal
+/// string `"binary response (not UTF-8)"`.
 pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     let args = parse_http_fetch_args(args_json)?;
     let host = extract_https_host(&args.url)?;
@@ -53,16 +73,9 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     let body = http_get(&args.url, HTTP_FETCH_MAX_RESPONSE_BYTES).await?;
     let body =
         String::from_utf8(body).unwrap_or_else(|_| "binary response (not UTF-8)".to_string());
-    let (truncated, was_truncated) = truncate_utf8_chars(&body, HTTP_FETCH_MAX_OUTPUT_CHARS);
-    if was_truncated {
-        Ok(format!(
-            "{}... [truncated, {} total bytes]",
-            truncated,
-            body.len()
-        ))
-    } else {
-        Ok(truncated)
-    }
+    let extracted = extract_http_fetch_content(&body, args.extract.as_ref())?;
+    let output = truncate_http_fetch_output(&extracted);
+    Ok(frame_untrusted_content("http_fetch", &output))
 }
 
 fn parse_http_fetch_args(args_json: &str) -> Result<HttpFetchArgs, String> {
@@ -72,6 +85,84 @@ fn parse_http_fetch_args(args_json: &str) -> Result<HttpFetchArgs, String> {
         return Err("missing required field: url".to_string());
     }
     Ok(args)
+}
+
+fn extract_http_fetch_content(
+    body: &str,
+    extract: Option<&ExtractionMode>,
+) -> Result<String, String> {
+    match extract {
+        Some(ExtractionMode::JsonPath { path }) => extract_json_path(body, path),
+        Some(ExtractionMode::Regex { pattern }) => extract_regex_lines(body, pattern),
+        None => Ok(body.to_string()),
+    }
+}
+
+fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
+    let trimmed_path = path.trim();
+    if trimmed_path.is_empty() {
+        return Err("json_path extraction failed: missing required field: path".to_string());
+    }
+
+    let root: Value = serde_json::from_str(body).map_err(|error| {
+        format!("json_path extraction failed: response is not valid JSON: {error}")
+    })?;
+
+    let segments = trimmed_path.split('.').collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.trim().is_empty()) {
+        return Err(format!(
+            "json_path extraction failed: invalid path `{trimmed_path}`"
+        ));
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.contains('[') || segment.contains(']'))
+    {
+        return Err("json_path extraction failed: array indexing is not supported".to_string());
+    }
+
+    let mut current = &root;
+    for segment in segments {
+        let segment = segment.trim();
+        current = current.get(segment).ok_or_else(|| {
+            format!("json_path extraction failed: path `{trimmed_path}` not found")
+        })?;
+    }
+
+    match current {
+        Value::String(value) => Ok(value.clone()),
+        value => serde_json::to_string(value).map_err(|error| {
+            format!("json_path extraction failed: could not serialize extracted value: {error}")
+        }),
+    }
+}
+
+fn extract_regex_lines(body: &str, pattern: &str) -> Result<String, String> {
+    let trimmed_pattern = pattern.trim();
+    if trimmed_pattern.is_empty() {
+        return Err("regex extraction failed: missing required field: pattern".to_string());
+    }
+    if trimmed_pattern.chars().count() > HTTP_FETCH_REGEX_MAX_PATTERN_CHARS {
+        return Err(format!(
+            "regex extraction failed: pattern exceeds max length of {HTTP_FETCH_REGEX_MAX_PATTERN_CHARS} characters"
+        ));
+    }
+
+    let regex = RegexBuilder::new(trimmed_pattern)
+        .size_limit(HTTP_FETCH_REGEX_SIZE_LIMIT_BYTES)
+        .dfa_size_limit(HTTP_FETCH_REGEX_DFA_SIZE_LIMIT_BYTES)
+        .build()
+        .map_err(|error| format!("regex extraction failed: invalid pattern: {error}"))?;
+
+    let matched_lines = body
+        .lines()
+        .filter(|line| regex.is_match(line))
+        .collect::<Vec<_>>();
+    if matched_lines.is_empty() {
+        return Err("regex extraction failed: no matching lines".to_string());
+    }
+
+    Ok(matched_lines.join("\n"))
 }
 
 fn ensure_host_allowed(host: &str, url: &str) -> Result<(), String> {
@@ -220,6 +311,19 @@ fn truncate_utf8_chars(input: &str, max_chars: usize) -> (String, bool) {
     (input[..cutoff].to_string(), true)
 }
 
+fn truncate_http_fetch_output(content: &str) -> String {
+    let (truncated, was_truncated) = truncate_utf8_chars(content, HTTP_FETCH_MAX_OUTPUT_CHARS);
+    if was_truncated {
+        format!(
+            "{}... [truncated, {} total bytes]",
+            truncated,
+            content.len()
+        )
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +369,7 @@ mod tests {
 
         let out = block_on_with_spin(http_fetch_tool(r#"{"url":"https://example.com/anything"}"#))
             .expect("without configured allowlist any https host should pass");
+        assert!(out.starts_with("[UNTRUSTED_CONTENT source=http_fetch]"));
         assert!(out.contains("stub"));
     }
 
@@ -278,6 +383,7 @@ mod tests {
             r#"{"url":"https://api.coingecko.com/api/v3/ping"}"#,
         ))
         .expect("host stub request should pass");
+        assert!(out.starts_with("[UNTRUSTED_CONTENT source=http_fetch]"));
         assert!(out.contains("stub"));
 
         let err = block_on_with_spin(http_fetch_tool(
@@ -295,5 +401,67 @@ mod tests {
         let err = block_on_with_spin(http_fetch_tool(r#"{"url":"https://example.com"}"#))
             .expect_err("configured empty allowlist should block all hosts");
         assert!(err.contains("no domains allowed"));
+    }
+
+    #[test]
+    fn parse_http_fetch_args_accepts_json_path_extract_mode() {
+        let args = parse_http_fetch_args(
+            r#"{"url":"https://example.com","extract":{"mode":"json_path","path":"data.price"}}"#,
+        )
+        .expect("json_path extract args should parse");
+        assert_eq!(args.url, "https://example.com");
+        assert_eq!(
+            args.extract,
+            Some(ExtractionMode::JsonPath {
+                path: "data.price".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_extracts_and_frames_value() {
+        stable::init_storage();
+
+        let out = block_on_with_spin(http_fetch_tool(
+            r#"{"url":"https://example.com/anything","extract":{"mode":"json_path","path":"stub"}}"#,
+        ))
+        .expect("json_path extraction should succeed");
+        assert!(out.starts_with("[UNTRUSTED_CONTENT source=http_fetch]"));
+        assert!(out.contains("\n---\nok\n---\n"));
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_reports_invalid_json() {
+        let err = extract_json_path("not json", "stub")
+            .expect_err("invalid json input should fail json_path extraction");
+        assert!(err.contains("response is not valid JSON"));
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_reports_missing_path() {
+        let err = extract_json_path(r#"{"data":{"price":42}}"#, "data.missing")
+            .expect_err("missing path should fail json_path extraction");
+        assert!(err.contains("path `data.missing` not found"));
+    }
+
+    #[test]
+    fn http_fetch_tool_regex_extracts_matching_lines() {
+        let out = extract_regex_lines("alpha\nprice:42\nbeta", r"^price:\d+$")
+            .expect("regex extraction should return matching lines");
+        assert_eq!(out, "price:42");
+    }
+
+    #[test]
+    fn http_fetch_tool_regex_reports_invalid_pattern() {
+        let err =
+            extract_regex_lines("price:42", "(").expect_err("invalid regex pattern should fail");
+        assert!(err.contains("invalid pattern"));
+    }
+
+    #[test]
+    fn http_fetch_tool_regex_reports_no_matches() {
+        let err = extract_regex_lines("alpha\nbeta", "price")
+            .expect_err("regex extraction without matches should fail");
+        assert!(err.contains("no matching lines"));
     }
 }

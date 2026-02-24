@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use alloy_primitives::keccak256;
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_http_certification::{HttpRequest, HttpUpdateRequest, HttpUpdateResponse};
 use pocket_ic::common::rest::{
@@ -17,6 +18,8 @@ const WASM_PATHS: &[&str] = &[
     "target/wasm32-unknown-unknown/release/backend.wasm",
     "target/wasm32-unknown-unknown/release/deps/backend.wasm",
 ];
+const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
+    "MessageQueued(address,uint64,address,string,uint256,uint256)";
 
 const AUTOMATON_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
 const INBOX_CONTRACT_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
@@ -238,13 +241,6 @@ fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, addr
     );
 }
 
-fn post_inbox_message(pic: &PocketIc, canister_id: Principal, message: &str) {
-    let payload = encode_args((message.to_string(),)).expect("failed to encode post_inbox_message");
-    let result: Result<String, String> =
-        call_update(pic, canister_id, "post_inbox_message", payload);
-    assert!(result.is_ok(), "post_inbox_message failed: {result:?}");
-}
-
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
     call_query(
         pic,
@@ -323,6 +319,68 @@ fn response_word_from_quantity(quantity_hex: &str) -> String {
     format!("0x{suffix:0>64}")
 }
 
+fn message_queued_topic0() -> String {
+    let hash = keccak256(INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE.as_bytes());
+    format!("0x{}", hex::encode(hash.as_slice()))
+}
+
+fn address_to_topic(address: &str) -> String {
+    let normalized = address.trim().to_ascii_lowercase();
+    let without_prefix = normalized.trim_start_matches("0x");
+    format!("0x{:0>64}", without_prefix)
+}
+
+fn encode_u256_word(value: u128) -> String {
+    format!("{value:064x}")
+}
+
+fn encode_message_queued_payload(
+    sender: &str,
+    message: &str,
+    usdc_amount: u128,
+    eth_amount: u128,
+) -> String {
+    let sender = sender.trim().to_ascii_lowercase();
+    let sender_hex = sender.trim_start_matches("0x");
+    assert_eq!(sender_hex.len(), 40, "sender must be a 20-byte hex address");
+
+    let message_hex = hex::encode(message.as_bytes());
+    let padded_message_hex = if message_hex.len().is_multiple_of(64) {
+        message_hex.clone()
+    } else {
+        let padding = "0".repeat(64 - (message_hex.len() % 64));
+        format!("{message_hex}{padding}")
+    };
+
+    format!(
+        "0x{:0>64}{}{}{}{}{}",
+        sender_hex,
+        encode_u256_word(128),
+        encode_u256_word(usdc_amount),
+        encode_u256_word(eth_amount),
+        encode_u256_word(message.len() as u128),
+        padded_message_hex,
+    )
+}
+
+fn rpc_log(
+    block_number: u64,
+    log_index: u64,
+    tx_hash: &str,
+    contract_address: &str,
+    topic1: &str,
+    data: &str,
+) -> Value {
+    json!({
+        "address": contract_address,
+        "topics": [message_queued_topic0(), topic1],
+        "data": data,
+        "blockNumber": format!("0x{block_number:x}"),
+        "logIndex": format!("0x{log_index:x}"),
+        "transactionHash": tx_hash,
+    })
+}
+
 fn decode_rpc_request(request: &CanisterHttpRequest) -> (String, Value) {
     let body: Value = serde_json::from_slice(&request.body)
         .unwrap_or_else(|error| panic!("failed to decode canister http request: {error}"));
@@ -338,6 +396,7 @@ fn wallet_rpc_response(
     request: &CanisterHttpRequest,
     mode: WalletRpcMode,
     latest_block: u64,
+    logs: &[Value],
 ) -> CanisterHttpResponse {
     let (method, body) = decode_rpc_request(request);
     let max_response_bytes = request.max_response_bytes.unwrap_or_default();
@@ -371,7 +430,7 @@ fn wallet_rpc_response(
         "eth_getLogs" => json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "result": [],
+            "result": logs,
         }),
         "eth_getBalance" => json!({
             "jsonrpc": "2.0",
@@ -412,6 +471,7 @@ fn drive_due_poll_inbox_with_wallet_rpc_mocks(
     pic: &PocketIc,
     canister_id: Principal,
     mode: WalletRpcMode,
+    logs: &[Value],
 ) {
     let before_poll_jobs = list_scheduler_jobs(pic, canister_id)
         .into_iter()
@@ -427,7 +487,7 @@ fn drive_due_poll_inbox_with_wallet_rpc_mocks(
                 pic.mock_canister_http_response(MockCanisterHttpResponse {
                     subnet_id: request.subnet_id,
                     request_id: request.request_id,
-                    response: wallet_rpc_response(&request, mode, 10),
+                    response: wallet_rpc_response(&request, mode, 10, logs),
                     additional_responses: vec![],
                 });
             }
@@ -461,7 +521,17 @@ fn drive_due_poll_inbox_with_wallet_rpc_mocks(
 
 fn advance_and_run_due_poll_inbox(pic: &PocketIc, canister_id: Principal, mode: WalletRpcMode) {
     pic.advance_time(Duration::from_secs(31));
-    drive_due_poll_inbox_with_wallet_rpc_mocks(pic, canister_id, mode);
+    drive_due_poll_inbox_with_wallet_rpc_mocks(pic, canister_id, mode, &[]);
+}
+
+fn advance_and_run_due_poll_inbox_with_logs(
+    pic: &PocketIc,
+    canister_id: Principal,
+    mode: WalletRpcMode,
+    logs: &[Value],
+) {
+    pic.advance_time(Duration::from_secs(31));
+    drive_due_poll_inbox_with_wallet_rpc_mocks(pic, canister_id, mode, logs);
 }
 
 fn wait_for_outbox_messages(pic: &PocketIc, canister_id: Principal, at_least: u64) {
@@ -483,13 +553,28 @@ fn bootstrap_gate_blocks_first_inference_until_wallet_sync_succeeds() {
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
     set_automaton_evm_address_admin(&pic, canister_id, AUTOMATON_ADDRESS);
     set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
-    post_inbox_message(
+    let topic1 = address_to_topic(AUTOMATON_ADDRESS);
+    let payload = encode_message_queued_payload(
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bootstrap gate must block agent turn before first wallet sync",
+        0,
+        0,
+    );
+    let logs = vec![rpc_log(
+        2,
+        0,
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        INBOX_CONTRACT_ADDRESS,
+        &topic1,
+        &payload,
+    )];
+
+    advance_and_run_due_poll_inbox_with_logs(
         &pic,
         canister_id,
-        "bootstrap gate must block agent turn before first wallet sync",
+        WalletRpcMode::FailWalletSync,
+        &logs,
     );
-
-    advance_and_run_due_poll_inbox(&pic, canister_id, WalletRpcMode::FailWalletSync);
 
     let failed_sync = get_wallet_balance_telemetry(&pic, canister_id);
     assert!(failed_sync.bootstrap_pending);
@@ -537,12 +622,12 @@ fn wallet_sync_refreshes_on_due_window_transitions_to_stale_and_degrades_non_fat
     assert_eq!(first.status, WalletBalanceStatus::Fresh);
 
     pic.advance_time(Duration::from_secs(120));
-    drive_due_poll_inbox_with_wallet_rpc_mocks(&pic, canister_id, WalletRpcMode::Success);
+    drive_due_poll_inbox_with_wallet_rpc_mocks(&pic, canister_id, WalletRpcMode::Success, &[]);
     let before_due = get_wallet_balance_telemetry(&pic, canister_id);
     assert_eq!(before_due.last_synced_at_ns, Some(first_synced_at));
 
     pic.advance_time(Duration::from_secs(301));
-    drive_due_poll_inbox_with_wallet_rpc_mocks(&pic, canister_id, WalletRpcMode::Success);
+    drive_due_poll_inbox_with_wallet_rpc_mocks(&pic, canister_id, WalletRpcMode::Success, &[]);
     let refreshed = get_wallet_balance_telemetry(&pic, canister_id);
     let refreshed_synced_at = refreshed
         .last_synced_at_ns
@@ -566,7 +651,12 @@ fn wallet_sync_refreshes_on_due_window_transitions_to_stale_and_degrades_non_fat
 
     set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
     pic.advance_time(Duration::from_secs(31));
-    drive_due_poll_inbox_with_wallet_rpc_mocks(&pic, canister_id, WalletRpcMode::FailWalletSync);
+    drive_due_poll_inbox_with_wallet_rpc_mocks(
+        &pic,
+        canister_id,
+        WalletRpcMode::FailWalletSync,
+        &[],
+    );
 
     let degraded = get_wallet_balance_telemetry(&pic, canister_id);
     assert_eq!(degraded.last_synced_at_ns, Some(refreshed_synced_at));
@@ -639,6 +729,7 @@ fn wallet_sync_oversized_outcall_tunes_response_limit_and_recovers_without_manua
         &pic,
         canister_id,
         WalletRpcMode::RejectOversizedUntilTuned,
+        &[],
     );
     let stable_config = get_wallet_balance_sync_config(&pic, canister_id);
     assert_eq!(

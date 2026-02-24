@@ -36,6 +36,7 @@ use crate::features::{
     infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
     MockSignerAdapter,
 };
+use crate::sanitize::{frame_untrusted_content, ToolSequenceValidator};
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
 use alloy_primitives::U256;
@@ -61,6 +62,7 @@ const MAX_STAGED_INBOX_MESSAGES_PER_TURN: usize = 1;
 /// Human-readable reason stored in synthetic tool records when a call is
 /// suppressed by the autonomy deduplication window.
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
+const TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX: &str = "tool sequence validator blocked";
 
 // ── Log types ────────────────────────────────────────────────────────────────
 
@@ -270,6 +272,13 @@ struct SuppressedAutonomyToolCall {
     age_secs: u64,
 }
 
+#[derive(Clone, Debug)]
+enum PlannedToolCallExecution {
+    Execute,
+    Suppressed { age_secs: u64 },
+    SequenceBlocked { reason: String },
+}
+
 /// Produces a synthetic `ToolCallRecord` marked as successful for a suppressed
 /// autonomy call, preserving the call in the turn's record so the continuation
 /// transcript remains consistent.
@@ -290,6 +299,30 @@ fn synthetic_suppressed_autonomy_tool_record(
         success: true,
         error: None,
     }
+}
+
+fn synthetic_sequence_blocked_tool_record(
+    turn_id: &str,
+    call: &ToolCall,
+    reason: &str,
+) -> ToolCallRecord {
+    let message = format!("{TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX}: {reason}");
+    ToolCallRecord {
+        turn_id: turn_id.to_string(),
+        tool: call.tool.clone(),
+        args_json: call.args_json.clone(),
+        output: message.clone(),
+        success: false,
+        error: Some(message),
+    }
+}
+
+fn is_sequence_validator_block(record: &ToolCallRecord) -> bool {
+    record
+        .error
+        .as_deref()
+        .map(|error| error.starts_with(TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX))
+        .unwrap_or(false)
 }
 
 /// Persists the fingerprint and timestamp of every successful autonomy tool call
@@ -767,7 +800,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 
         let inbox_preview = staged_messages
             .iter()
-            .map(|message| message.body.as_str())
+            .map(|message| frame_untrusted_content("inbox_message", message.body.as_str()))
             .collect::<Vec<_>>()
             .join(" | ");
         let (memory_facts, memory_rollups) = stable::list_memory_for_context(20, 8);
@@ -805,6 +838,10 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         let signer: Box<dyn SignerPort> = Box::new(MockSignerAdapter::new());
 
         let mut manager = ToolManager::new();
+        let mut tool_sequence_validator = ToolSequenceValidator::new();
+        if staged_message_count > 0 {
+            tool_sequence_validator.mark_untrusted_source("inbox");
+        }
         let mut transcript = Vec::<InferenceTranscriptMessage>::new();
         let mut inference_completed = false;
         let mut executed_any_tool = false;
@@ -954,12 +991,10 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     );
                 }
             }
-            let mut executable_tool_calls = planned_tool_calls.clone();
             let mut suppressed_autonomy_calls = Vec::new();
             if inference_round_count == 1 && !has_external_input {
-                let (filtered_calls, suppressed_calls) =
+                let (_, suppressed_calls) =
                     suppress_duplicate_autonomy_tool_calls(&planned_tool_calls, started_at_ns);
-                executable_tool_calls = filtered_calls;
                 if !suppressed_calls.is_empty() {
                     let details = suppressed_calls
                         .iter()
@@ -990,6 +1025,45 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
 
+            let mut planned_execution =
+                Vec::<PlannedToolCallExecution>::with_capacity(planned_tool_calls.len());
+            let mut executable_tool_calls = Vec::<ToolCall>::new();
+            let mut suppressed_iter = suppressed_autonomy_calls.into_iter().peekable();
+            for (index, call) in planned_tool_calls.iter().enumerate() {
+                let is_suppressed = suppressed_iter
+                    .peek()
+                    .map(|entry| entry.index == index)
+                    .unwrap_or(false);
+                if is_suppressed {
+                    let suppressed = suppressed_iter
+                        .next()
+                        .expect("suppressed iterator must provide matching index");
+                    planned_execution.push(PlannedToolCallExecution::Suppressed {
+                        age_secs: suppressed.age_secs,
+                    });
+                    continue;
+                }
+
+                match tool_sequence_validator.validate_next(&call.tool) {
+                    Ok(()) => {
+                        executable_tool_calls.push(call.clone());
+                        planned_execution.push(PlannedToolCallExecution::Execute);
+                    }
+                    Err(reason) => {
+                        planned_execution
+                            .push(PlannedToolCallExecution::SequenceBlocked { reason });
+                    }
+                }
+            }
+            if last_error.is_none() && suppressed_iter.next().is_some() {
+                last_error = Some(
+                    "tool execution record mismatch: unexpected extra suppressed tool".to_string(),
+                );
+            }
+            if last_error.is_some() {
+                break;
+            }
+
             transcript.push(InferenceTranscriptMessage::Assistant {
                 content: if trimmed_reply.is_empty() {
                     None
@@ -1009,35 +1083,32 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 record_successful_autonomy_tool_calls(&executed, execution_completed_ns);
             }
             let mut executed_iter = executed.into_iter();
-            let mut suppressed_iter = suppressed_autonomy_calls.into_iter().peekable();
             let mut round_tool_records = Vec::with_capacity(planned_tool_calls.len());
-            for (index, call) in planned_tool_calls.iter().enumerate() {
-                let is_suppressed = suppressed_iter
-                    .peek()
-                    .map(|entry| entry.index == index)
-                    .unwrap_or(false);
-                if is_suppressed {
-                    let suppressed = suppressed_iter
-                        .next()
-                        .expect("suppressed iterator must provide matching index");
-                    round_tool_records.push(synthetic_suppressed_autonomy_tool_record(
-                        &turn_id,
-                        call,
-                        suppressed.age_secs,
-                    ));
-                    continue;
+            for (call, execution) in planned_tool_calls.iter().zip(planned_execution.iter()) {
+                match execution {
+                    PlannedToolCallExecution::Execute => {
+                        let Some(record) = executed_iter.next() else {
+                            last_error = Some(
+                                "tool execution record mismatch: missing executed record"
+                                    .to_string(),
+                            );
+                            break;
+                        };
+                        round_tool_records.push(record);
+                    }
+                    PlannedToolCallExecution::Suppressed { age_secs } => {
+                        round_tool_records.push(synthetic_suppressed_autonomy_tool_record(
+                            &turn_id, call, *age_secs,
+                        ));
+                    }
+                    PlannedToolCallExecution::SequenceBlocked { reason } => {
+                        round_tool_records.push(synthetic_sequence_blocked_tool_record(
+                            &turn_id, call, reason,
+                        ));
+                    }
                 }
-
-                let Some(record) = executed_iter.next() else {
-                    last_error =
-                        Some("tool execution record mismatch: missing executed record".to_string());
-                    break;
-                };
-                round_tool_records.push(record);
             }
-            if last_error.is_none()
-                && (executed_iter.next().is_some() || suppressed_iter.next().is_some())
-            {
+            if last_error.is_none() && executed_iter.next().is_some() {
                 last_error = Some(
                     "tool execution record mismatch: unexpected extra tool record".to_string(),
                 );
@@ -1051,7 +1122,10 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 assistant_reply = Some(tool_results_reply);
             }
 
-            if round_tool_records.iter().any(|record| !record.success) {
+            if round_tool_records
+                .iter()
+                .any(|record| !record.success && !is_sequence_validator_block(record))
+            {
                 last_error = Some("tool execution reported failures".to_string());
             }
 

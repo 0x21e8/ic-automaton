@@ -578,14 +578,27 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         }),
         IcLlmTool::Function(IcLlmFunction {
             name: "http_fetch".to_string(),
-            description: Some("Fetch text from an allowlisted HTTPS URL via GET.".to_string()),
+            description: Some(
+                "Fetch text from an allowlisted HTTPS URL via GET. Use optional `extract` to return only structured fields or regex-matching lines."
+                    .to_string(),
+            ),
             parameters: Some(IcLlmParameters {
                 type_: "object".to_string(),
-                properties: Some(vec![IcLlmProperty {
-                    type_: "string".to_string(),
-                    name: "url".to_string(),
-                    description: Some("HTTPS URL on an allowed domain.".to_string()),
-                }]),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "url".to_string(),
+                        description: Some("HTTPS URL on an allowed domain.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "extract".to_string(),
+                        description: Some(
+                            "Optional extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"data.price\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"^price:\\\\d+$\"}. Prefer extraction to minimize untrusted content."
+                                .to_string(),
+                        ),
+                    },
+                ]),
                 required: Some(vec!["url".to_string()]),
             }),
         }),
@@ -1947,6 +1960,64 @@ mod tests {
         openrouter_names.sort();
 
         assert_eq!(openrouter_names, ic_names);
+    }
+
+    #[test]
+    fn ic_llm_http_fetch_schema_includes_extract_modes() {
+        let http_fetch_tool = ic_llm_tools()
+            .into_iter()
+            .find(|tool| matches!(tool, IcLlmTool::Function(function) if function.name == "http_fetch"))
+            .expect("http_fetch tool should exist");
+
+        let IcLlmTool::Function(function) = http_fetch_tool;
+        let params = function
+            .parameters
+            .expect("http_fetch tool should define parameters");
+        let properties = params
+            .properties
+            .expect("http_fetch tool should define properties");
+        let extract_property = properties
+            .iter()
+            .find(|property| property.name == "extract")
+            .expect("http_fetch tool should include extract property");
+        assert_eq!(extract_property.type_, "object");
+        let description = extract_property.description.as_deref().unwrap_or_default();
+        assert!(description.contains("json_path"));
+        assert!(description.contains("regex"));
+    }
+
+    #[test]
+    fn openrouter_http_fetch_schema_includes_extract_modes() {
+        let http_fetch_tool = openrouter_tools()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|name| name.as_str())
+                    .is_some_and(|name| name == "http_fetch")
+            })
+            .expect("openrouter http_fetch tool should exist");
+
+        let extract_property = http_fetch_tool
+            .get("function")
+            .and_then(|function| function.get("parameters"))
+            .and_then(|parameters| parameters.get("properties"))
+            .and_then(|properties| properties.get("extract"))
+            .expect("openrouter http_fetch schema should include extract property");
+        assert_eq!(
+            extract_property
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+            "object"
+        );
+        let description = extract_property
+            .get("description")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(description.contains("json_path"));
+        assert!(description.contains("regex"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use alloy_primitives::keccak256;
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use pocket_ic::common::rest::{
@@ -16,6 +17,8 @@ const WASM_PATHS: &[&str] = &[
     "target/wasm32-unknown-unknown/release/backend.wasm",
     "target/wasm32-unknown-unknown/release/deps/backend.wasm",
 ];
+const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
+    "MessageQueued(address,uint64,address,string,uint256,uint256)";
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
@@ -48,13 +51,30 @@ enum InferenceProvider {
 }
 
 #[allow(dead_code)]
-#[derive(CandidType, Clone, Copy, Debug)]
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum TaskKind {
     AgentTurn,
     PollInbox,
     CheckCycles,
     TopUpCycles,
     Reconcile,
+}
+
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum JobStatus {
+    Pending,
+    InFlight,
+    Succeeded,
+    Failed,
+    TimedOut,
+    Skipped,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize)]
+struct ObservedJob {
+    kind: TaskKind,
+    status: JobStatus,
+    created_at_ns: u64,
 }
 
 fn assert_wasm_artifact_present() -> Vec<u8> {
@@ -163,6 +183,21 @@ fn set_task_interval_secs(pic: &PocketIc, canister_id: Principal, kind: TaskKind
     assert!(result.is_ok(), "set_task_interval_secs failed: {result:?}");
 }
 
+fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
+    call_query(
+        pic,
+        canister_id,
+        "list_scheduler_jobs",
+        encode_args((200u32,)).expect("failed to encode list_scheduler_jobs"),
+    )
+}
+
+fn latest_poll_job(jobs: &[ObservedJob]) -> Option<&ObservedJob> {
+    jobs.iter()
+        .filter(|job| job.kind == TaskKind::PollInbox)
+        .max_by_key(|job| job.created_at_ns)
+}
+
 fn response_word_from_address(address: &str) -> String {
     let suffix = address.trim_start_matches("0x").to_ascii_lowercase();
     format!("0x{suffix:0>64}")
@@ -173,7 +208,73 @@ fn response_word_from_quantity(quantity_hex: &str) -> String {
     format!("0x{suffix:0>64}")
 }
 
-fn wallet_sync_rpc_response(request: &CanisterHttpRequest) -> CanisterHttpResponse {
+fn message_queued_topic0() -> String {
+    let hash = keccak256(INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE.as_bytes());
+    format!("0x{}", hex::encode(hash.as_slice()))
+}
+
+fn address_to_topic(address: &str) -> String {
+    let normalized = address.trim().to_ascii_lowercase();
+    let without_prefix = normalized.trim_start_matches("0x");
+    format!("0x{:0>64}", without_prefix)
+}
+
+fn encode_u256_word(value: u128) -> String {
+    format!("{value:064x}")
+}
+
+fn encode_message_queued_payload(
+    sender: &str,
+    message: &str,
+    usdc_amount: u128,
+    eth_amount: u128,
+) -> String {
+    let sender = sender.trim().to_ascii_lowercase();
+    let sender_hex = sender.trim_start_matches("0x");
+    assert_eq!(sender_hex.len(), 40, "sender must be a 20-byte hex address");
+
+    let message_hex = hex::encode(message.as_bytes());
+    let padded_message_hex = if message_hex.len().is_multiple_of(64) {
+        message_hex.clone()
+    } else {
+        let padding = "0".repeat(64 - (message_hex.len() % 64));
+        format!("{message_hex}{padding}")
+    };
+
+    format!(
+        "0x{:0>64}{}{}{}{}{}",
+        sender_hex,
+        encode_u256_word(128),
+        encode_u256_word(usdc_amount),
+        encode_u256_word(eth_amount),
+        encode_u256_word(message.len() as u128),
+        padded_message_hex,
+    )
+}
+
+fn rpc_log(
+    block_number: u64,
+    log_index: u64,
+    tx_hash: &str,
+    contract_address: &str,
+    topic1: &str,
+    data: &str,
+) -> Value {
+    json!({
+        "address": contract_address,
+        "topics": [message_queued_topic0(), topic1],
+        "data": data,
+        "blockNumber": format!("0x{block_number:x}"),
+        "logIndex": format!("0x{log_index:x}"),
+        "transactionHash": tx_hash,
+    })
+}
+
+fn wallet_sync_rpc_response(
+    request: &CanisterHttpRequest,
+    latest_block: u64,
+    logs: &[Value],
+) -> CanisterHttpResponse {
     let request_json: Value = serde_json::from_slice(&request.body)
         .unwrap_or_else(|error| panic!("failed to parse canister http request body: {error}"));
     let method = request_json
@@ -185,12 +286,12 @@ fn wallet_sync_rpc_response(request: &CanisterHttpRequest) -> CanisterHttpRespon
         "eth_blockNumber" => json!({
             "jsonrpc":"2.0",
             "id":1,
-            "result":"0xa",
+            "result": format!("0x{latest_block:x}"),
         }),
         "eth_getLogs" => json!({
             "jsonrpc":"2.0",
             "id":1,
-            "result":[],
+            "result":logs,
         }),
         "eth_getBalance" => json!({
             "jsonrpc":"2.0",
@@ -238,12 +339,60 @@ fn flush_wallet_sync_http(pic: &PocketIc) {
             pic.mock_canister_http_response(MockCanisterHttpResponse {
                 subnet_id: request.subnet_id,
                 request_id: request.request_id,
-                response: wallet_sync_rpc_response(&request),
+                response: wallet_sync_rpc_response(&request, 10, &[]),
                 additional_responses: vec![],
             });
         }
         pic.tick();
     }
+}
+
+fn drive_due_poll_inbox_with_logs(pic: &PocketIc, canister_id: Principal, logs: &[Value]) {
+    let before_poll_jobs = list_scheduler_jobs(pic, canister_id)
+        .into_iter()
+        .filter(|job| job.kind == TaskKind::PollInbox)
+        .count();
+
+    pic.advance_time(Duration::from_secs(31));
+    pic.tick();
+
+    for _ in 0..36 {
+        let pending_http = pic.get_canister_http();
+        if !pending_http.is_empty() {
+            for request in pending_http {
+                pic.mock_canister_http_response(MockCanisterHttpResponse {
+                    subnet_id: request.subnet_id,
+                    request_id: request.request_id,
+                    response: wallet_sync_rpc_response(&request, 10, logs),
+                    additional_responses: vec![],
+                });
+            }
+        }
+
+        pic.tick();
+
+        let jobs = list_scheduler_jobs(pic, canister_id);
+        let poll_jobs = jobs
+            .iter()
+            .filter(|job| job.kind == TaskKind::PollInbox)
+            .count();
+        let latest_terminal = latest_poll_job(&jobs)
+            .map(|job| {
+                matches!(
+                    job.status,
+                    JobStatus::Succeeded
+                        | JobStatus::Failed
+                        | JobStatus::TimedOut
+                        | JobStatus::Skipped
+                )
+            })
+            .unwrap_or(false);
+        if poll_jobs > before_poll_jobs && latest_terminal && pic.get_canister_http().is_empty() {
+            return;
+        }
+    }
+
+    panic!("poll inbox did not complete with mocked http responses");
 }
 
 fn call_http_update<'a>(
@@ -276,16 +425,10 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
     set_task_interval_secs(&pic, canister_id, TaskKind::AgentTurn, 30);
     set_task_interval_secs(&pic, canister_id, TaskKind::PollInbox, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(
-        &pic,
-        canister_id,
-        "0x1111111111111111111111111111111111111111",
-    );
-    set_inbox_contract_address_admin(
-        &pic,
-        canister_id,
-        "0x2222222222222222222222222222222222222222",
-    );
+    let automaton_address = "0x1111111111111111111111111111111111111111";
+    let inbox_contract_address = "0x2222222222222222222222222222222222222222";
+    set_automaton_evm_address_admin(&pic, canister_id, automaton_address);
+    set_inbox_contract_address_admin(&pic, canister_id, inbox_contract_address);
 
     let root_request = HttpRequest::get("/").build();
     let root_payload = encode_args((root_request,))
@@ -314,30 +457,40 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
         "root response should be certified"
     );
 
-    let post_payload = serde_json::to_vec(&serde_json::json!({
-        "message": "hello from pocketic ui flow"
-    }))
-    .expect("failed to serialize inbox body");
     let post_request: HttpUpdateRequest = HttpRequest::post("/api/inbox")
         .with_headers(vec![(
             "content-type".to_string(),
             "application/json".to_string(),
         )])
-        .with_body(post_payload)
+        .with_body(br#"{"message":"hello from pocketic ui flow"}"#.to_vec())
         .build_update();
     let post_response = call_http_update(&pic, canister_id, post_request);
-    assert_eq!(post_response.status_code().as_u16(), 200);
+    assert_eq!(post_response.status_code().as_u16(), 404);
 
     let post_json: Value =
         serde_json::from_slice(post_response.body()).expect("post /api/inbox should return json");
-    let posted_id = post_json
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    assert!(
-        posted_id.starts_with("inbox:"),
-        "post /api/inbox should return an inbox id"
+    assert_eq!(post_json.get("ok"), Some(&Value::Bool(false)));
+    assert_eq!(
+        post_json.get("error").and_then(Value::as_str),
+        Some("not found")
     );
+
+    let topic1 = address_to_topic(automaton_address);
+    let payload = encode_message_queued_payload(
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hello from pocketic ui flow",
+        0,
+        0,
+    );
+    let logs = vec![rpc_log(
+        2,
+        0,
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        inbox_contract_address,
+        &topic1,
+        &payload,
+    )];
+    drive_due_poll_inbox_with_logs(&pic, canister_id, &logs);
 
     let snapshot_request: HttpUpdateRequest = HttpRequest::get("/api/snapshot").build_update();
     let snapshot_response = call_http_update(&pic, canister_id, snapshot_request);
@@ -378,11 +531,13 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
         "snapshot should expose tracked storage entry trend metrics"
     );
     assert!(
-        snapshot
-            .inbox_messages
-            .iter()
-            .any(|msg| msg.get("id").and_then(Value::as_str) == Some(posted_id)),
-        "snapshot should include the posted message id"
+        snapshot.inbox_messages.iter().any(|msg| {
+            msg.get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("hello from pocketic ui flow")
+        }),
+        "snapshot should include the polled inbox message"
     );
     assert_eq!(
         snapshot.prompt_layers.len(),

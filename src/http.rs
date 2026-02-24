@@ -2,7 +2,7 @@
 ///
 /// Every route that is served as a query response is covered by an
 /// IC-certified Merkle tree (v2 certificate header).  Write routes
-/// (`POST /api/inbox`, `POST /api/conversation`, …) carry an
+/// (`POST /api/conversation`, …) carry an
 /// `upgrade: true` flag so the IC boundary nodes automatically retry them as
 /// update calls, which go through `handle_http_request_update`.
 ///
@@ -20,7 +20,6 @@
 /// | GET    | `/api/evm/config`             | query       |
 /// | GET    | `/api/inference/config`       | query       |
 /// | POST   | `/api/conversation`           | update      |
-/// | POST   | `/api/inbox`                  | update      |
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 #[cfg(target_arch = "wasm32")]
@@ -88,21 +87,7 @@ struct HttpCertificationState {
     fallback_not_found: CertifiedRoute,
 }
 
-// ── Inbox API types ──────────────────────────────────────────────────────────
-
-/// JSON body returned on a successful `POST /api/inbox` call.
-#[derive(Clone, Debug, Serialize)]
-struct InboxPostSuccess {
-    ok: bool,
-    id: String,
-}
-
-/// JSON body returned when `POST /api/inbox` is rejected.
-#[derive(Clone, Debug, Serialize)]
-struct InboxPostError {
-    ok: bool,
-    error: String,
-}
+// ── API types ────────────────────────────────────────────────────────────────
 
 /// Parsed body for `POST /api/conversation` — identifies the conversation by
 /// sender address.
@@ -139,13 +124,6 @@ fn evm_config_view() -> EvmConfigView {
         chain_id: route.chain_id,
         rpc_url: stable::get_evm_rpc_url(),
     }
-}
-
-/// Parsed body for `POST /api/inbox`.
-/// The `message` field accepts plain text or a JSON `{"message":"…"}` wrapper.
-#[derive(Clone, Debug, Deserialize)]
-struct InboxPostRequest {
-    message: String,
 }
 
 // ── Route handlers ───────────────────────────────────────────────────────────
@@ -215,20 +193,6 @@ pub fn handle_http_request(request: HttpRequest<'_>) -> HttpResponse<'static> {
     })
 }
 
-/// Returns the textual principal of the update caller.
-/// Falls back to the anonymous principal text in native/test builds.
-fn http_update_caller() -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        return ic_cdk::api::msg_caller().to_text();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        "2vxsx-fae".to_string()
-    }
-}
-
 /// Handles `http_request_update` calls — the mutable side of the HTTP
 /// interface.  Each arm dispatches to the appropriate storage operation and
 /// calls `init_certification` when a state change affects a GET-served route.
@@ -236,13 +200,17 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
     let path = match request.get_path() {
         Ok(path) => path,
         Err(_) => {
-            return json_update_response(
-                StatusCode::BAD_REQUEST,
-                &InboxPostError {
-                    ok: false,
-                    error: "malformed request url".to_string(),
-                },
-            );
+            return HttpResponse::bad_request(
+                br#"{"ok":false,"error":"malformed request url"}"#.as_slice(),
+                vec![
+                    (
+                        HEADER_CONTENT_TYPE.to_string(),
+                        CONTENT_TYPE_JSON.to_string(),
+                    ),
+                    (HEADER_CACHE_CONTROL.to_string(), CACHE_NO_STORE.to_string()),
+                ],
+            )
+            .build_update();
         }
     };
 
@@ -258,43 +226,6 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
         (&Method::GET, "/api/wallet/balance/sync-config") => {
             let config = stable::wallet_balance_sync_config_view();
             json_update_response(StatusCode::OK, &config)
-        }
-        (&Method::POST, "/api/inbox") => {
-            let payload = parse_inbox_post_request(request.body());
-            match payload {
-                Ok(body) => {
-                    let caller = http_update_caller();
-                    match stable::post_inbox_message(body.message, caller) {
-                        Ok(id) => {
-                            log!(HttpLogPriority::Info, "http_inbox_posted id={}", id);
-                            init_certification();
-                            json_update_response(StatusCode::OK, &InboxPostSuccess { ok: true, id })
-                        }
-                        Err(error) => {
-                            log!(
-                                HttpLogPriority::Warn,
-                                "http_inbox_post_rejected err={}",
-                                error
-                            );
-                            json_update_response(
-                                StatusCode::BAD_REQUEST,
-                                &InboxPostError { ok: false, error },
-                            )
-                        }
-                    }
-                }
-                Err(error) => {
-                    log!(
-                        HttpLogPriority::Warn,
-                        "http_inbox_parse_error err={}",
-                        error
-                    );
-                    json_update_response(
-                        StatusCode::BAD_REQUEST,
-                        &InboxPostError { ok: false, error },
-                    )
-                }
-            }
         }
         (&Method::POST, "/api/conversation") => {
             match parse_conversation_lookup_request(request.body()) {
@@ -402,7 +333,6 @@ fn build_certification_state() -> HttpCertificationState {
         json_route(Method::GET, "/api/evm/config", &evm_config),
         json_route(Method::GET, "/api/inference/config", &inference_config),
         upgrade_route(Method::POST, "/api/conversation"),
-        upgrade_route(Method::POST, "/api/inbox"),
     ];
     for route in &routes {
         let entry = HttpCertificationTreeEntry::new(&route.cert_path, route.certification);
@@ -667,25 +597,6 @@ fn json_update_response<T: Serialize>(
             .build_update()
         }
     }
-}
-
-/// Parses an inbox POST body.  Accepts both `{"message":"…"}` JSON and raw
-/// UTF-8 plain text.  Normalises the message via `stable::normalize_inbox_body`.
-fn parse_inbox_post_request(body: &[u8]) -> Result<InboxPostRequest, String> {
-    if body.is_empty() {
-        return Err("message body cannot be empty".to_string());
-    }
-
-    if let Ok(parsed) = serde_json::from_slice::<InboxPostRequest>(body) {
-        return Ok(InboxPostRequest {
-            message: stable::normalize_inbox_body(&parsed.message)?,
-        });
-    }
-
-    let as_text = std::str::from_utf8(body).map_err(|_| "request body is not valid utf-8")?;
-    Ok(InboxPostRequest {
-        message: stable::normalize_inbox_body(as_text)?,
-    })
 }
 
 /// Parses the `POST /api/conversation` request body and trims the sender field.
@@ -994,6 +905,17 @@ mod tests {
     }
 
     #[test]
+    fn post_inbox_route_is_not_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::post("/api/inbox").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(response.upgrade(), None);
+    }
+
+    #[test]
     fn post_conversation_route_is_upgradable() {
         init_certification();
 
@@ -1044,45 +966,23 @@ mod tests {
     }
 
     #[test]
-    fn post_inbox_accepts_oversized_burst_payloads_with_truncation() {
+    fn post_inbox_update_route_returns_not_found() {
         init_certification();
-        stable::init_storage();
-        let oversized = "z".repeat(stable::MAX_INBOX_BODY_CHARS.saturating_add(512));
 
-        for idx in 0..120usize {
-            let request: HttpUpdateRequest = HttpRequest::post("/api/inbox")
-                .with_headers(vec![(
-                    "content-type".to_string(),
-                    CONTENT_TYPE_JSON.to_string(),
-                )])
-                .with_body(
-                    serde_json::json!({
-                        "message": format!("{oversized}-{idx:03}"),
-                    })
-                    .to_string()
-                    .into_bytes(),
-                )
-                .build_update();
-            let response = handle_http_request_update(request);
-            assert_eq!(
-                response.status_code(),
-                StatusCode::OK,
-                "burst payload index {idx} should be accepted and normalized"
-            );
-        }
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inbox")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"message":"legacy path"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
 
-        let stats = stable::inbox_stats();
-        assert_eq!(
-            stats.total_messages, 120,
-            "oversized burst ingress should be persisted without dropping requests"
-        );
-
-        let messages = stable::list_inbox_messages(120);
-        assert_eq!(messages.len(), 120);
-        assert!(messages.iter().all(|message| {
-            message.body.chars().count() <= stable::MAX_INBOX_BODY_CHARS
-                && message.body.contains("[truncated")
-        }));
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(body.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(body.get("error").and_then(Value::as_str), Some("not found"));
     }
 
     #[test]

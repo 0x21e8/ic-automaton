@@ -105,6 +105,7 @@ dependencies = [
  "json5",
  "k256",
  "pocket-ic",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
