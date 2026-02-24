@@ -1,3 +1,28 @@
+/// Intent → execution plan compilation.
+///
+/// This module transforms a high-level [`StrategyExecutionIntent`] — which specifies a strategy
+/// template key, action ID, and JSON-typed call arguments — into a concrete [`ExecutionPlan`]
+/// containing ABI-encoded calldata ready for on-chain submission.
+///
+/// # Compilation pipeline (`compile_intent`)
+///
+/// 1. **Template lookup** — retrieve the [`StrategyTemplate`] from the registry; error if absent.
+/// 2. **Action resolution** — find the named action within the template's `actions` list.
+/// 3. **Parameter parsing** — deserialise `typed_params_json` into per-call arg arrays; assert
+///    call-count parity with `action.call_sequence`.
+/// 4. **Role binding** — for each call in the sequence, resolve the contract role to an EVM
+///    address via the template's `contract_roles`.
+/// 5. **ABI verification** — load the [`AbiArtifact`] for the role; confirm the function
+///    signature appears in the artifact (via [`abi::verify_function_selector`]).
+/// 6. **ABI encoding** — encode each call's arguments using the full Solidity ABI encoding
+///    rules (head/tail layout, dynamic types, tuple recursion).
+/// 7. **Plan assembly** — concatenate selector + encoded args into `data`, attach `value_wei`,
+///    and collect everything into an [`ExecutionPlan`].
+///
+/// [`StrategyExecutionIntent`]: crate::domain::types::StrategyExecutionIntent
+/// [`ExecutionPlan`]: crate::domain::types::ExecutionPlan
+/// [`StrategyTemplate`]: crate::domain::types::StrategyTemplate
+/// [`AbiArtifact`]: crate::domain::types::AbiArtifact
 use crate::domain::types::{
     AbiArtifactKey, AbiTypeSpec, ExecutionPlan, StrategyExecutionCall, StrategyExecutionIntent,
 };
@@ -8,12 +33,16 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+// ── Internal deserialization types ──────────────────────────────────────────
+
+/// Top-level typed parameters extracted from `intent.typed_params_json`.
 #[derive(Clone, Debug, Deserialize, Default)]
 struct IntentTypedParams {
     #[serde(default)]
     calls: Vec<IntentTypedCall>,
 }
 
+/// Per-call arguments supplied by the caller inside `typed_params_json`.
 #[derive(Clone, Debug, Deserialize, Default)]
 struct IntentTypedCall {
     #[serde(default)]
@@ -22,6 +51,13 @@ struct IntentTypedCall {
     value_wei: Option<String>,
 }
 
+// ── Public surface ───────────────────────────────────────────────────────────
+
+/// Compile a [`StrategyExecutionIntent`] into a fully ABI-encoded [`ExecutionPlan`].
+///
+/// See the module-level documentation for a description of the compilation pipeline.
+/// Returns `Err` with a descriptive message if any step fails; the error is safe to
+/// surface to callers and is used by the learner to classify failure determinism.
 pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan, String> {
     let action_id = normalize_non_empty(&intent.action_id, "action_id")?;
     let template = registry::get_template(&intent.key, &intent.version).ok_or_else(|| {
@@ -47,6 +83,7 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         ));
     }
 
+    // Each element of `typed.calls` must correspond 1:1 with `action.call_sequence`.
     let typed: IntentTypedParams = serde_json::from_str(&intent.typed_params_json)
         .map_err(|error| format!("invalid typed_params_json: {error}"))?;
     if typed.calls.len() != action.call_sequence.len() {
@@ -57,6 +94,7 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         ));
     }
 
+    // Build a role→binding map for O(1) lookups during call assembly.
     let role_bindings = template
         .contract_roles
         .iter()
@@ -132,6 +170,7 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         .to_string();
         let encoded_args = encode_abi_params(&function.inputs, &typed_call.args)?;
         let selector_hex = normalize_selector_hex(&function.selector_hex)?;
+        // Calldata = 4-byte selector || ABI-encoded arguments (no length prefix).
         let data = format!(
             "0x{}{}",
             selector_hex.trim_start_matches("0x"),
@@ -155,6 +194,8 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         postconditions: action.postconditions.clone(),
     })
 }
+
+// ── Normalisation helpers ────────────────────────────────────────────────────
 
 fn normalize_non_empty(raw: &str, field: &str) -> Result<String, String> {
     let trimmed = raw.trim();
@@ -295,6 +336,14 @@ fn static_word_size(spec: &AbiTypeSpec) -> Result<Option<usize>, String> {
     Ok(Some(1))
 }
 
+// ── ABI encoding ─────────────────────────────────────────────────────────────
+
+/// Encode a slice of typed values according to the Solidity ABI head/tail layout.
+///
+/// Dynamic types (arrays with unknown length, `bytes`, `string`) contribute a 32-byte
+/// offset word to the head section and append their payload to the tail.  Static types
+/// (fixed-size scalars, fixed-length arrays, static tuples) are written directly into
+/// the head.
 fn encode_abi_params(specs: &[AbiTypeSpec], values: &[Value]) -> Result<Vec<u8>, String> {
     if specs.len() != values.len() {
         return Err(format!(
@@ -304,9 +353,11 @@ fn encode_abi_params(specs: &[AbiTypeSpec], values: &[Value]) -> Result<Vec<u8>,
         ));
     }
 
+    // First pass: compute head section size so tail offsets can be pre-calculated.
     let mut head_size_words = 0usize;
     for spec in specs {
         if is_dynamic_type(spec)? {
+            // Dynamic types each reserve exactly one 32-byte offset word in the head.
             head_size_words = head_size_words.saturating_add(1);
         } else {
             let Some(words) = static_word_size(spec)? else {
@@ -460,10 +511,13 @@ fn encode_abi_dynamic(spec: &AbiTypeSpec, value: &Value, field: &str) -> Result<
     Err(format!("unsupported dynamic abi type: {kind}"))
 }
 
+/// Encode a byte slice as an ABI dynamic-bytes value: length word followed by
+/// the payload zero-padded to the next 32-byte boundary.
 fn encode_dynamic_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_u256_word(U256::from(bytes.len())));
     out.extend_from_slice(bytes);
+    // Pad to 32-byte boundary; `(32 - len % 32) % 32` handles exact multiples correctly.
     let padding = (32usize.saturating_sub(bytes.len() % 32)) % 32;
     if padding > 0 {
         out.extend(vec![0u8; padding]);
@@ -552,6 +606,7 @@ fn parse_i128_from_json(value: &Value, field: &str) -> Result<i128, String> {
         .map_err(|error| format!("failed to parse {field} as signed integer: {error}"))
 }
 
+/// Encode a `U256` as a big-endian 32-byte ABI word.
 fn encode_u256_word(value: U256) -> Vec<u8> {
     let mut out = [0u8; 32];
     let mut index = 0usize;

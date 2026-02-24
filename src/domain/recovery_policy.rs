@@ -1,11 +1,41 @@
 #![allow(dead_code)]
 
+/// Failure classification and recovery policy decisions for the scheduler.
+///
+/// `decide_recovery_action` is the single entry point: it accepts a structured
+/// `RecoveryFailure` and a `RecoveryContext` and returns a `RecoveryDecision`
+/// that tells the caller what to do next — retry immediately, back off, tune the
+/// response limit, skip, or escalate.
+///
+/// # Decision tree (high level)
+///
+/// ```text
+/// RecoveryFailure::Outcall
+///   ResponseTooLarge  → TuneResponseLimit (if headroom remains) | Backoff
+///   Timeout/Transport/UpstreamUnavailable
+///                     → RetryImmediate (first failure) | Backoff
+///   RateLimited       → Backoff (honouring retry-after hint)
+///   InvalidRequest / RejectedByPolicy → EscalateFault
+///   InvalidResponse / Unknown         → Backoff
+///
+/// RecoveryFailure::Operation
+///   BlockedBySurvivalPolicy / InsufficientCycles → Skip
+///   MissingConfig / InvalidConfig / Unauthorized / Deterministic → EscalateFault
+///   Unknown → Backoff
+/// ```
 use crate::domain::types::{
     OperationFailureKind, OutcallFailureKind, RecoveryContext, RecoveryDecision,
     RecoveryDecisionReason, RecoveryFailure, RecoveryPolicyAction, ResponseLimitAdjustment,
     ResponseLimitPolicy,
 };
 
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Classify `failure` and return the appropriate `RecoveryDecision`.
+///
+/// The decision is purely a function of the failure type and context — no
+/// side effects.  Callers are responsible for acting on the returned decision
+/// (scheduling the backoff, updating response limits, etc.).
 pub fn decide_recovery_action(
     failure: &RecoveryFailure,
     context: &RecoveryContext,
@@ -95,6 +125,10 @@ pub fn decide_recovery_action(
     }
 }
 
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+/// Build a `Backoff` decision, preferring the upstream `retry_after_secs` hint
+/// over the locally computed exponential value, but clamping to `[1, max]`.
 fn backoff_decision(
     context: &RecoveryContext,
     retry_after_secs: Option<u64>,
@@ -106,6 +140,7 @@ fn backoff_decision(
         bounded_max,
         context.consecutive_failures,
     );
+    // Use hint if provided; clamp so we never exceed the configured maximum.
     let backoff_secs = retry_after_secs.unwrap_or(computed).clamp(1, bounded_max);
     RecoveryDecision {
         action: RecoveryPolicyAction::Backoff,
@@ -115,6 +150,8 @@ fn backoff_decision(
     }
 }
 
+/// Compute `base_secs × 2^consecutive_failures`, clamped to `[1, max_secs]`.
+/// The shift is capped at 20 to prevent overflow on `checked_shl`.
 fn exponential_backoff_secs(base_secs: u64, max_secs: u64, consecutive_failures: u32) -> u64 {
     let bounded_max = max_secs.max(1);
     let bounded_base = base_secs.clamp(1, bounded_max);
@@ -123,6 +160,8 @@ fn exponential_backoff_secs(base_secs: u64, max_secs: u64, consecutive_failures:
     bounded_base.saturating_mul(multiplier).min(bounded_max)
 }
 
+/// Compute the next response-limit step by applying `tune_multiplier`.
+/// Returns `None` when the limit is already at its maximum.
 fn next_response_limit_adjustment(
     response_limit: &ResponseLimitPolicy,
 ) -> Option<ResponseLimitAdjustment> {

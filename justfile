@@ -1,13 +1,19 @@
+set dotenv-load := true
+
 default:
   @just --list
 
 anvil_host := "127.0.0.1"
 anvil_port := "18545"
 anvil_chain_id := "31337"
+base_chain_id := "8453"
 anvil_rpc_url := "http://" + anvil_host + ":" + anvil_port
 anvil_private_key := "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 bootstrap_usdc_amount := "1000000000"
 bootstrap_eth_wei := "500000000000000"
+bootstrap_wallet_usdc_amount := "100000000"
+bootstrap_wallet_eth_wei := "1000000000000000000"
+bootstrap_secondary_evm_address := "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca"
 automaton_wait_timeout_secs := "180"
 automaton_wait_poll_secs := "2"
 local_url := "http://127.0.0.1:8000"
@@ -25,17 +31,63 @@ ic-start:
 ic-stop:
   icp network stop
 
-anvil-start:
+anvil-start mode="local" fork_url="" fork_block="":
   #!/usr/bin/env bash
   set -euo pipefail
+  mode="{{mode}}"
+  fork_url="{{fork_url}}"
+  fork_block="{{fork_block}}"
   mkdir -p .local
-  if [ -f .local/anvil.pid ] && kill -0 "$(cat .local/anvil.pid)" 2>/dev/null; then
-    echo "Anvil already running with PID $(cat .local/anvil.pid)"
-  else
-    rm -f .local/anvil.pid
-    nohup anvil --host {{anvil_host}} --port {{anvil_port}} --chain-id {{anvil_chain_id}} --silent >/tmp/anvil-ic-automaton.log 2>&1 &
+  current_mode=""
+  if [ -f .local/anvil.mode ]; then
+    current_mode="$(cat .local/anvil.mode)"
+  fi
+
+  if [ -f .local/anvil.pid ]; then
+    if kill -0 "$(cat .local/anvil.pid)" 2>/dev/null; then
+      if [ "$current_mode" = "$mode" ]; then
+        echo "Anvil already running with PID $(cat .local/anvil.pid) in mode=$mode"
+      else
+        echo "Anvil is running in mode=$current_mode and will be restarted with mode=$mode"
+        kill "$(cat .local/anvil.pid)"
+        rm -f .local/anvil.pid
+      fi
+    else
+      echo "Removing stale Anvil PID file: $(cat .local/anvil.pid)"
+      rm -f .local/anvil.pid
+    fi
+  fi
+
+  if [ ! -f .local/anvil.pid ]; then
+    case "$mode" in
+      local)
+        chain_id="{{anvil_chain_id}}"
+        nohup anvil --host {{anvil_host}} --port {{anvil_port}} --chain-id "$chain_id" --silent >/tmp/anvil-ic-automaton.log 2>&1 &
+        ;;
+      base-fork)
+        chain_id="{{base_chain_id}}"
+        if [ -z "$fork_url" ]; then
+          fork_url="${BASE_MAINNET_RPC_URL:-}"
+        fi
+        if [ -z "$fork_url" ]; then
+          echo "base-fork mode requires fork_url arg or BASE_MAINNET_RPC_URL env var" >&2
+          exit 1
+        fi
+        anvil_cmd=(anvil --host {{anvil_host}} --port {{anvil_port}} --chain-id "$chain_id" --fork-url "$fork_url" --silent)
+        if [ -n "$fork_block" ]; then
+          anvil_cmd+=(--fork-block-number "$fork_block")
+        fi
+        nohup "${anvil_cmd[@]}" >/tmp/anvil-ic-automaton.log 2>&1 &
+        ;;
+      *)
+        echo "unsupported mode=$mode (supported: local, base-fork)" >&2
+        exit 1
+        ;;
+    esac
     echo $! > .local/anvil.pid
-    echo "Started Anvil with PID $(cat .local/anvil.pid)"
+    printf '%s\n' "$mode" > .local/anvil.mode
+    printf '%s\n' "$chain_id" > .local/anvil.chain_id
+    echo "Started Anvil with PID $(cat .local/anvil.pid) in mode=$mode"
   fi
   ready=0
   for _ in $(seq 1 50); do
@@ -92,7 +144,7 @@ deploy-inbox:
   echo "MockUSDC: $mock_usdc_address"
   echo "Inbox:    $inbox_address"
 
-deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id:
+deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_chain_id=anvil_chain_id evm_rpc_url=anvil_rpc_url:
   #!/usr/bin/env bash
   set -euo pipefail
   escape_candid_text() {
@@ -100,6 +152,8 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id:
   }
   inbox_address="{{inbox_address}}"
   llm_canister_id="{{llm_canister_id}}"
+  evm_chain_id="{{evm_chain_id}}"
+  evm_rpc_url="{{evm_rpc_url}}"
   if [ -z "$inbox_address" ]; then
     inbox_address="$(cat .local/inbox_contract_address)"
   fi
@@ -107,7 +161,7 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id:
   if ! icp canister create backend -e local >/dev/null 2>&1; then
     echo "backend canister already exists on local"
   fi
-  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ({{anvil_chain_id}} : nat64); evm_rpc_url = opt \"{{anvil_rpc_url}}\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\" })"
+  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ($evm_chain_id : nat64); evm_rpc_url = opt \"$evm_rpc_url\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\" })"
   if [ -n "${OPENROUTER_API_KEY:-}" ]; then
     api_key_escaped="$(escape_candid_text "$OPENROUTER_API_KEY")"
     icp canister call backend set_openrouter_api_key "(opt \"$api_key_escaped\")" -e local >/dev/null
@@ -188,11 +242,61 @@ seed-bootstrap-payer:
 
   echo "Seeded payer $sender_address with {{bootstrap_usdc_amount}} mock USDC and approved inbox"
 
-configure-inference-openrouter model=openrouter_default_model:
+seed-bootstrap-wallets automaton_address="" recipient_address=bootstrap_secondary_evm_address:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ ! -f .local/mock_usdc_address ]; then
+    echo "Missing mock USDC address in .local; run just deploy-inbox first" >&2
+    exit 1
+  fi
+
+  automaton_address="{{automaton_address}}"
+  recipient_address="{{recipient_address}}"
+  if [ -z "$automaton_address" ]; then
+    automaton_address="$(just --quiet automaton-evm-address)"
+  fi
+
+  for address in "$automaton_address" "$recipient_address"; do
+    if ! printf '%s\n' "$address" | grep -Eiq '^0x[0-9a-f]{40}$'; then
+      echo "Invalid EVM address: $address" >&2
+      exit 1
+    fi
+  done
+
+  mock_usdc_address="$(cat .local/mock_usdc_address)"
+
+  cast send "$mock_usdc_address" \
+    "transfer(address,uint256)" \
+    "$automaton_address" \
+    {{bootstrap_wallet_usdc_amount}} \
+    --rpc-url {{anvil_rpc_url}} \
+    --private-key {{anvil_private_key}} >/dev/null
+  cast send "$automaton_address" \
+    --value {{bootstrap_wallet_eth_wei}} \
+    --rpc-url {{anvil_rpc_url}} \
+    --private-key {{anvil_private_key}} >/dev/null
+
+  cast send "$mock_usdc_address" \
+    "transfer(address,uint256)" \
+    "$recipient_address" \
+    {{bootstrap_wallet_usdc_amount}} \
+    --rpc-url {{anvil_rpc_url}} \
+    --private-key {{anvil_private_key}} >/dev/null
+  cast send "$recipient_address" \
+    --value {{bootstrap_wallet_eth_wei}} \
+    --rpc-url {{anvil_rpc_url}} \
+    --private-key {{anvil_private_key}} >/dev/null
+
+  echo "Seeded $automaton_address and $recipient_address with {{bootstrap_wallet_usdc_amount}} mock USDC and {{bootstrap_wallet_eth_wei}} wei"
+
+configure-inference-openrouter model="":
   #!/usr/bin/env bash
   set -euo pipefail
 
   model="{{model}}"
+  if [ -z "$model" ]; then
+    model="${OPENROUTER_MODEL:-{{openrouter_default_model}}}"
+  fi
   escape_candid_text() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
   }
@@ -215,9 +319,13 @@ configure-inference-openrouter model=openrouter_default_model:
     echo "OPENROUTER_API_KEY is not set; inference will fail until you set it."
   fi
 
-ollama-start model=ic_llm_default_model:
+ollama-start model="":
   #!/usr/bin/env bash
   set -euo pipefail
+  model="{{model}}"
+  if [ -z "$model" ]; then
+    model="${IC_LLM_MODEL:-{{ic_llm_default_model}}}"
+  fi
   mkdir -p .local
 
   if curl -fsS "{{ollama_api_url}}/api/tags" >/dev/null 2>&1; then
@@ -248,7 +356,7 @@ ollama-start model=ic_llm_default_model:
     exit 1
   fi
 
-  ollama pull "{{model}}"
+  ollama pull "$model"
 
 ollama-stop:
   #!/usr/bin/env bash
@@ -261,7 +369,7 @@ ollama-stop:
     echo "No tracked Ollama PID in .local/ollama.pid"
   fi
 
-configure-inference-icllm model=ic_llm_default_model:
+configure-inference-icllm model="":
   #!/usr/bin/env bash
   set -euo pipefail
 
@@ -270,6 +378,9 @@ configure-inference-icllm model=ic_llm_default_model:
   }
 
   model="{{model}}"
+  if [ -z "$model" ]; then
+    model="${IC_LLM_MODEL:-{{ic_llm_default_model}}}"
+  fi
   model_escaped="$(escape_candid_text "$model")"
   icp canister call backend set_inference_provider '(variant { IcLlm })' -e local >/dev/null
   icp canister call backend set_inference_model "(\"$model_escaped\")" -e local >/dev/null
@@ -305,19 +416,43 @@ send-message-eth-only message="hello automaton (eth-only)" eth_wei=bootstrap_eth
     --rpc-url {{anvil_rpc_url}} \
     --private-key {{anvil_private_key}}
 
-bootstrap mode="openrouter" openrouter_model=openrouter_default_model ic_llm_model=ic_llm_default_model:
+bootstrap mode="openrouter" openrouter_model="" ic_llm_model="" evm_mode="local" base_rpc_url="" base_fork_block="":
   #!/usr/bin/env bash
   set -euo pipefail
   mode="{{mode}}"
+  openrouter_model="{{openrouter_model}}"
+  ic_llm_model="{{ic_llm_model}}"
+  evm_mode="{{evm_mode}}"
+  base_rpc_url="{{base_rpc_url}}"
+  base_fork_block="{{base_fork_block}}"
+  evm_chain_id="{{anvil_chain_id}}"
   llm_canister_id="{{llm_default_canister_id}}"
+  if [ -z "$openrouter_model" ]; then
+    openrouter_model="${OPENROUTER_MODEL:-{{openrouter_default_model}}}"
+  fi
+  if [ -z "$ic_llm_model" ]; then
+    ic_llm_model="${IC_LLM_MODEL:-{{ic_llm_default_model}}}"
+  fi
   just ic-start
-  just anvil-start
+  case "$evm_mode" in
+    local)
+      just anvil-start
+      ;;
+    base-fork)
+      just anvil-start "base-fork" "$base_rpc_url" "$base_fork_block"
+      evm_chain_id="{{base_chain_id}}"
+      ;;
+    *)
+      echo "unsupported evm_mode=$evm_mode (supported: local, base-fork)" >&2
+      exit 1
+      ;;
+  esac
   just deploy-inbox
   case "$mode" in
     openrouter)
       ;;
     icllm|ic-llm|ollama)
-      just ollama-start "{{ic_llm_model}}"
+      just ollama-start "$ic_llm_model"
       just deploy-llm
       llm_canister_id="$(cat .local/llm_canister_id)"
       ;;
@@ -327,16 +462,17 @@ bootstrap mode="openrouter" openrouter_model=openrouter_default_model ic_llm_mod
       ;;
   esac
 
-  just deploy-canister "" "$llm_canister_id"
+  just deploy-canister "" "$llm_canister_id" "$evm_chain_id" "{{anvil_rpc_url}}"
   automaton_address="$(just --quiet automaton-evm-address)"
   echo "Automaton EVM address: $automaton_address"
   just seed-bootstrap-payer
+  just seed-bootstrap-wallets "$automaton_address"
   case "$mode" in
     openrouter)
-      just configure-inference-openrouter "{{openrouter_model}}"
+      just configure-inference-openrouter "$openrouter_model"
       ;;
     icllm|ic-llm|ollama)
-      just configure-inference-icllm "{{ic_llm_model}}"
+      just configure-inference-icllm "$ic_llm_model"
       ;;
     *)
       echo "unsupported mode=$mode (supported: openrouter, icllm)" >&2

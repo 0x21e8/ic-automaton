@@ -1,3 +1,27 @@
+/// Certified HTTP handler for the canister's browser UI and JSON API.
+///
+/// Every route that is served as a query response is covered by an
+/// IC-certified Merkle tree (v2 certificate header).  Write routes
+/// (`POST /api/inbox`, `POST /api/inference/config`, …) carry an
+/// `upgrade: true` flag so the IC boundary nodes automatically retry them as
+/// update calls, which go through `handle_http_request_update`.
+///
+/// # Route map
+///
+/// | Method | Path                          | Kind        |
+/// |--------|-------------------------------|-------------|
+/// | GET    | `/`                           | query       |
+/// | GET    | `/index.html`                 | query       |
+/// | GET    | `/styles.css`                 | query       |
+/// | GET    | `/app.js`                     | query       |
+/// | GET    | `/api/snapshot`               | query       |
+/// | GET    | `/api/wallet/balance`         | query       |
+/// | GET    | `/api/wallet/balance/sync-config` | query   |
+/// | GET    | `/api/evm/config`             | query       |
+/// | GET    | `/api/inference/config`       | query       |
+/// | POST   | `/api/inference/config`       | update      |
+/// | POST   | `/api/conversation`           | update      |
+/// | POST   | `/api/inbox`                  | update      |
 use crate::domain::types::InferenceConfigView;
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -23,6 +47,9 @@ const UI_INDEX_HTML: &str = include_str!("ui_index.html");
 const UI_STYLES_CSS: &str = include_str!("ui_styles.css");
 const UI_APP_JS: &str = include_str!("ui_app.js");
 
+// ── Certification types ──────────────────────────────────────────────────────
+
+/// Log priority levels for HTTP-layer diagnostics.
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum HttpLogPriority {
     #[log_level(capacity = 1000, name = "HTTP_INFO")]
@@ -39,6 +66,9 @@ impl GetLogFilter for HttpLogPriority {
     }
 }
 
+/// A fully-certified HTTP route: pairs a pre-built `HttpCertification` proof
+/// with the base response body so that `render_certified_response` can attach
+/// the v2 certificate header without recomputing the Merkle witness each time.
 #[derive(Clone)]
 struct CertifiedRoute {
     method: Method,
@@ -50,6 +80,9 @@ struct CertifiedRoute {
     base_response: HttpResponse<'static>,
 }
 
+/// Thread-local snapshot of the certification tree and all registered routes.
+/// Rebuilt by `init_certification` on every `init` / `post_upgrade` call and
+/// whenever a write route mutates state that is reflected in a GET response.
 #[derive(Clone)]
 struct HttpCertificationState {
     tree: HttpCertificationTree,
@@ -57,41 +90,55 @@ struct HttpCertificationState {
     fallback_not_found: CertifiedRoute,
 }
 
+// ── Inbox API types ──────────────────────────────────────────────────────────
+
+/// JSON body returned on a successful `POST /api/inbox` call.
 #[derive(Clone, Debug, Serialize)]
 struct InboxPostSuccess {
     ok: bool,
     id: String,
 }
 
+/// JSON body returned when `POST /api/inbox` is rejected.
 #[derive(Clone, Debug, Serialize)]
 struct InboxPostError {
     ok: bool,
     error: String,
 }
 
+// ── Inference config API types ───────────────────────────────────────────────
+
+/// JSON body returned when `POST /api/inference/config` is rejected.
 #[derive(Clone, Debug, Serialize)]
 struct InferenceConfigError {
     ok: bool,
     error: String,
 }
 
+/// JSON body returned on a successful `POST /api/inference/config` call.
 #[derive(Clone, Debug, Serialize)]
 struct InferenceConfigSuccess {
     ok: bool,
     config: InferenceConfigView,
 }
 
+/// Parsed body for `POST /api/conversation` — identifies the conversation by
+/// sender address.
 #[derive(Clone, Debug, Deserialize)]
 struct ConversationLookupRequest {
     sender: String,
 }
 
+/// JSON body returned when `POST /api/conversation` cannot find the requested
+/// sender.
 #[derive(Clone, Debug, Serialize)]
 struct ConversationLookupError {
     ok: bool,
     error: String,
 }
 
+/// Parsed body for `POST /api/inference/config`.
+/// All fields are optional; only supplied fields are mutated.
 #[derive(Clone, Debug, Deserialize)]
 struct InferenceConfigUpdateRequest {
     #[serde(default)]
@@ -104,6 +151,9 @@ struct InferenceConfigUpdateRequest {
     api_key: Option<String>,
 }
 
+/// Controls how the OpenRouter API key is handled in a config update request.
+/// `Keep` leaves the current key in place, `Set` stores a new one, `Clear`
+/// removes it.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum OpenRouterKeyAction {
@@ -112,6 +162,8 @@ enum OpenRouterKeyAction {
     Clear,
 }
 
+/// Serialisable snapshot of EVM configuration fields served by
+/// `GET /api/evm/config`.
 #[derive(Clone, Debug, Serialize)]
 struct EvmConfigView {
     automaton_address: Option<String>,
@@ -121,15 +173,35 @@ struct EvmConfigView {
     rpc_url: String,
 }
 
+fn evm_config_view() -> EvmConfigView {
+    let route = stable::evm_route_state_view();
+    EvmConfigView {
+        automaton_address: route.automaton_evm_address,
+        inbox_contract_address: route.inbox_contract_address,
+        usdc_address: stable::get_discovered_usdc_address(),
+        chain_id: route.chain_id,
+        rpc_url: stable::get_evm_rpc_url(),
+    }
+}
+
+/// Parsed body for `POST /api/inbox`.
+/// The `message` field accepts plain text or a JSON `{"message":"…"}` wrapper.
 #[derive(Clone, Debug, Deserialize)]
 struct InboxPostRequest {
     message: String,
 }
 
+// ── Route handlers ───────────────────────────────────────────────────────────
+
+// Per-canister thread-local state holding the live certification tree.
 thread_local! {
     static HTTP_STATE: RefCell<Option<HttpCertificationState>> = const { RefCell::new(None) };
 }
 
+/// Builds a fresh `HttpCertificationState` from current stable storage,
+/// commits the Merkle root hash as certified data, and stores the state in
+/// the thread-local slot.  Must be called from `init`, `post_upgrade`, and
+/// after any write route that changes a GET-served payload.
 pub fn init_certification() {
     let state = build_certification_state();
     set_tree_as_certified_data(&state.tree);
@@ -138,6 +210,12 @@ pub fn init_certification() {
     });
 }
 
+/// Handles `http_request` query calls.
+///
+/// Routes that exist in the certification tree are served with a v2 certificate
+/// header.  Upgrade routes return `upgrade: true` so the boundary node retries
+/// as `http_request_update`.  Unknown paths fall back to the certified 404
+/// wildcard route.
 pub fn handle_http_request(request: HttpRequest<'_>) -> HttpResponse<'static> {
     ensure_initialized();
 
@@ -180,6 +258,8 @@ pub fn handle_http_request(request: HttpRequest<'_>) -> HttpResponse<'static> {
     })
 }
 
+/// Returns the textual principal of the update caller.
+/// Falls back to the anonymous principal text in native/test builds.
 fn http_update_caller() -> String {
     #[cfg(target_arch = "wasm32")]
     {
@@ -192,6 +272,9 @@ fn http_update_caller() -> String {
     }
 }
 
+/// Handles `http_request_update` calls — the mutable side of the HTTP
+/// interface.  Each arm dispatches to the appropriate storage operation and
+/// calls `init_certification` when a state change affects a GET-served route.
 pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateResponse<'static> {
     let path = match request.get_path() {
         Ok(path) => path,
@@ -227,6 +310,7 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
                     match stable::post_inbox_message(body.message, caller) {
                         Ok(id) => {
                             log!(HttpLogPriority::Info, "http_inbox_posted id={}", id);
+                            init_certification();
                             json_update_response(StatusCode::OK, &InboxPostSuccess { ok: true, id })
                         }
                         Err(error) => {
@@ -274,14 +358,7 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             }
         }
         (&Method::GET, "/api/evm/config") => {
-            let route = stable::evm_route_state_view();
-            let config = EvmConfigView {
-                automaton_address: route.automaton_evm_address,
-                inbox_contract_address: route.inbox_contract_address,
-                usdc_address: stable::get_discovered_usdc_address(),
-                chain_id: route.chain_id,
-                rpc_url: stable::get_evm_rpc_url(),
-            };
+            let config = evm_config_view();
             json_update_response(StatusCode::OK, &config)
         }
         (&Method::GET, "/api/inference/config") => {
@@ -291,13 +368,16 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
         (&Method::POST, "/api/inference/config") => {
             match parse_inference_config_request(request.body()) {
                 Ok(payload) => match apply_inference_config_update(payload) {
-                    Ok(_) => json_update_response(
-                        StatusCode::OK,
-                        &InferenceConfigSuccess {
-                            ok: true,
-                            config: stable::inference_config_view(),
-                        },
-                    ),
+                    Ok(_) => {
+                        init_certification();
+                        json_update_response(
+                            StatusCode::OK,
+                            &InferenceConfigSuccess {
+                                ok: true,
+                                config: stable::inference_config_view(),
+                            },
+                        )
+                    }
                     Err(error) => {
                         log!(
                             HttpLogPriority::Warn,
@@ -334,6 +414,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
     }
 }
 
+/// Lazily initialises the certification state if not yet present.
+/// Used as a safety net in `handle_http_request`; in production the explicit
+/// `init_certification` call in `init`/`post_upgrade` should always pre-populate
+/// the state.
 fn ensure_initialized() {
     HTTP_STATE.with(|slot| {
         if slot.borrow().is_none() {
@@ -344,7 +428,18 @@ fn ensure_initialized() {
     });
 }
 
+// ── UI serving ───────────────────────────────────────────────────────────────
+
+/// Constructs the full `HttpCertificationState` by reading current stable
+/// storage values and building certified routes for all static assets and API
+/// endpoints.  Inserts each route into a fresh `HttpCertificationTree`.
 fn build_certification_state() -> HttpCertificationState {
+    let snapshot = stable::observability_snapshot(DEFAULT_SNAPSHOT_LIMIT);
+    let wallet_balance = stable::wallet_balance_telemetry_view();
+    let wallet_sync_config = stable::wallet_balance_sync_config_view();
+    let evm_config = evm_config_view();
+    let inference_config = stable::inference_config_view();
+
     let mut tree = HttpCertificationTree::default();
     let routes = vec![
         static_asset_route(
@@ -375,11 +470,15 @@ fn build_certification_state() -> HttpCertificationState {
             UI_APP_JS.as_bytes(),
             CONTENT_TYPE_JS,
         ),
-        upgrade_route(Method::GET, "/api/snapshot"),
-        upgrade_route(Method::GET, "/api/wallet/balance"),
-        upgrade_route(Method::GET, "/api/wallet/balance/sync-config"),
-        upgrade_route(Method::GET, "/api/evm/config"),
-        upgrade_route(Method::GET, "/api/inference/config"),
+        json_route(Method::GET, "/api/snapshot", &snapshot),
+        json_route(Method::GET, "/api/wallet/balance", &wallet_balance),
+        json_route(
+            Method::GET,
+            "/api/wallet/balance/sync-config",
+            &wallet_sync_config,
+        ),
+        json_route(Method::GET, "/api/evm/config", &evm_config),
+        json_route(Method::GET, "/api/inference/config", &inference_config),
         upgrade_route(Method::POST, "/api/inference/config"),
         upgrade_route(Method::POST, "/api/conversation"),
         upgrade_route(Method::POST, "/api/inbox"),
@@ -403,6 +502,7 @@ fn build_certification_state() -> HttpCertificationState {
     }
 }
 
+/// Builds a `CertifiedRoute` for a static file asset (HTML, CSS, JS).
 fn static_asset_route(
     method: Method,
     request_path: &'static str,
@@ -427,6 +527,48 @@ fn static_asset_route(
     )
 }
 
+/// Serialises `payload` to JSON and builds a certified GET route for
+/// `request_path`.  On serialization failure a static error JSON is used so
+/// the route is still registered and the tree remains consistent.
+fn json_route<T: Serialize>(
+    method: Method,
+    request_path: &'static str,
+    payload: &T,
+) -> CertifiedRoute {
+    let body = match serde_json::to_vec(payload) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            log!(
+                HttpLogPriority::Error,
+                "http_json_serialize_error route={} err={}",
+                request_path,
+                error
+            );
+            br#"{"ok":false,"error":"serialization failed"}"#.to_vec()
+        }
+    };
+    let base_response = HttpResponse::ok(
+        body,
+        vec![
+            (
+                HEADER_CONTENT_TYPE.to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            ),
+            (HEADER_CACHE_CONTROL.to_string(), CACHE_NO_STORE.to_string()),
+        ],
+    )
+    .build();
+
+    certified_route(
+        method,
+        request_path,
+        HttpCertificationPath::exact(request_path),
+        base_response,
+    )
+}
+
+/// Builds a certified route that signals `upgrade: true` to the boundary
+/// node, causing it to retry the request as an update call.
 fn upgrade_route(method: Method, request_path: &'static str) -> CertifiedRoute {
     let base_response = HttpResponse::ok(
         br#"{"upgrade":true}"#.as_slice(),
@@ -449,6 +591,8 @@ fn upgrade_route(method: Method, request_path: &'static str) -> CertifiedRoute {
     )
 }
 
+/// Builds the certified wildcard 404 fallback route that covers all paths not
+/// explicitly registered in the tree.
 fn not_found_route() -> CertifiedRoute {
     let base_response = HttpResponse::not_found(
         br#"404 Not Found"#.as_slice(),
@@ -470,6 +614,9 @@ fn not_found_route() -> CertifiedRoute {
     )
 }
 
+/// Core builder: attaches the CEL expression header to `base_response`,
+/// computes the `HttpCertification` proof, and packages everything into a
+/// `CertifiedRoute`.
 fn certified_route(
     method: Method,
     request_path: &'static str,
@@ -501,6 +648,9 @@ fn certified_route(
     }
 }
 
+/// Clones the pre-built base response and — on wasm32 — attaches the IC v2
+/// certificate header using the data certificate and a Merkle witness for
+/// `request_path`.
 fn render_certified_response(
     state: &HttpCertificationState,
     route: &CertifiedRoute,
@@ -549,6 +699,9 @@ fn render_certified_response(
     response
 }
 
+/// Serialises `payload` to JSON and wraps it in an `HttpUpdateResponse` with
+/// the given status code.  Falls back to a 500 plain-error body on
+/// serialization failure.
 fn json_update_response<T: Serialize>(
     status_code: StatusCode,
     payload: &T,
@@ -586,6 +739,8 @@ fn json_update_response<T: Serialize>(
     }
 }
 
+/// Parses an inbox POST body.  Accepts both `{"message":"…"}` JSON and raw
+/// UTF-8 plain text.  Normalises the message via `stable::normalize_inbox_body`.
 fn parse_inbox_post_request(body: &[u8]) -> Result<InboxPostRequest, String> {
     if body.is_empty() {
         return Err("message body cannot be empty".to_string());
@@ -603,6 +758,9 @@ fn parse_inbox_post_request(body: &[u8]) -> Result<InboxPostRequest, String> {
     })
 }
 
+/// Parses the `POST /api/inference/config` request body into an
+/// `InferenceConfigUpdateRequest`.  Returns a structured `InferenceConfigError`
+/// (suitable for direct JSON serialization) on failure.
 fn parse_inference_config_request(
     body: &[u8],
 ) -> Result<InferenceConfigUpdateRequest, InferenceConfigError> {
@@ -621,6 +779,7 @@ fn parse_inference_config_request(
     })
 }
 
+/// Parses the `POST /api/conversation` request body and trims the sender field.
 fn parse_conversation_lookup_request(body: &[u8]) -> Result<ConversationLookupRequest, String> {
     if body.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Err("conversation lookup body cannot be empty".to_string());
@@ -638,6 +797,9 @@ fn parse_conversation_lookup_request(body: &[u8]) -> Result<ConversationLookupRe
     })
 }
 
+/// Applies a validated `InferenceConfigUpdateRequest` to stable storage.
+/// Validates provider/model combinations and API key actions before
+/// persisting any changes.
 fn apply_inference_config_update(
     payload: InferenceConfigUpdateRequest,
 ) -> Result<InferenceConfigView, String> {
@@ -705,6 +867,8 @@ fn apply_inference_config_update(
     Ok(stable::inference_config_view())
 }
 
+/// Maps a raw provider string (case-insensitive) to `InferenceProvider`.
+/// Accepts common aliases such as `"llm_canister"` and `"ic_llm"`.
 fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::InferenceProvider, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "llm_canister" | "llm-canister" | "ic_llm" | "icllm" => {
@@ -715,6 +879,8 @@ fn parse_inference_provider(raw: &str) -> Result<crate::domain::types::Inference
     }
 }
 
+/// Returns `true` when `model` is a well-known IC LLM alias that is invalid
+/// as an OpenRouter model ID.
 fn is_ic_llm_model_alias(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
@@ -722,6 +888,8 @@ fn is_ic_llm_model_alias(model: &str) -> bool {
     )
 }
 
+/// Commits the Merkle root hash of `tree` as the canister's certified data.
+/// No-op in native/test builds where the IC certified data API is unavailable.
 fn set_tree_as_certified_data(tree: &HttpCertificationTree) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -765,52 +933,99 @@ mod tests {
     }
 
     #[test]
-    fn api_snapshot_query_path_requests_upgrade() {
+    fn serves_app_asset_with_history_and_config_commands_wired() {
+        init_certification();
+
+        let request = HttpRequest::get("/app.js").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            find_header(&response, HEADER_CONTENT_TYPE),
+            Some(CONTENT_TYPE_JS)
+        );
+
+        let body = std::str::from_utf8(response.body()).expect("app.js body should be utf8");
+        assert!(
+            body.contains("Past messages and automaton responses"),
+            "help output should mention the history command"
+        );
+        assert!(
+            body.contains("Configuration overview"),
+            "help output should mention the config command"
+        );
+        assert!(
+            body.contains("case \"history\""),
+            "command dispatcher should route the history command"
+        );
+        assert!(
+            body.contains("case \"config\""),
+            "command dispatcher should route the config command"
+        );
+        assert!(
+            body.contains("LIVE STATUS VIEW"),
+            "status command should open a live status view"
+        );
+    }
+
+    #[test]
+    fn api_snapshot_query_path_returns_certified_json() {
         init_certification();
 
         let request = HttpRequest::get("/api/snapshot").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
-        assert_eq!(response.upgrade(), Some(true));
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("snapshot body should decode as json");
+        assert!(body.get("runtime").is_some());
     }
 
     #[test]
-    fn get_wallet_balance_route_is_upgradable() {
+    fn get_wallet_balance_route_is_certified_query() {
         init_certification();
 
         let request = HttpRequest::get("/api/wallet/balance").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
-        assert_eq!(response.upgrade(), Some(true));
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("wallet balance body should decode as json");
+        assert!(body.get("status").is_some());
     }
 
     #[test]
-    fn get_wallet_balance_sync_config_route_is_upgradable() {
+    fn get_wallet_balance_sync_config_route_is_certified_query() {
         init_certification();
 
         let request = HttpRequest::get("/api/wallet/balance/sync-config").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
-        assert_eq!(response.upgrade(), Some(true));
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("wallet sync config body should decode as json");
+        assert!(body.get("enabled").is_some());
     }
 
     #[test]
-    fn get_evm_config_route_is_upgradable() {
+    fn get_evm_config_route_is_certified_query() {
         init_certification();
 
         let request = HttpRequest::get("/api/evm/config").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
-        assert_eq!(response.upgrade(), Some(true));
+        assert_eq!(response.upgrade(), None);
+        let body =
+            serde_json::from_slice::<Value>(response.body()).expect("evm config should decode");
+        assert!(body.get("chain_id").is_some());
     }
 
     #[test]
     fn get_evm_config_returns_expected_fields() {
-        init_certification();
         stable::init_storage();
         stable::set_evm_address(Some(
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -821,9 +1036,10 @@ mod tests {
         ))
         .expect("inbox contract should store");
         stable::set_evm_chain_id(31337).expect("chain id should store");
+        init_certification();
 
-        let request: HttpUpdateRequest = HttpRequest::get("/api/evm/config").build_update();
-        let response = handle_http_request_update(request);
+        let request = HttpRequest::get("/api/evm/config").build();
+        let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
         let body = serde_json::from_slice::<serde_json::Value>(response.body())
@@ -935,14 +1151,17 @@ mod tests {
     }
 
     #[test]
-    fn get_inference_config_route_is_upgradable() {
+    fn get_inference_config_route_is_certified_query() {
         init_certification();
 
         let request = HttpRequest::get("/api/inference/config").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::OK);
-        assert_eq!(response.upgrade(), Some(true));
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("inference config body should decode as json");
+        assert!(body.get("provider").is_some());
     }
 
     #[test]

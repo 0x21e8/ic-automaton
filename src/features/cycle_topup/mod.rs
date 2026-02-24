@@ -1,3 +1,27 @@
+/// Multi-stage cycle top-up state machine via the Onesec USDC bridge.
+///
+/// Funds the canister with cycles by converting Base-chain USDC to ICP and then
+/// to cycles via the Cycles Minting Canister (CMC).  The full pipeline is:
+///
+/// ```text
+/// Preflight
+///   → ApprovingLocker          (ERC-20 approve USDC → Onesec locker)
+///   → WaitingApprovalConfirmation
+///   → LockingUSDC              (call lock1 on Onesec locker)
+///   → WaitingLockConfirmation  (wait N confirmations)
+///   → ValidatingOnOnesec       (call transfer_evm_to_icp on Onesec canister)
+///   → WaitingForBridgedUSDC    (poll bridge transfer until Succeeded)
+///   → ApprovingKongSwap        (ICRC-2 approve bridged-USDC → Kong backend)
+///   → SwappingToICP            (KongSwap USDC → ICP)
+///   → TransferringToCMC        (ICRC-1 transfer ICP → CMC subaccount)
+///   → MintingCycles            (notify_top_up on CMC)
+///   → Completed / Failed
+/// ```
+///
+/// Each stage is advanced by a single `CycleTopUp::advance` call.  Waiting
+/// stages return `Ok(false)` so the scheduler can defer the next tick.
+// ── Imports ──────────────────────────────────────────────────────────────────
+use crate::timing::current_time_ns;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
@@ -7,29 +31,30 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Minimum cycle balance required before the top-up operation may start.
+/// Below this threshold the canister may not have enough cycles to complete
+/// the multi-step cross-chain flow.
 pub(crate) const TOPUP_MIN_OPERATIONAL_CYCLES: u128 = 250_000_000_000;
+
+/// Minimum USDC available (after reserve) before initiating a top-up.
+/// 10_000_000 = $10.00 in USDC 6-decimal units.
 pub(crate) const TOPUP_MIN_USDC_AVAILABLE_RAW: u64 = 10_000_000;
+
+// Default gas limit for EVM transactions submitted during the top-up flow.
 const DEFAULT_EVM_GAS_LIMIT: u64 = 250_000;
+
+// EIP-1559 priority fee — 1 Gwei, suitable for Base mainnet.
 const DEFAULT_PRIORITY_FEE_PER_GAS_WEI: u64 = 1_000_000_000;
+
+// RLP encoding length of an empty EIP-2930 access list `[]`.
 const EMPTY_ACCESS_LIST_RLP_LEN: usize = 1;
 
-const SELECTOR_ERC20_BALANCE_OF: &str = "70a08231";
-const SELECTOR_ERC20_APPROVE: &str = "095ea7b3";
-const SELECTOR_LOCK1: &str = "3455fccc";
-
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
-}
+// ABI function selectors (first 4 bytes of keccak256 of the function signature).
+const SELECTOR_ERC20_BALANCE_OF: &str = "70a08231"; // balanceOf(address)
+const SELECTOR_ERC20_APPROVE: &str = "095ea7b3"; // approve(address,uint256)
+const SELECTOR_LOCK1: &str = "3455fccc"; // lock1(uint256,bytes32)
 
 fn current_canister_id() -> Principal {
     #[cfg(target_arch = "wasm32")]
@@ -47,6 +72,10 @@ fn current_cycle_balance128() -> u128 {
     return u128::MAX;
 }
 
+// ── Port traits ───────────────────────────────────────────────────────────────
+
+/// Abstraction over EVM signing and RPC used by the top-up state machine.
+/// Concrete implementation in `cycle_topup_host::AutomatonEvmPort`.
 #[allow(dead_code)]
 #[async_trait(?Send)]
 pub trait EvmPort {
@@ -54,28 +83,52 @@ pub trait EvmPort {
     async fn evm_rpc_call(&self, method: &str, params: &str) -> Result<String, String>;
 }
 
+/// Abstraction over persistent stage storage.
+/// Concrete implementation in `cycle_topup_host::AutomatonStoragePort`.
 pub trait StoragePort {
     fn load_state(&self) -> Option<TopUpStage>;
     fn save_state(&self, state: &TopUpStage);
     fn clear_state(&self);
 }
 
+// ── Configuration ─────────────────────────────────────────────────────────────
+
+/// Static configuration for a single top-up operation.
+///
+/// Built from `RuntimeSnapshot` via `topup_config_from_snapshot` in
+/// `cycle_topup_host`.  All addresses and canister IDs are validated before
+/// the `CycleTopUp` state machine is created.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TopUpConfig {
+    /// EVM wallet address that holds USDC and submits transactions.
     pub evm_address: String,
+    /// Base-chain USDC ERC-20 contract address (default: native USDC on Base).
     pub usdc_contract_address: String,
+    /// Onesec locker contract address — receives the ERC-20 approve + lock1 calls.
     pub onesec_locker_address: String,
+    /// EVM chain ID — must be Base (8453) for the bridge to function.
     pub evm_chain_id: u64,
+    /// Onesec bridge canister for `transfer_evm_to_icp`.
     pub onesec_canister: Principal,
+    /// Bridged USDC ledger canister (ICRC-2) on the IC side.
     pub bridged_usdc_ledger: Principal,
+    /// KongSwap backend canister for USDC → ICP swap.
     pub kong_backend: Principal,
+    /// ICP ledger canister (ICRC-1) for transferring ICP to CMC.
     pub icp_ledger: Principal,
+    /// Cycles Minting Canister — receives ICP and mints cycles.
     pub cmc: Principal,
+    /// Canister to top up; defaults to the automaton itself when `None`.
     pub target_canister: Option<Principal>,
+    /// Minimum USDC balance to keep in reserve (6-decimal raw units).
     pub min_usdc_reserve: u64,
+    /// Maximum USDC to spend in a single top-up (6-decimal raw units).
     pub max_usdc_per_topup: u64,
+    /// Maximum acceptable KongSwap slippage as a percentage (e.g. `5.0` = 5%).
     pub max_slippage_pct: f64,
+    /// Maximum number of bridge status polls before failing the `WaitingForBridgedUSDC` stage.
     pub max_bridge_polls: u8,
+    /// Number of EVM block confirmations required before accepting the lock transaction.
     pub lock_confirmations: u8,
 }
 
@@ -101,54 +154,61 @@ impl Default for TopUpConfig {
     }
 }
 
+// ── State machine ─────────────────────────────────────────────────────────────
+
+/// Persistent state of the top-up pipeline.
+///
+/// Each variant represents a distinct stage; the state machine advances one
+/// stage per `CycleTopUp::advance` call.  Waiting stages (`WaitingApprovalConfirmation`,
+/// `WaitingLockConfirmation`, `WaitingForBridgedUSDC`) cause `advance` to return
+/// `Ok(false)` so the scheduler defers the next tick rather than busy-looping.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum TopUpStage {
+    /// Initial stage: verifies USDC balance and Onesec fee bounds.
     Preflight,
-    ApprovingLocker {
-        usdc_amount: u64,
-    },
-    WaitingApprovalConfirmation {
-        usdc_amount: u64,
-        tx_hash: String,
-    },
-    LockingUSDC {
-        usdc_amount: u64,
-    },
+    /// Submitting `approve(onesec_locker, usdc_amount)` ERC-20 transaction.
+    ApprovingLocker { usdc_amount: u64 },
+    /// Waiting for the ERC-20 approval transaction to be confirmed on-chain.
+    WaitingApprovalConfirmation { usdc_amount: u64, tx_hash: String },
+    /// Submitting `lock1(usdc_amount, data1)` to the Onesec locker contract.
+    LockingUSDC { usdc_amount: u64 },
+    /// Waiting for the lock transaction to reach `lock_confirmations` confirmations.
     WaitingLockConfirmation {
         usdc_amount: u64,
         tx_hash: String,
         confirmations: u8,
     },
-    ValidatingOnOnesec {
-        usdc_amount: u64,
-        tx_hash: String,
-    },
+    /// Calling `transfer_evm_to_icp` on the Onesec bridge canister.
+    ValidatingOnOnesec { usdc_amount: u64, tx_hash: String },
+    /// Polling the bridge transfer status until `BridgeTransferStatus::Succeeded`.
     WaitingForBridgedUSDC {
         usdc_amount: u64,
+        /// Onesec bridge transfer ID returned by `transfer_evm_to_icp`.
         transfer_id: u128,
+        /// Number of polls already performed; fails when it reaches `max_bridge_polls`.
         polls: u8,
     },
+    /// Submitting ICRC-2 approve for KongSwap to spend the bridged USDC.
     ApprovingKongSwap {
         bridged_usdc_amount: u64,
         usdc_spent: u64,
     },
+    /// Calling KongSwap to swap bridged USDC for ICP.
     SwappingToICP {
         bridged_usdc_amount: u64,
         usdc_spent: u64,
     },
-    TransferringToCMC {
-        icp_amount: u64,
-        usdc_spent: u64,
-    },
-    MintingCycles {
-        block_index: u64,
-        usdc_spent: u64,
-    },
+    /// Transferring ICP to the CMC subaccount for the target canister.
+    TransferringToCMC { icp_amount: u64, usdc_spent: u64 },
+    /// Calling `notify_top_up` on the CMC to convert the ICP transfer to cycles.
+    MintingCycles { block_index: u64, usdc_spent: u64 },
+    /// Terminal success — cycles have been minted and credited to `target_canister`.
     Completed {
         cycles_minted: u128,
         usdc_spent: u64,
         completed_at_ns: u64,
     },
+    /// Terminal failure — records the stage name, error message, and attempt count.
     Failed {
         stage: String,
         error: String,
@@ -813,6 +873,12 @@ fn cmc_subaccount_for_canister(canister_id: &Principal) -> [u8; 32] {
     subaccount
 }
 
+// ── State machine executor ────────────────────────────────────────────────────
+
+/// The cycle top-up state machine.
+///
+/// Generic over `E: EvmPort` (EVM signing + RPC) and `S: StoragePort`
+/// (persistent stage storage) to allow full unit-test substitution.
 pub struct CycleTopUp<E: EvmPort, S: StoragePort> {
     config: TopUpConfig,
     evm: E,
@@ -820,6 +886,7 @@ pub struct CycleTopUp<E: EvmPort, S: StoragePort> {
 }
 
 impl<E: EvmPort, S: StoragePort> CycleTopUp<E, S> {
+    /// Create a new state machine with the given config and port implementations.
     pub fn new(config: TopUpConfig, evm: E, storage: S) -> Self {
         Self {
             config,
@@ -828,6 +895,12 @@ impl<E: EvmPort, S: StoragePort> CycleTopUp<E, S> {
         }
     }
 
+    /// Advance the state machine by one stage.
+    ///
+    /// Returns `Ok(true)` when the machine has reached a terminal state
+    /// (`Completed` or `Failed`) or when no state is stored (idle).
+    /// Returns `Ok(false)` when the current stage is a waiting state — the
+    /// caller should yield and retry on the next scheduler tick.
     pub async fn advance(&self) -> Result<bool, String> {
         let Some(mut state) = self.storage.load_state() else {
             return Ok(true);

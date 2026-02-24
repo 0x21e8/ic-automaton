@@ -1,3 +1,18 @@
+/// LLM inference abstraction supporting IC LLM and OpenRouter backends.
+///
+/// Provides a unified `InferenceAdapter` trait with two concrete implementations:
+/// - `IcLlmInferenceAdapter` — calls the on-chain IC LLM canister via Candid inter-canister call.
+/// - `OpenRouterInferenceAdapter` — calls the OpenRouter REST API via an IC HTTPS outcall.
+///
+/// Both adapters support multi-round continuation via `infer_with_transcript`, which appends
+/// prior assistant/tool messages before sending the next inference request.
+///
+/// # Survival policy
+///
+/// `infer_with_provider` and `infer_with_provider_transcript` check the survival policy before
+/// dispatching.  On low-cycles conditions the call returns an empty `InferenceOutput` rather
+/// than an error, allowing the agent turn to degrade gracefully.
+// ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, AffordabilityRequirements,
     OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
@@ -8,6 +23,7 @@ use crate::domain::types::{
 };
 use crate::prompt;
 use crate::storage::stable;
+use crate::timing::current_time_ns;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -17,24 +33,15 @@ use ic_cdk::management_canister::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+// ── Internal constants ───────────────────────────────────────────────────────
+
+// Sentinel model name that bypasses the real LLM canister and runs
+// deterministic rule-based inference.  Only permitted when the ECDSA key
+// name is "dfx_test_key" (local dfx network) or in cfg(test) builds.
 const DETERMINISTIC_IC_LLM_MODEL: &str = "deterministic-local";
 const DETERMINISTIC_LAYER_6_MARKER: &str = "phase5-layer6-marker";
 const DETERMINISTIC_LAYER_6_UPDATE_CONTENT: &str =
     "## Layer 6: Economic Decision Loop (Mutable Default)\n- phase5-layer6-marker";
-
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
-}
 
 #[derive(Clone, Copy, Serialize, Deserialize, LogPriorityLevels)]
 enum InferenceLogPriority {
@@ -50,6 +57,13 @@ impl GetLogFilter for InferenceLogPriority {
     }
 }
 
+// ── Public types ─────────────────────────────────────────────────────────────
+
+/// The result of a single LLM inference call.
+///
+/// `tool_calls` contains zero or more structured tool invocations parsed from
+/// the model response.  `explanation` holds the model's free-text content
+/// (may be empty when only tool calls are returned).
 #[derive(Debug)]
 pub struct InferenceOutput {
     pub tool_calls: Vec<ToolCall>,
@@ -57,22 +71,41 @@ pub struct InferenceOutput {
     pub explanation: String,
 }
 
+/// A single entry in the multi-round conversation transcript.
+///
+/// Transcripts are built incrementally during a turn: each time the model
+/// returns tool calls they are appended as `Assistant`, the tool results are
+/// appended as `Tool`, and the whole slice is passed back on the next
+/// `infer_with_transcript` call.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum InferenceTranscriptMessage {
+    /// Model response — may carry text content and/or tool call requests.
     Assistant {
         content: Option<String>,
         tool_calls: Vec<ToolCall>,
     },
+    /// Tool execution result matched to a prior assistant tool call by ID.
     Tool {
         tool_call_id: String,
         content: String,
     },
 }
 
+// ── Adapter trait ────────────────────────────────────────────────────────────
+
+/// Abstraction over an LLM backend.
+///
+/// Implement this trait to add a new inference provider.  The default
+/// `infer_with_transcript` implementation discards the transcript and
+/// delegates to `infer`; concrete adapters override it to forward the
+/// full conversation history.
 #[async_trait(?Send)]
 pub trait InferenceAdapter {
+    /// Single-shot inference — no prior conversation context.
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String>;
 
+    /// Continuation inference — appends `transcript` after the user message
+    /// so the model sees prior tool calls and their results.
     async fn infer_with_transcript(
         &self,
         input: &InferenceInput,
@@ -83,6 +116,13 @@ pub trait InferenceAdapter {
     }
 }
 
+// ── Public entry points ──────────────────────────────────────────────────────
+
+/// Single-shot inference using the provider configured in `snapshot`.
+///
+/// Convenience wrapper around `infer_with_provider_transcript` with an empty
+/// transcript.  Returns an empty `InferenceOutput` (no tool calls) when the
+/// survival policy blocks inference rather than propagating an error.
 pub async fn infer_with_provider(
     snapshot: &RuntimeSnapshot,
     input: &InferenceInput,
@@ -90,6 +130,11 @@ pub async fn infer_with_provider(
     infer_with_provider_transcript(snapshot, input, &[]).await
 }
 
+/// Continuation inference — forwards `transcript` to the configured provider.
+///
+/// Checks the survival policy first; defers (returns empty output) when the
+/// canister has insufficient liquid cycles.  On success, records a survival
+/// operation success so backoff is reset.
 pub async fn infer_with_provider_transcript(
     snapshot: &RuntimeSnapshot,
     input: &InferenceInput,
@@ -958,6 +1003,12 @@ fn is_insufficient_cycles_error(error: &str) -> bool {
     indicates_insufficient_cycles || indicates_depleted
 }
 
+// ── Failure classification ───────────────────────────────────────────────────
+
+/// Map a raw inference error string to a structured `RecoveryFailure`.
+///
+/// Used by the agent's error-handling path to decide whether to retry,
+/// back off, or surface a permanent configuration error.
 #[allow(dead_code)]
 pub fn classify_inference_failure(error: &str) -> RecoveryFailure {
     let normalized = error.to_ascii_lowercase();

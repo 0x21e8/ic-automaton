@@ -1,3 +1,15 @@
+/// Host-side orchestration of the cycle top-up flow.
+///
+/// Wires together the concrete port implementations (`AutomatonEvmPort`,
+/// `AutomatonStoragePort`) and exposes the scheduler-facing helpers:
+///
+/// - `topup_config_from_snapshot` — validates and assembles `TopUpConfig` from
+///   the current `RuntimeSnapshot`.
+/// - `build_cycle_topup` — constructs the fully-wired `CycleTopUp` state machine
+///   ready to call `advance`.
+/// - `enqueue_topup_cycles_job` — inserts a `TopUpCycles` job into the scheduler
+///   queue at the current tick boundary (idempotent — deduped by key).
+// ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::types::{RuntimeSnapshot, TaskKind, TaskLane};
 use crate::features::cycle_topup::{
     normalize_evm_hex_address, topup_status_from_stage, CycleTopUp, EvmPort, StoragePort,
@@ -6,31 +18,24 @@ use crate::features::cycle_topup::{
 use crate::features::evm::HttpEvmRpcClient;
 use crate::features::threshold_signer::ThresholdSignerAdapter;
 use crate::storage::stable;
+use crate::timing::{self, current_time_ns};
 use crate::tools::SignerPort;
 use async_trait::async_trait;
 use candid::Principal;
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+// The top-up flow is only supported on Base mainnet (chain ID 8453).
 const BASE_EVM_CHAIN_ID: u64 = 8453;
 
-fn current_time_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
-}
+// ── Port implementations ──────────────────────────────────────────────────────
 
 fn parse_principal(raw: &str, field: &str) -> Result<Principal, String> {
     Principal::from_text(raw.trim())
         .map_err(|error| format!("{field} must be a valid principal: {error}"))
 }
 
+/// Production `EvmPort` — wraps `ThresholdSignerAdapter` and `HttpEvmRpcClient`.
 #[derive(Clone, Debug)]
 pub struct AutomatonEvmPort {
     signer: ThresholdSignerAdapter,
@@ -38,6 +43,7 @@ pub struct AutomatonEvmPort {
 }
 
 impl AutomatonEvmPort {
+    /// Construct from the current `RuntimeSnapshot`.
     pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Result<Self, String> {
         Ok(Self {
             signer: ThresholdSignerAdapter::new(snapshot.ecdsa_key_name.clone()),
@@ -57,6 +63,7 @@ impl EvmPort for AutomatonEvmPort {
     }
 }
 
+/// Production `StoragePort` — reads/writes top-up state via stable storage.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AutomatonStoragePort;
 
@@ -74,6 +81,12 @@ impl StoragePort for AutomatonStoragePort {
     }
 }
 
+// ── Factory functions ─────────────────────────────────────────────────────────
+
+/// Build a validated `TopUpConfig` from the current `RuntimeSnapshot`.
+///
+/// Rejects configurations that target a non-Base EVM chain or that contain
+/// malformed EVM addresses or canister principal IDs.
 pub fn topup_config_from_snapshot(snapshot: &RuntimeSnapshot) -> Result<TopUpConfig, String> {
     let cycle_topup = &snapshot.cycle_topup;
     let evm_chain_id = snapshot.evm_cursor.chain_id;
@@ -127,6 +140,10 @@ pub fn topup_config_from_snapshot(snapshot: &RuntimeSnapshot) -> Result<TopUpCon
     })
 }
 
+/// Construct a fully-wired `CycleTopUp` state machine from the current snapshot.
+///
+/// Validates config, creates the production EVM and storage port implementations,
+/// and returns the state machine ready to call `advance`.
 pub fn build_cycle_topup(
     snapshot: &RuntimeSnapshot,
 ) -> Result<CycleTopUp<AutomatonEvmPort, AutomatonStoragePort>, String> {
@@ -137,16 +154,26 @@ pub fn build_cycle_topup(
     ))
 }
 
+/// Read the current top-up status directly from stable storage.
 pub fn topup_status_from_storage() -> TopUpStatus {
     topup_status_from_stage(stable::read_topup_state())
 }
 
+// Deduplication key for the singleton `TopUpCycles` scheduler job.
 pub fn topup_cycles_dedupe_key() -> String {
     format!("{}:singleton", TaskKind::TopUpCycles.as_str())
 }
 
+/// Enqueue a `TopUpCycles` job at the current scheduler tick boundary.
+///
+/// Uses `enqueue_job_if_absent` so multiple callers within the same tick
+/// result in exactly one queued job (idempotent deduplication).
+/// Returns `Some(dedupe_key)` if the job was newly inserted, `None` if it was
+/// already present.
 pub fn enqueue_topup_cycles_job(_trigger: &str, now_ns: u64) -> Option<String> {
-    let slot_ns = now_ns - (now_ns % 30_000_000_000);
+    let tick_ns = timing::SCHEDULER_TICK_INTERVAL_SECS.saturating_mul(1_000_000_000);
+    // Align to the start of the current tick window.
+    let slot_ns = now_ns - (now_ns % tick_ns);
     stable::enqueue_job_if_absent(
         TaskKind::TopUpCycles,
         TaskLane::Mutating,
@@ -156,10 +183,12 @@ pub fn enqueue_topup_cycles_job(_trigger: &str, now_ns: u64) -> Option<String> {
     )
 }
 
+/// Agent tool: return the current top-up status as a debug string.
 pub fn top_up_status_tool() -> String {
     format!("{:?}", topup_status_from_storage())
 }
 
+/// Agent tool: start a new top-up cycle and enqueue the `TopUpCycles` job.
 pub fn trigger_top_up_tool() -> Result<String, String> {
     let snapshot = stable::runtime_snapshot();
     if !snapshot.cycle_topup.enabled {

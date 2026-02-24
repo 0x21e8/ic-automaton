@@ -1,11 +1,52 @@
+/// Outcome learning — accumulate execution results and derive adaptive parameter priors.
+///
+/// After each strategy execution the agent records an [`StrategyOutcomeEvent`] here.
+/// This module:
+///
+/// 1. Appends the raw event to stable storage via `stable::record_strategy_outcome`.
+/// 2. Recomputes derived statistics (`confidence_bps`, `ranking_score_bps`, and
+///    [`StrategyParameterPriors`]) via `apply_learning_updates`.
+/// 3. Persists the updated [`StrategyOutcomeStats`].
+/// 4. Auto-deactivates the template if `deterministic_failure_streak` reaches
+///    [`AUTO_DEACTIVATE_DETERMINISTIC_STREAK`].
+///
+/// # Scoring model
+///
+/// All scores are expressed in basis points (0–10 000 = 0–100 %).
+///
+/// - **confidence** = success_rate − deterministic_penalty − nondeterministic_penalty
+///   (deterministic failures penalised at 0.5×, nondeterministic at 0.25×).
+/// - **ranking** = confidence × 0.8 + sample_bonus (up to 50 runs × 40 bps = 2 000 bps).
+/// - **slippage_bps prior** = 100 + scaled deterministic/nondeterministic failure rates,
+///   clamped to [25, 500].
+/// - **gas_buffer_bps prior** = 120 + scaled failure rates, clamped to [100, 500].
+///
+/// [`StrategyOutcomeEvent`]: crate::domain::types::StrategyOutcomeEvent
+/// [`StrategyOutcomeStats`]: crate::domain::types::StrategyOutcomeStats
+/// [`StrategyParameterPriors`]: crate::domain::types::StrategyParameterPriors
 use crate::domain::types::{
     StrategyOutcomeEvent, StrategyOutcomeStats, StrategyParameterPriors, StrategyTemplateKey,
     TemplateActivationState, TemplateVersion,
 };
 use crate::storage::stable;
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Number of consecutive deterministic failures before the template is automatically
+/// deactivated to prevent further on-chain losses.
+///
+/// Deterministic failures (e.g. "execution reverted", "insufficient balance") will not
+/// resolve by retrying with the same parameters, so continued execution would only waste
+/// gas.  The template can be re-enabled manually once the root cause is resolved.
 const AUTO_DEACTIVATE_DETERMINISTIC_STREAK: u32 = 3;
 
+// ── Public surface ───────────────────────────────────────────────────────────
+
+/// Record a strategy execution outcome event and return the updated [`StrategyOutcomeStats`].
+///
+/// Appends the raw event, recomputes all derived stats, persists them, and — if the
+/// deterministic failure streak has reached [`AUTO_DEACTIVATE_DETERMINISTIC_STREAK`] —
+/// deactivates the template.
 pub fn record_outcome(event: StrategyOutcomeEvent) -> Result<StrategyOutcomeStats, String> {
     let observed_at_ns = event.observed_at_ns;
     let stats = stable::record_strategy_outcome(event)?;
@@ -15,6 +56,8 @@ pub fn record_outcome(event: StrategyOutcomeEvent) -> Result<StrategyOutcomeStat
     Ok(persisted)
 }
 
+/// Retrieve the current [`StrategyOutcomeStats`] for a template version without recording
+/// a new event.  Returns `None` if no outcomes have been recorded yet.
 pub fn outcome_stats(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -22,6 +65,12 @@ pub fn outcome_stats(
     stable::strategy_outcome_stats(key, version)
 }
 
+// ── Learning internals ───────────────────────────────────────────────────────
+
+/// Recompute all derived stats from the raw counters in `stats`.
+///
+/// Called after every `record_outcome` call.  All arithmetic uses saturating operations
+/// to prevent overflow on adversarial inputs.
 fn apply_learning_updates(mut stats: StrategyOutcomeStats) -> StrategyOutcomeStats {
     if stats.total_runs == 0 {
         stats.confidence_bps = 0;
@@ -35,12 +84,16 @@ fn apply_learning_updates(mut stats: StrategyOutcomeStats) -> StrategyOutcomeSta
     let deterministic_rate_bps = ratio_bps(stats.deterministic_failures, total);
     let nondeterministic_rate_bps = ratio_bps(stats.nondeterministic_failures, total);
 
+    // Deterministic failures are penalised more heavily (0.5×) than nondeterministic
+    // ones (0.25×) because they indicate a structural problem rather than transient noise.
     let deterministic_penalty = deterministic_rate_bps / 2;
     let nondeterministic_penalty = nondeterministic_rate_bps / 4;
     let confidence = success_rate_bps
         .saturating_sub(deterministic_penalty)
         .saturating_sub(nondeterministic_penalty);
 
+    // Sample bonus rewards templates with more observations (capped at 50 runs × 40 bps).
+    // Ranking weights confidence at 80 % and sample depth at 20 %.
     let sample_bonus = u16::try_from(stats.total_runs.min(50))
         .unwrap_or(50)
         .saturating_mul(40);
@@ -48,6 +101,8 @@ fn apply_learning_updates(mut stats: StrategyOutcomeStats) -> StrategyOutcomeSta
         .saturating_add(u32::from(sample_bonus))
         .min(10_000) as u16;
 
+    // Slippage and gas-buffer priors grow with failure rates so riskier templates are
+    // allocated wider execution margins.
     let slippage = 100u16
         .saturating_add(deterministic_rate_bps / 100)
         .saturating_add(nondeterministic_rate_bps / 200)
@@ -66,6 +121,7 @@ fn apply_learning_updates(mut stats: StrategyOutcomeStats) -> StrategyOutcomeSta
     stats
 }
 
+/// Compute `numerator / denominator` expressed in basis points, saturating at 10 000.
 fn ratio_bps(numerator: u64, denominator: u64) -> u16 {
     if denominator == 0 {
         return 0;
@@ -77,6 +133,10 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u16 {
     u16::try_from(bps).unwrap_or(10_000).min(10_000)
 }
 
+/// Deactivate the template if `deterministic_failure_streak` has reached the threshold.
+///
+/// No-ops if the template is already inactive or the streak is below the threshold,
+/// keeping the operation idempotent across redundant calls.
 fn maybe_auto_deactivate_on_deterministic_failures(
     stats: &StrategyOutcomeStats,
     observed_at_ns: u64,

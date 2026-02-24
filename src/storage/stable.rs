@@ -1,3 +1,48 @@
+/// Stable-memory persistence layer for the ic-automaton canister.
+///
+/// This module owns all `StableBTreeMap` instances (one `MemoryId` per
+/// collection), the `MemoryManager`, and every function that reads from or
+/// writes to persistent storage.  It is the **only** place where
+/// `ic_stable_structures` is used.
+///
+/// ## Storage map index
+///
+/// | `MemoryId` | Map | Purpose |
+/// |-----------|-----|---------|
+/// | 0  | `RUNTIME_MAP`               | Runtime snapshot, scalar flags, sequence counters |
+/// | 1  | `TRANSITION_MAP`            | FSM transition log |
+/// | 2  | `TURN_MAP`                  | Agent turn records |
+/// | 3  | `TOOL_MAP`                  | Tool-call records keyed by turn |
+/// | 4  | `SKILL_MAP`                 | Skill definitions |
+/// | 5  | `SCHEDULER_RUNTIME_MAP`     | Scheduler runtime + cadence multiplier |
+/// | 6  | `TASK_CONFIG_MAP`           | Per-task schedule config |
+/// | 7  | `TASK_RUNTIME_MAP`          | Per-task schedule runtime |
+/// | 8  | `JOB_MAP`                   | Scheduled job records |
+/// | 9  | `JOB_QUEUE_MAP`             | Priority-ordered job queue index |
+/// | 10 | `DEDUPE_MAP`                | Job deduplication index |
+/// | 11 | `INBOX_MAP`                 | Inbox messages |
+/// | 12 | `INBOX_PENDING_QUEUE_MAP`   | Pending-message queue |
+/// | 13 | `INBOX_STAGED_QUEUE_MAP`    | Staged-message queue |
+/// | 14 | `OUTBOX_MAP`                | Outbox messages |
+/// | 15 | `SURVIVAL_OPERATION_RUNTIME_MAP` | Per-operation backoff state |
+/// | 16 | `MEMORY_FACTS_MAP`          | Agent knowledge base |
+/// | 17 | `HTTP_DOMAIN_ALLOWLIST_MAP` | HTTP outcall domain allow-list |
+/// | 18 | `PROMPT_LAYER_MAP`          | Mutable system prompt layers |
+/// | 19 | `CONVERSATION_MAP`          | Per-sender conversation logs |
+/// | 20 | `RETENTION_RUNTIME_MAP`     | Retention config + maintenance progress |
+/// | 21 | `SESSION_SUMMARY_MAP`       | Daily inbox/outbox session summaries |
+/// | 22 | `TURN_WINDOW_SUMMARY_MAP`   | Daily turn/tool statistics |
+/// | 23 | `MEMORY_ROLLUP_MAP`         | Compressed memory-fact rollups |
+/// | 24 | `TOPUP_STATE_MAP`           | Cycle top-up pipeline state |
+/// | 25 | `STRATEGY_TEMPLATE_MAP`     | Strategy template records |
+/// | 26 | `STRATEGY_TEMPLATE_INDEX_MAP` | Strategy template version index |
+/// | 27 | `ABI_ARTIFACT_MAP`          | ABI artefact records |
+/// | 28 | `ABI_ARTIFACT_INDEX_MAP`    | ABI artefact version index |
+/// | 29 | `STRATEGY_ACTIVATION_MAP`   | Per-version activation state |
+/// | 30 | `STRATEGY_REVOCATION_MAP`   | Per-version revocation state |
+/// | 31 | `STRATEGY_KILL_SWITCH_MAP`  | Per-key kill-switch state |
+/// | 32 | `STRATEGY_OUTCOME_STATS_MAP`| Execution outcome statistics |
+/// | 33 | `STRATEGY_BUDGET_MAP`       | Cumulative budget spent per version |
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, ConversationEntry, ConversationLog,
     ConversationSummary, CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage,
@@ -25,63 +70,98 @@ use sha3::{Digest, Keccak256};
 use std::cell::RefCell;
 
 fn now_ns() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time();
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_nanos().try_into().unwrap_or(u64::MAX))
-            .unwrap_or_default()
-    }
+    crate::timing::current_time_ns()
 }
 
+// ── Storage keys ─────────────────────────────────────────────────────────────
+
+/// Stable key for the serialised [`RuntimeSnapshot`] in `RUNTIME_MAP`.
 const RUNTIME_KEY: &str = "runtime.snapshot";
+/// Stable key for the serialised [`SchedulerRuntime`] in `SCHEDULER_RUNTIME_MAP`.
 const SCHEDULER_RUNTIME_KEY: &str = "scheduler.runtime";
+/// Monotonically increasing inbox sequence counter stored in `RUNTIME_MAP`.
 const INBOX_SEQ_KEY: &str = "inbox.seq";
+/// Monotonically increasing outbox sequence counter stored in `RUNTIME_MAP`.
 const OUTBOX_SEQ_KEY: &str = "outbox.seq";
+/// Bool flag: `true` once the HTTP allow-list has been explicitly configured.
 const HTTP_ALLOWLIST_INITIALIZED_KEY: &str = "http.allowlist.initialized";
+/// Serialised `Vec<CycleBalanceSample>` ring buffer stored in `RUNTIME_MAP`.
 const CYCLE_BALANCE_SAMPLES_KEY: &str = "cycles.balance.samples";
+/// Serialised `Vec<StorageGrowthSample>` ring buffer stored in `RUNTIME_MAP`.
 const STORAGE_GROWTH_SAMPLES_KEY: &str = "storage.growth.samples";
 const RETENTION_CONFIG_KEY: &str = "retention.config";
 const RETENTION_RUNTIME_KEY: &str = "retention.runtime";
 const TOPUP_STATE_KEY: &str = "cycle_topup.state";
+/// Persisted cadence multiplier for overriding `TICKS_PER_TURN_INTERVAL` at runtime.
+#[allow(dead_code)]
+const CADENCE_MULTIPLIER_KEY: &str = "timing.cadence_multiplier";
+
+// ── Capacity constants ───────────────────────────────────────────────────────
+
+/// Maximum number of jobs returned by `list_recent_jobs`.
 const MAX_RECENT_JOBS: usize = 200;
+/// Default number of items returned by the observability snapshot query.
 const DEFAULT_OBSERVABILITY_LIMIT: usize = 25;
+/// Hard cap on items returned by the observability snapshot query.
 const MAX_OBSERVABILITY_LIMIT: usize = 100;
-const CYCLES_BURN_MOVING_WINDOW_SECONDS: u64 = 15 * 60;
-const CYCLES_BURN_MOVING_WINDOW_NS: u64 = CYCLES_BURN_MOVING_WINDOW_SECONDS * 1_000_000_000;
+use crate::timing;
+/// Nanosecond window over which the cycles burn-rate moving average is computed.
+const CYCLES_BURN_MOVING_WINDOW_NS: u64 = timing::CYCLES_BURN_MOVING_WINDOW_NS;
+/// Maximum number of cycle-balance samples retained in the ring buffer.
 const CYCLES_BURN_MAX_SAMPLES: usize = 450;
+/// Trend window (seconds) for the storage-growth rate calculation.
 const STORAGE_GROWTH_TREND_WINDOW_SECONDS: u64 = 6 * 60 * 60;
 const STORAGE_GROWTH_TREND_WINDOW_NS: u64 = STORAGE_GROWTH_TREND_WINDOW_SECONDS * 1_000_000_000;
+/// Maximum number of storage-growth samples retained in the ring buffer.
 const STORAGE_GROWTH_MAX_SAMPLES: usize = 360;
+/// Utilisation % threshold for `StoragePressureLevel::Elevated`.
 const STORAGE_PRESSURE_ELEVATED_PERCENT: u8 = 70;
+/// Utilisation % threshold for `StoragePressureLevel::High`.
 const STORAGE_PRESSURE_HIGH_PERCENT: u8 = 85;
+/// Utilisation % threshold for `StoragePressureLevel::Critical`.
 const STORAGE_PRESSURE_CRITICAL_PERCENT: u8 = 95;
+/// Storage growth rate (entries/hour) above which a pressure warning is emitted.
 const STORAGE_GROWTH_WARNING_ENTRIES_PER_HOUR: i64 = 5_000;
+/// USD value of 1 trillion cycles used for burn-rate cost projections.
 const CYCLES_USD_PER_TRILLION_ESTIMATE: f64 = 1.35;
+/// Maximum conversation entries kept per sender in `CONVERSATION_MAP`.
 const MAX_CONVERSATION_ENTRIES_PER_SENDER: usize = 20;
+/// Maximum number of distinct senders tracked in `CONVERSATION_MAP`.
 const MAX_CONVERSATION_SENDERS: usize = 200;
+/// Character limit applied to inbox message bodies in conversation logs.
 const MAX_CONVERSATION_BODY_CHARS: usize = 500;
+/// Character limit applied to agent replies in conversation logs.
 const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
+/// Maximum value accepted for `evm_cursor.confirmation_depth`.
 const MAX_EVM_CONFIRMATION_DEPTH: u64 = 100;
+/// Hard cap on the number of memory facts stored in `MEMORY_FACTS_MAP`.
 pub const MAX_MEMORY_FACTS: usize = 500;
+/// Maximum inbox message body size (in characters) accepted by `post_inbox_message`.
 pub const MAX_INBOX_BODY_CHARS: usize = 4_096;
+/// Character limit for the `inner_dialogue` field of a stored `TurnRecord`.
 const MAX_TURN_INNER_DIALOGUE_CHARS: usize = 12_000;
+/// Character limit for tool call `args_json` stored in `TOOL_MAP`.
 const MAX_TOOL_ARGS_JSON_CHARS: usize = 4_000;
+/// Character limit for tool call `output` stored in `TOOL_MAP`.
 const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
 const MIN_RETENTION_BATCH_SIZE: u32 = 1;
 const MAX_RETENTION_BATCH_SIZE: u32 = 1_000;
 const MIN_RETENTION_INTERVAL_SECS: u64 = 1;
+/// 24-hour summary window used for session and turn-window summaries.
 const SUMMARY_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+/// Age threshold after which a memory fact is eligible for rollup compression.
 const MEMORY_ROLLUP_STALE_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+/// Maximum number of session summaries in `SESSION_SUMMARY_MAP`.
 const MAX_SESSION_SUMMARIES: usize = 2_000;
+/// Maximum number of turn-window summaries in `TURN_WINDOW_SUMMARY_MAP`.
 const MAX_TURN_WINDOW_SUMMARIES: usize = 1_000;
+/// Maximum number of memory rollups in `MEMORY_ROLLUP_MAP`.
 const MAX_MEMORY_ROLLUPS: usize = 128;
+/// Maximum distinct error strings stored per turn-window summary.
 const MAX_TURN_SUMMARY_ERRORS: usize = 5;
+/// Maximum source keys stored per memory rollup.
 const MAX_MEMORY_ROLLUP_SOURCE_KEYS: usize = 10;
+/// Maximum facts sampled per namespace when building a rollup.
 const MAX_MEMORY_ROLLUP_FACTS_PER_NAMESPACE: usize = 5;
 #[cfg(test)]
 const MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS: usize = 120;
@@ -91,11 +171,21 @@ const EVM_INGEST_DEDUPE_KEY_PREFIX: &str = "evm.ingest";
 const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_LIQUID_CYCLES_OVERRIDE_KEY: &str = "host.liquid_cycles";
+
+// ── Survival constants ───────────────────────────────────────────────────────
+
+/// Number of consecutive `Normal` cycle observations required before the
+/// scheduler downgrades from an elevated `SurvivalTier`.
 pub const SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED: u32 = 3;
+/// Maximum exponential backoff (seconds) for the `Inference` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE: u64 = 120;
+/// Maximum exponential backoff (seconds) for the `EvmPoll` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
+/// Maximum exponential backoff (seconds) for the `EvmBroadcast` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
+/// Maximum exponential backoff (seconds) for the `ThresholdSign` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
+/// Hard upper limit on the EVM RPC response buffer (2 MiB).
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 #[allow(dead_code)]
 const MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS: u64 = 60;
@@ -198,6 +288,10 @@ fn survival_operation_allows_in_tier(
     )
 }
 
+// ── Survival / backoff ───────────────────────────────────────────────────────
+
+/// Returns `true` if `operation` is permitted given the current survival tier
+/// and its per-operation backoff timer.
 pub fn can_run_survival_operation(operation: &SurvivalOperationClass, now_ns: u64) -> bool {
     if !survival_operation_allows_in_tier(&scheduler_survival_tier(), operation) {
         return false;
@@ -207,6 +301,8 @@ pub fn can_run_survival_operation(operation: &SurvivalOperationClass, now_ns: u6
         .is_none_or(|until| until <= now_ns)
 }
 
+/// Records a failure for `operation`, increments the consecutive-failure count,
+/// and sets an exponential backoff deadline.
 pub fn record_survival_operation_failure(
     operation: &SurvivalOperationClass,
     now_ns: u64,
@@ -231,6 +327,8 @@ pub fn record_survival_operation_failure(
     );
 }
 
+/// Clears the consecutive-failure count and backoff for `operation` after a
+/// successful execution.  A no-op if the operation was already clean.
 pub fn record_survival_operation_success(operation: &SurvivalOperationClass) {
     let runtime = get_survival_operation_runtime(operation);
     if runtime.consecutive_failures == 0 && runtime.backoff_until_ns.is_none() {
@@ -416,6 +514,13 @@ thread_local! {
     ));
 }
 
+// ── Initialization ───────────────────────────────────────────────────────────
+
+/// One-time storage bootstrap called from `canister_init` and `canister_post_upgrade`.
+///
+/// Performs idempotent setup: migrates legacy cursor fields, seeds default
+/// prompt layers, initialises sequence counters, and calls
+/// `init_scheduler_defaults` / `init_retention_defaults`.
 pub fn init_storage() {
     let mut snapshot = runtime_snapshot();
     let mut snapshot_changed = false;
@@ -452,6 +557,9 @@ pub fn init_storage() {
     init_retention_defaults(now_ns());
 }
 
+/// Idempotent initialisation of scheduler-runtime and per-task config/runtime
+/// entries.  `PollInbox` is scheduled immediately (`next_due_ns = now_ns`);
+/// every other task starts at its default interval.
 pub fn init_scheduler_defaults(now_ns: u64) {
     if SCHEDULER_RUNTIME_MAP
         .with(|map| map.borrow().get(&SCHEDULER_RUNTIME_KEY.to_string()))
@@ -468,12 +576,16 @@ pub fn init_scheduler_defaults(now_ns: u64) {
             .with(|map| map.borrow().get(&key))
             .is_none()
         {
+            let next_due_ns = if *kind == TaskKind::PollInbox {
+                now_ns
+            } else {
+                now_ns.saturating_add(kind.default_interval_secs().saturating_mul(1_000_000_000))
+            };
             save_task_runtime(
                 kind,
                 &TaskScheduleRuntime {
                     kind: kind.clone(),
-                    next_due_ns: now_ns
-                        .saturating_add(kind.default_interval_secs().saturating_mul(1_000_000_000)),
+                    next_due_ns,
                     backoff_until_ns: None,
                     consecutive_failures: 0,
                     pending_job_id: None,
@@ -515,6 +627,9 @@ fn init_retention_defaults(now_ns: u64) {
     }
 }
 
+// ── Retention ────────────────────────────────────────────────────────────────
+
+/// Returns the current retention configuration from stable storage.
 pub fn retention_config() -> RetentionConfig {
     RETENTION_RUNTIME_MAP
         .with(|map| map.borrow().get(&RETENTION_CONFIG_KEY.to_string()))
@@ -522,6 +637,10 @@ pub fn retention_config() -> RetentionConfig {
         .unwrap_or_default()
 }
 
+/// Validates and persists a new retention configuration.
+///
+/// Returns the saved config on success, or an error string if any field is
+/// out of the permitted range.
 pub fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, String> {
     if !(MIN_RETENTION_BATCH_SIZE..=MAX_RETENTION_BATCH_SIZE)
         .contains(&config.maintenance_batch_size)
@@ -545,6 +664,8 @@ pub fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, 
     Ok(config)
 }
 
+/// Returns the current retention maintenance runtime (scan cursors, last-run
+/// timestamps, per-bucket deletion counts).
 pub fn retention_maintenance_runtime() -> RetentionMaintenanceRuntime {
     RETENTION_RUNTIME_MAP
         .with(|map| map.borrow().get(&RETENTION_RUNTIME_KEY.to_string()))
@@ -624,6 +745,10 @@ struct TransitionCandidate {
     transition: TransitionLogRecord,
 }
 
+/// Runs one incremental retention pass if `runtime.next_run_after_ns <= now_ns`.
+///
+/// Returns `None` if the maintenance window has not yet elapsed, or
+/// `Some(stats)` with per-bucket deletion counts on success.
 pub fn run_retention_maintenance_if_due(now_ns: u64) -> Option<RetentionPruneStats> {
     let runtime = retention_maintenance_runtime();
     if runtime.next_run_after_ns > now_ns {
@@ -632,6 +757,12 @@ pub fn run_retention_maintenance_if_due(now_ns: u64) -> Option<RetentionPruneSta
     Some(run_retention_maintenance_once(now_ns))
 }
 
+/// Executes one full incremental retention pass regardless of the schedule.
+///
+/// Prunes jobs, dedup entries, inbox/outbox messages, turns, transitions, and
+/// tool records up to `maintenance_batch_size` items each.  Also generates
+/// session summaries, turn-window summaries, and memory rollups for any
+/// pruned records.
 pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
     let config = retention_config();
     let mut runtime = retention_maintenance_runtime();
@@ -833,12 +964,18 @@ fn seed_default_prompt_layers() {
     }
 }
 
+// ── Prompt layers ─────────────────────────────────────────────────────────────
+
+/// Retrieves the mutable prompt layer with `layer_id` from `PROMPT_LAYER_MAP`,
+/// or `None` if it has not yet been set.
 pub fn get_prompt_layer(layer_id: u8) -> Option<PromptLayer> {
     PROMPT_LAYER_MAP
         .with(|map| map.borrow().get(&layer_id))
         .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
+/// Persists a mutable prompt layer.  Returns an error if `layer_id` falls
+/// outside the mutable range `[MUTABLE_LAYER_MIN_ID, MUTABLE_LAYER_MAX_ID]`.
 pub fn save_prompt_layer(layer: &PromptLayer) -> Result<(), String> {
     if !(prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID).contains(&layer.layer_id) {
         return Err(format!(
@@ -854,6 +991,8 @@ pub fn save_prompt_layer(layer: &PromptLayer) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns a merged view of all immutable and mutable prompt layers, ordered
+/// by `layer_id` ascending.
 pub fn list_prompt_layers() -> Vec<PromptLayerView> {
     let mut layers = Vec::with_capacity(
         usize::from(prompt::IMMUTABLE_LAYER_MAX_ID - prompt::IMMUTABLE_LAYER_MIN_ID + 1)
@@ -901,6 +1040,11 @@ pub fn list_prompt_layers() -> Vec<PromptLayerView> {
     layers
 }
 
+// ── Conversation ─────────────────────────────────────────────────────────────
+
+/// Appends a conversation entry for `sender`, trimming body/reply fields to
+/// `MAX_CONVERSATION_BODY_CHARS` / `MAX_CONVERSATION_REPLY_CHARS`, and evicts
+/// the oldest sender if the total sender count exceeds `MAX_CONVERSATION_SENDERS`.
 pub fn append_conversation_entry(sender: &str, mut entry: ConversationEntry) {
     let sender_key = normalize_conversation_sender(sender);
     if sender_key.is_empty() {
@@ -932,6 +1076,8 @@ pub fn append_conversation_entry(sender: &str, mut entry: ConversationEntry) {
     evict_oldest_conversation_sender_if_needed();
 }
 
+/// Returns the full conversation log for `sender`, or `None` if no entries
+/// exist yet.
 pub fn get_conversation_log(sender: &str) -> Option<ConversationLog> {
     let sender_key = normalize_conversation_sender(sender);
     if sender_key.is_empty() {
@@ -942,6 +1088,8 @@ pub fn get_conversation_log(sender: &str) -> Option<ConversationLog> {
         .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
+/// Returns one-line summaries for every tracked sender, sorted by most recent
+/// activity descending.
 pub fn list_conversation_summaries() -> Vec<ConversationSummary> {
     let mut summaries = CONVERSATION_MAP.with(|map| {
         map.borrow()
@@ -1163,6 +1311,10 @@ fn enforce_memory_rollup_cap() {
     });
 }
 
+// ── Summaries ─────────────────────────────────────────────────────────────────
+
+/// Returns the most-recent `limit` daily session summaries (newest first).
+/// Caps `limit` at `MAX_OBSERVABILITY_LIMIT`.
 pub fn list_session_summaries(limit: usize) -> Vec<SessionSummary> {
     if limit == 0 {
         return Vec::new();
@@ -1178,6 +1330,8 @@ pub fn list_session_summaries(limit: usize) -> Vec<SessionSummary> {
     })
 }
 
+/// Returns the most-recent `limit` daily turn-window summaries (newest first).
+/// Caps `limit` at `MAX_OBSERVABILITY_LIMIT`.
 pub fn list_turn_window_summaries(limit: usize) -> Vec<TurnWindowSummary> {
     if limit == 0 {
         return Vec::new();
@@ -1193,6 +1347,8 @@ pub fn list_turn_window_summaries(limit: usize) -> Vec<TurnWindowSummary> {
     })
 }
 
+/// Returns up to `limit` memory rollups, sorted by generation time descending.
+/// Caps `limit` at `MAX_MEMORY_ROLLUPS`.
 pub fn list_memory_rollups(limit: usize) -> Vec<MemoryRollup> {
     if limit == 0 {
         return Vec::new();
@@ -1222,6 +1378,13 @@ fn is_critical_exact_memory_key(key: &str) -> bool {
         || key.starts_with("config.")
 }
 
+// ── Memory facts ──────────────────────────────────────────────────────────────
+
+/// Selects up to `raw_limit` facts for the agent's context prompt.
+///
+/// Critical keys (e.g. `balance.*`, `config.*`) are always included first;
+/// non-critical facts fill the remaining slots.  If the raw limit is reached,
+/// `rollup_limit` memory rollups are also returned for additional context.
 pub fn list_memory_for_context(
     raw_limit: usize,
     rollup_limit: usize,
@@ -1254,17 +1417,23 @@ pub fn list_memory_for_context(
     (selected_raw, rollups)
 }
 
+// ── Runtime snapshot ─────────────────────────────────────────────────────────
+
+/// Deserialises and returns the current [`RuntimeSnapshot`] from `RUNTIME_MAP`.
+/// Falls back to `Default` if the key is absent (first boot).
 pub fn runtime_snapshot() -> RuntimeSnapshot {
     let payload = RUNTIME_MAP.with(|map| map.borrow().get(&RUNTIME_KEY.to_string()));
     read_json(payload.as_deref()).unwrap_or_default()
 }
 
+/// Reads the current cycle top-up pipeline stage from `TOPUP_STATE_MAP`.
 pub fn read_topup_state() -> Option<TopUpStage> {
     TOPUP_STATE_MAP
         .with(|map| map.borrow().get(&TOPUP_STATE_KEY.to_string()))
         .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
+/// Persists the cycle top-up pipeline stage to `TOPUP_STATE_MAP`.
 pub fn write_topup_state(state: &TopUpStage) {
     TOPUP_STATE_MAP.with(|map| {
         map.borrow_mut()
@@ -1272,12 +1441,14 @@ pub fn write_topup_state(state: &TopUpStage) {
     });
 }
 
+/// Removes the top-up state key from `TOPUP_STATE_MAP`, resetting the pipeline.
 pub fn clear_topup_state() {
     TOPUP_STATE_MAP.with(|map| {
         map.borrow_mut().remove(&TOPUP_STATE_KEY.to_string());
     });
 }
 
+/// Serialises `snapshot` and writes it to `RUNTIME_MAP` under `RUNTIME_KEY`.
 pub fn save_runtime_snapshot(snapshot: &RuntimeSnapshot) {
     RUNTIME_MAP.with(|map| {
         map.borrow_mut()
@@ -1285,6 +1456,9 @@ pub fn save_runtime_snapshot(snapshot: &RuntimeSnapshot) {
     });
 }
 
+// ── Task / scheduler management ──────────────────────────────────────────────
+
+/// Returns all stored per-task schedule configs, sorted by priority then name.
 pub fn list_task_configs() -> Vec<(TaskKind, TaskScheduleConfig)> {
     let mut entries = TASK_CONFIG_MAP.with(|map| {
         map.borrow()
@@ -1301,6 +1475,7 @@ pub fn list_task_configs() -> Vec<(TaskKind, TaskScheduleConfig)> {
     entries
 }
 
+/// Returns paired `(config, runtime)` tuples for every task kind, sorted by priority.
 pub fn list_task_schedules() -> Vec<(TaskScheduleConfig, TaskScheduleRuntime)> {
     let mut schedules = list_task_configs()
         .into_iter()
@@ -1310,6 +1485,7 @@ pub fn list_task_schedules() -> Vec<(TaskScheduleConfig, TaskScheduleRuntime)> {
     schedules
 }
 
+/// Inserts or replaces the schedule config for `config.kind`.
 pub fn upsert_task_config(config: TaskScheduleConfig) {
     TASK_CONFIG_MAP.with(|map| {
         map.borrow_mut()
@@ -1317,12 +1493,15 @@ pub fn upsert_task_config(config: TaskScheduleConfig) {
     });
 }
 
+/// Returns the schedule config for `kind`, or `None` if not yet persisted.
 pub fn get_task_config(kind: &TaskKind) -> Option<TaskScheduleConfig> {
     TASK_CONFIG_MAP
         .with(|map| map.borrow().get(&task_kind_key(kind)))
         .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
+/// Updates the recurrence interval for `kind` and advances `next_due_ns`
+/// by the new interval from `now`.  Returns an error if `interval_secs` is 0.
 pub fn set_task_interval_secs(kind: &TaskKind, interval_secs: u64) -> Result<(), String> {
     if interval_secs == 0 {
         return Err("interval_secs must be greater than 0".to_string());
@@ -1336,12 +1515,47 @@ pub fn set_task_interval_secs(kind: &TaskKind, interval_secs: u64) -> Result<(),
     Ok(())
 }
 
+// ── Cadence multiplier ───────────────────────────────────────────────────
+
+/// Read the persisted cadence multiplier, falling back to the compile-time default.
+#[allow(dead_code)]
+pub fn get_cadence_multiplier() -> u64 {
+    SCHEDULER_RUNTIME_MAP
+        .with(|map| map.borrow().get(&CADENCE_MULTIPLIER_KEY.to_string()))
+        .and_then(|payload| read_json::<u64>(Some(payload.as_slice())))
+        .unwrap_or(timing::TICKS_PER_TURN_INTERVAL)
+}
+
+/// Persist a new cadence multiplier and re-derive `interval_secs` for every task.
+///
+/// The multiplier is clamped to `[MIN_CADENCE_MULTIPLIER, MAX_CADENCE_MULTIPLIER]`.
+/// Returns the effective (clamped) multiplier.
+#[allow(dead_code)]
+pub fn set_cadence_multiplier(multiplier: u64) -> u64 {
+    let clamped = multiplier.clamp(
+        timing::MIN_CADENCE_MULTIPLIER,
+        timing::MAX_CADENCE_MULTIPLIER,
+    );
+    SCHEDULER_RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(CADENCE_MULTIPLIER_KEY.to_string(), encode_json(&clamped));
+    });
+    let new_interval = timing::task_interval_for_multiplier(clamped);
+    for kind in TaskKind::all() {
+        let _ = set_task_interval_secs(kind, new_interval);
+    }
+    clamped
+}
+
+/// Enables or disables scheduling of `kind` without touching its interval.
 pub fn set_task_enabled(kind: &TaskKind, enabled: bool) {
     let mut config = get_task_config(kind).unwrap_or_else(|| TaskScheduleConfig::default_for(kind));
     config.enabled = enabled;
     upsert_task_config(config);
 }
 
+/// Returns the schedule runtime for `kind`.  Falls back to a freshly-initialised
+/// runtime if the entry is absent from stable storage.
 pub fn get_task_runtime(kind: &TaskKind) -> TaskScheduleRuntime {
     TASK_RUNTIME_MAP
         .with(|map| map.borrow().get(&task_kind_key(kind)))
@@ -1359,6 +1573,7 @@ pub fn get_task_runtime(kind: &TaskKind) -> TaskScheduleRuntime {
         })
 }
 
+/// Persists the schedule runtime for `kind` to `TASK_RUNTIME_MAP`.
 pub fn save_task_runtime(kind: &TaskKind, runtime: &TaskScheduleRuntime) {
     TASK_RUNTIME_MAP.with(|map| {
         map.borrow_mut()
@@ -1366,10 +1581,13 @@ pub fn save_task_runtime(kind: &TaskKind, runtime: &TaskScheduleRuntime) {
     });
 }
 
+/// Returns the full scheduler runtime (exposed for observability queries).
 pub fn scheduler_runtime_view() -> SchedulerRuntime {
     scheduler_runtime()
 }
 
+/// Enables or disables the scheduler globally.  When disabled the
+/// `paused_reason` is set to `"disabled"`.  Returns a status string.
 pub fn set_scheduler_enabled(enabled: bool) -> String {
     let mut runtime = scheduler_runtime();
     runtime.enabled = enabled;
@@ -1382,6 +1600,10 @@ pub fn set_scheduler_enabled(enabled: bool) -> String {
     format!("scheduler_enabled={enabled}")
 }
 
+/// Transitions the scheduler into or out of low-cycles mode.
+///
+/// Enabling sets `survival_tier = LowCycles` and `paused_reason = "low_cycles"`;
+/// disabling restores `survival_tier = Normal`.  Returns a status string.
 pub fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
     let previous = scheduler_low_cycles_mode();
     let mut runtime = scheduler_runtime();
@@ -1411,6 +1633,11 @@ pub fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
     }
 }
 
+/// Updates the scheduler's survival tier with hysteresis recovery.
+///
+/// A `Normal` observation only promotes the tier back to `Normal` after
+/// `SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED` consecutive normal observations.
+/// Non-normal observations take effect immediately.
 pub fn set_scheduler_survival_tier(observed_tier: SurvivalTier) {
     let mut runtime = scheduler_runtime();
     let previous_tier = runtime.survival_tier.clone();
@@ -1488,6 +1715,8 @@ fn next_survival_tier_with_recovery(
     }
 }
 
+/// Records the start of a scheduler tick: sets `last_tick_started_ns` and
+/// clears any prior tick error.
 pub fn record_scheduler_tick_start(now_ns: u64) {
     let mut runtime = scheduler_runtime();
     runtime.last_tick_started_ns = now_ns;
@@ -1495,6 +1724,8 @@ pub fn record_scheduler_tick_start(now_ns: u64) {
     save_scheduler_runtime(&runtime);
 }
 
+/// Records the end of a scheduler tick: sets `last_tick_finished_ns` and
+/// stores any error that occurred during the tick.
 pub fn record_scheduler_tick_end(now_ns: u64, error: Option<String>) {
     let mut runtime = scheduler_runtime();
     runtime.last_tick_finished_ns = now_ns;
@@ -1502,6 +1733,9 @@ pub fn record_scheduler_tick_end(now_ns: u64, error: Option<String>) {
     save_scheduler_runtime(&runtime);
 }
 
+// ── Runtime snapshot mutators ─────────────────────────────────────────────────
+
+/// Toggles the `loop_enabled` flag in the runtime snapshot.
 pub fn set_loop_enabled(enabled: bool) {
     let mut snapshot = runtime_snapshot();
     snapshot.loop_enabled = enabled;
@@ -1523,6 +1757,8 @@ pub fn update_state(state: AgentState) {
     save_runtime_snapshot(&snapshot);
 }
 
+/// Replaces the agent's `soul` field and updates `last_transition_at_ns`.
+/// Returns the new soul string.
 pub fn set_soul(soul: String) -> String {
     let mut snapshot = runtime_snapshot();
     snapshot.soul = soul;
@@ -1615,6 +1851,10 @@ pub fn get_ecdsa_key_name() -> String {
     runtime_snapshot().ecdsa_key_name
 }
 
+// ── EVM configuration ─────────────────────────────────────────────────────────
+
+/// Sets the agent's EVM address (0x-prefixed 20-byte hex) in the snapshot and
+/// derives the Keccak topic filter for log polling.  Pass `None` to clear.
 pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String> {
     let normalized = match address {
         Some(raw) => Some(normalize_evm_hex_address(&raw, "evm address")?),
@@ -1646,6 +1886,7 @@ pub fn get_discovered_usdc_address() -> Option<String> {
     runtime_snapshot().wallet_balance.usdc_contract_address
 }
 
+/// Sets the inbox contract address and mirrors it to `evm_cursor.contract_address`.
 pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<String>, String> {
     let normalized = match address {
         Some(raw) => Some(normalize_evm_hex_address(&raw, "inbox contract address")?),
@@ -1660,6 +1901,8 @@ pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<Stri
     Ok(normalized)
 }
 
+/// Sets the EVM chain ID and resets the poll cursor to block 0.
+/// Returns an error if `chain_id` is 0.
 pub fn set_evm_chain_id(chain_id: u64) -> Result<u64, String> {
     if chain_id == 0 {
         return Err("evm chain id must be greater than 0".to_string());
@@ -1676,6 +1919,7 @@ pub fn set_evm_chain_id(chain_id: u64) -> Result<u64, String> {
     Ok(chain_id)
 }
 
+/// Sets the EVM confirmation depth (capped at `MAX_EVM_CONFIRMATION_DEPTH = 100`).
 pub fn set_evm_confirmation_depth(confirmation_depth: u64) -> Result<u64, String> {
     if confirmation_depth > MAX_EVM_CONFIRMATION_DEPTH {
         return Err(format!(
@@ -1689,6 +1933,8 @@ pub fn set_evm_confirmation_depth(confirmation_depth: u64) -> Result<u64, String
     Ok(confirmation_depth)
 }
 
+/// Inserts or replaces a memory fact.  Returns an error if the store is full
+/// (`MAX_MEMORY_FACTS`) and the key does not already exist.
 pub fn set_memory_fact(fact: &MemoryFact) -> Result<(), String> {
     MEMORY_FACTS_MAP.with(|map| {
         let mut map_ref = map.borrow_mut();
@@ -1701,12 +1947,15 @@ pub fn set_memory_fact(fact: &MemoryFact) -> Result<(), String> {
     })
 }
 
+/// Returns the memory fact stored under `key`, or `None` if absent.
 pub fn get_memory_fact(key: &str) -> Option<MemoryFact> {
     MEMORY_FACTS_MAP
         .with(|map| map.borrow().get(&key.to_string()))
         .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
+/// Removes the memory fact stored under `key`.  Returns `true` if a record
+/// was actually deleted.
 pub fn remove_memory_fact(key: &str) -> bool {
     MEMORY_FACTS_MAP
         .with(|map| map.borrow_mut().remove(&key.to_string()))
@@ -1718,6 +1967,7 @@ pub fn memory_fact_count() -> usize {
     MEMORY_FACTS_MAP.with(|map| map.borrow().len() as usize)
 }
 
+/// Returns up to `limit` memory facts, sorted by `updated_at_ns` descending.
 pub fn list_all_memory_facts(limit: usize) -> Vec<MemoryFact> {
     if limit == 0 {
         return Vec::new();
@@ -1732,6 +1982,8 @@ pub fn list_all_memory_facts(limit: usize) -> Vec<MemoryFact> {
     sort_memory_facts_desc_by_updated(facts, limit)
 }
 
+/// Returns up to `limit` facts whose keys begin with `prefix` (case-insensitive),
+/// sorted by `updated_at_ns` descending.
 pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact> {
     if limit == 0 {
         return Vec::new();
@@ -1748,6 +2000,10 @@ pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact
     sort_memory_facts_desc_by_updated(facts, limit)
 }
 
+// ── Strategy ─────────────────────────────────────────────────────────────────
+
+/// Validates and stores a strategy template, creating both the record and the
+/// version-index entries in `STRATEGY_TEMPLATE_MAP` and `STRATEGY_TEMPLATE_INDEX_MAP`.
 pub fn upsert_strategy_template(template: StrategyTemplate) -> Result<StrategyTemplate, String> {
     validate_strategy_template(&template)?;
     let lookup_key = strategy_template_lookup_key(&template.key);
@@ -1764,6 +2020,7 @@ pub fn upsert_strategy_template(template: StrategyTemplate) -> Result<StrategyTe
     Ok(template)
 }
 
+/// Retrieves a single strategy template by key and version.
 pub fn strategy_template(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -1793,6 +2050,7 @@ pub fn list_strategy_template_versions(key: &StrategyTemplateKey) -> Vec<Templat
     versions
 }
 
+/// Returns the most-recent `limit` versions of the template identified by `key`.
 pub fn list_strategy_templates(key: &StrategyTemplateKey, limit: usize) -> Vec<StrategyTemplate> {
     if limit == 0 {
         return Vec::new();
@@ -1831,6 +2089,8 @@ pub fn list_all_strategy_templates(limit: usize) -> Vec<StrategyTemplate> {
     templates
 }
 
+/// Validates and stores an ABI artefact, creating both the record and the
+/// version-index entries in `ABI_ARTIFACT_MAP` and `ABI_ARTIFACT_INDEX_MAP`.
 pub fn upsert_abi_artifact(artifact: AbiArtifact) -> Result<AbiArtifact, String> {
     validate_abi_artifact(&artifact)?;
     let lookup_key = abi_artifact_lookup_key(&artifact.key);
@@ -1887,6 +2147,7 @@ pub fn list_abi_artifact_versions(
     versions
 }
 
+/// Persists an activation state record for a specific template version.
 pub fn set_strategy_template_activation(
     state: TemplateActivationState,
 ) -> Result<TemplateActivationState, String> {
@@ -1932,6 +2193,7 @@ pub fn strategy_template_revocation(
         .and_then(|payload| read_json(Some(payload.as_slice())))
 }
 
+/// Persists a kill-switch state for the given strategy key (all versions).
 pub fn set_strategy_kill_switch(
     state: StrategyKillSwitchState,
 ) -> Result<StrategyKillSwitchState, String> {
@@ -1972,6 +2234,8 @@ pub fn upsert_strategy_outcome_stats(
     Ok(stats)
 }
 
+/// Returns the cumulative budget spent (in wei, as a decimal string) for the
+/// given strategy template version, or `None` if no budget has been recorded.
 pub fn strategy_template_budget_spent_wei(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
@@ -1998,6 +2262,8 @@ pub fn set_strategy_template_budget_spent_wei(
     Ok(normalized)
 }
 
+/// Appends an outcome event to the running `StrategyOutcomeStats` for the
+/// given template key + version.  Creates the stats record on first call.
 pub fn record_strategy_outcome(
     outcome: StrategyOutcomeEvent,
 ) -> Result<StrategyOutcomeStats, String> {
@@ -2049,10 +2315,16 @@ pub fn record_strategy_outcome(
     upsert_strategy_outcome_stats(stats)
 }
 
+// ── Autonomy deduplication ────────────────────────────────────────────────────
+
+/// Returns the timestamp (ns) of the last successful invocation of the
+/// autonomy tool identified by `fingerprint`, or `None` if never called.
 pub fn autonomy_tool_last_success_ns(fingerprint: &str) -> Option<u64> {
     runtime_u64(&autonomy_tool_success_key(fingerprint))
 }
 
+/// Records a successful autonomy tool call at `succeeded_at_ns`, keyed by
+/// `fingerprint`.  Used by the deduplication window check.
 pub fn record_autonomy_tool_success(fingerprint: &str, succeeded_at_ns: u64) {
     save_runtime_u64(&autonomy_tool_success_key(fingerprint), succeeded_at_ns);
 }
@@ -2074,6 +2346,9 @@ fn sort_memory_facts_desc_by_updated(mut facts: Vec<MemoryFact>, limit: usize) -
     facts
 }
 
+// ── HTTP allowlist ────────────────────────────────────────────────────────────
+
+/// Returns all allowed HTTP outcall domains stored in `HTTP_DOMAIN_ALLOWLIST_MAP`.
 pub fn list_allowed_http_domains() -> Vec<String> {
     HTTP_DOMAIN_ALLOWLIST_MAP.with(|map| {
         map.borrow()
@@ -2083,10 +2358,16 @@ pub fn list_allowed_http_domains() -> Vec<String> {
     })
 }
 
+/// Returns `true` if the HTTP allowlist has been explicitly configured and is
+/// being enforced.
 pub fn is_http_allowlist_enforced() -> bool {
     runtime_bool(HTTP_ALLOWLIST_INITIALIZED_KEY).unwrap_or(false)
 }
 
+/// Replaces the entire HTTP allowlist with `domains` (normalised, sorted, deduped).
+///
+/// Setting the allowlist marks it as enforced (`HTTP_ALLOWLIST_INITIALIZED_KEY = true`).
+/// Returns the final normalised list, or an error if any domain is invalid.
 pub fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
     let mut normalized = domains
         .into_iter()
@@ -2183,6 +2464,8 @@ fn normalize_http_allowed_domain(raw: &str) -> Result<String, String> {
     Ok(domain)
 }
 
+/// Sets the primary EVM JSON-RPC URL after validating it is https:// (or a
+/// local http:// URL).
 pub fn set_evm_rpc_url(url: String) -> Result<String, String> {
     let normalized = normalize_https_url(&url, "evm rpc url")?;
     let mut snapshot = runtime_snapshot();
@@ -2311,6 +2594,11 @@ pub fn set_wallet_balance_bootstrap_pending(pending: bool) {
     save_runtime_snapshot(&snapshot);
 }
 
+// ── Wallet balance ─────────────────────────────────────────────────────────────
+
+/// Stores a successful wallet balance sync result: ETH balance, USDC balance,
+/// and USDC contract address.  Clears any prior error and marks
+/// `wallet_balance_bootstrap_pending = false`.  Returns the updated snapshot.
 pub fn record_wallet_balance_sync_success(
     now_ns: u64,
     eth_balance_wei_hex: String,
@@ -2330,6 +2618,8 @@ pub fn record_wallet_balance_sync_success(
     updated
 }
 
+/// Records a wallet balance sync error, storing the error string in the snapshot.
+/// Returns the updated snapshot.
 pub fn record_wallet_balance_sync_error(error: String) -> WalletBalanceSnapshot {
     let mut snapshot = runtime_snapshot();
     snapshot.wallet_balance.last_error = Some(error);
@@ -2344,6 +2634,8 @@ pub fn set_last_error(error: Option<String>) {
     save_runtime_snapshot(&snapshot);
 }
 
+/// Atomically increments the turn counter, sets `turn_in_flight = true`,
+/// derives `last_turn_id`, and clears `last_error`.  Returns the updated snapshot.
 pub fn increment_turn_counter() -> RuntimeSnapshot {
     let mut snapshot = runtime_snapshot();
     snapshot.turn_counter = snapshot.turn_counter.saturating_add(1);
@@ -2355,10 +2647,12 @@ pub fn increment_turn_counter() -> RuntimeSnapshot {
     snapshot
 }
 
+/// Converts the current runtime snapshot to the public `RuntimeView` DTO.
 pub fn snapshot_to_view() -> RuntimeView {
     RuntimeView::from(&runtime_snapshot())
 }
 
+/// Returns the EVM route sub-view derived from the current runtime snapshot.
 pub fn evm_route_state_view() -> EvmRouteStateView {
     EvmRouteStateView::from(&runtime_snapshot())
 }
@@ -2395,6 +2689,8 @@ fn wallet_balance_sync_has_usdc_source(snapshot: &RuntimeSnapshot) -> bool {
         || wallet_balance_sync_has_discoverable_usdc_source(snapshot)
 }
 
+/// Returns `true` if the wallet balance sync feature has enough configuration
+/// to attempt a sync (RPC URL, address, and at least one USDC source).
 pub fn wallet_balance_sync_capable(snapshot: &RuntimeSnapshot) -> bool {
     if !snapshot.wallet_balance_sync.enabled {
         return false;
@@ -2418,10 +2714,14 @@ pub fn wallet_balance_sync_capable(snapshot: &RuntimeSnapshot) -> bool {
     wallet_balance_sync_has_usdc_source(snapshot)
 }
 
+// ── Inference configuration ───────────────────────────────────────────────────
+
+/// Returns the current inference configuration as an `InferenceConfigView`.
 pub fn inference_config_view() -> InferenceConfigView {
     InferenceConfigView::from(&runtime_snapshot())
 }
 
+/// Sets the active inference provider (e.g. `OpenRouter`, `LLMCanister`).
 pub fn set_inference_provider(provider: InferenceProvider) {
     let mut snapshot = runtime_snapshot();
     snapshot.inference_provider = provider;
@@ -2429,6 +2729,8 @@ pub fn set_inference_provider(provider: InferenceProvider) {
     save_runtime_snapshot(&snapshot);
 }
 
+/// Sets the inference model string (e.g. `"anthropic/claude-opus-4-6"`).
+/// Returns an error if the trimmed value is empty.
 pub fn set_inference_model(model: String) -> Result<String, String> {
     if model.trim().is_empty() {
         return Err("inference model cannot be empty".to_string());
@@ -2441,6 +2743,8 @@ pub fn set_inference_model(model: String) -> Result<String, String> {
     Ok(out)
 }
 
+/// Sets the ICP canister ID of the on-chain LLM canister.
+/// Returns an error if `canister_id` is not a valid `Principal` text.
 pub fn set_llm_canister_id(canister_id: String) -> Result<String, String> {
     let trimmed = canister_id.trim();
     if trimmed.is_empty() {
@@ -2462,6 +2766,7 @@ pub fn get_llm_canister_id() -> String {
     runtime_snapshot().llm_canister_id
 }
 
+#[allow(dead_code)]
 pub fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
     if base_url.trim().is_empty() {
         return Err("openrouter base url cannot be empty".to_string());
@@ -2474,6 +2779,8 @@ pub fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
     Ok(out)
 }
 
+/// Sets (or clears) the OpenRouter API key stored in the runtime snapshot.
+/// An empty string is treated as `None`.
 pub fn set_openrouter_api_key(api_key: Option<String>) {
     let mut snapshot = runtime_snapshot();
     snapshot.openrouter_api_key = api_key.and_then(|key| {
@@ -2488,6 +2795,10 @@ pub fn set_openrouter_api_key(api_key: Option<String>) {
     save_runtime_snapshot(&snapshot);
 }
 
+// ── Transitions and turns ─────────────────────────────────────────────────────
+
+/// Appends a `TransitionLogRecord` to `TRANSITION_MAP` and increments
+/// `transition_seq` and `event_seq` in the runtime snapshot.
 pub fn record_transition(
     turn_id: &str,
     from: &AgentState,
@@ -2518,6 +2829,8 @@ pub fn record_transition(
     save_runtime_snapshot(&snapshot);
 }
 
+/// Persists a `TurnRecord` (with `inner_dialogue` truncated to
+/// `MAX_TURN_INNER_DIALOGUE_CHARS`) and its associated tool-call records.
 pub fn append_turn_record(record: &TurnRecord, tool_calls: &[ToolCallRecord]) {
     let mut bounded_record = record.clone();
     bounded_record.inner_dialogue = bounded_record
@@ -2533,6 +2846,7 @@ pub fn append_turn_record(record: &TurnRecord, tool_calls: &[ToolCallRecord]) {
     set_tool_records(&bounded_record.id, tool_calls);
 }
 
+/// Returns the most-recent `limit` FSM transition records (newest first).
 pub fn list_recent_transitions(limit: usize) -> Vec<TransitionLogRecord> {
     if limit == 0 {
         return Vec::new();
@@ -2547,6 +2861,7 @@ pub fn list_recent_transitions(limit: usize) -> Vec<TransitionLogRecord> {
     })
 }
 
+/// Returns the most-recent `limit` agent turn records (newest first).
 pub fn list_turns(limit: usize) -> Vec<TurnRecord> {
     if limit == 0 {
         return Vec::new();
@@ -2561,6 +2876,8 @@ pub fn list_turns(limit: usize) -> Vec<TurnRecord> {
     })
 }
 
+/// Persists the tool-call records for `turn_id`, truncating `args_json` and
+/// `output` fields to their respective character limits.
 pub fn set_tool_records(turn_id: &str, tool_calls: &[ToolCallRecord]) {
     let bounded_tool_calls = tool_calls
         .iter()
@@ -2578,6 +2895,8 @@ pub fn set_tool_records(turn_id: &str, tool_calls: &[ToolCallRecord]) {
     });
 }
 
+/// Marks the current turn as complete: clears `turn_in_flight`, sets the new
+/// `state`, records any error, and updates `last_transition_at_ns`.
 pub fn complete_turn(state: AgentState, error: Option<String>) {
     let mut snapshot = runtime_snapshot();
     snapshot.turn_in_flight = false;
@@ -2587,11 +2906,16 @@ pub fn complete_turn(state: AgentState, error: Option<String>) {
     save_runtime_snapshot(&snapshot);
 }
 
+/// Returns the tool-call records associated with `turn_id`, or an empty
+/// vector if none have been stored.
 pub fn get_tools_for_turn(turn_id: &str) -> Vec<ToolCallRecord> {
     let key = format!("tools:{turn_id}");
     TOOL_MAP.with(|map| read_json(map.borrow().get(&key).as_deref()).unwrap_or_default())
 }
 
+/// Replaces `evm_cursor` in the snapshot, filling in `contract_address` and
+/// `automaton_address_topic` from the snapshot's own fields if they are absent
+/// in the incoming cursor.
 pub fn set_evm_cursor(cursor: &EvmPollCursor) {
     let mut snapshot = runtime_snapshot();
     let mut next_cursor = cursor.clone();
@@ -2607,6 +2931,10 @@ pub fn set_evm_cursor(cursor: &EvmPollCursor) {
     save_runtime_snapshot(&snapshot);
 }
 
+/// Idempotent deduplication for EVM log ingestion.
+///
+/// Returns `true` and marks the event as seen on first call; returns `false`
+/// on subsequent calls for the same `(tx_hash, log_index)` pair.
 pub fn try_mark_evm_event_ingested(tx_hash: &str, log_index: u64) -> bool {
     let key = evm_ingest_dedupe_key(tx_hash, log_index);
     let already_seen = RUNTIME_MAP.with(|map| map.borrow().get(&key).is_some());
@@ -2625,6 +2953,10 @@ pub fn normalize_inbox_body(raw_body: &str) -> Result<String, String> {
     Ok(truncate_text_field(trimmed, MAX_INBOX_BODY_CHARS))
 }
 
+// ── Inbox / Outbox ────────────────────────────────────────────────────────────
+
+/// Creates and stores a new inbox message, enqueues it in `INBOX_PENDING_QUEUE_MAP`,
+/// and returns the new message ID.  Truncates `body` to `MAX_INBOX_BODY_CHARS`.
 pub fn post_inbox_message(body: String, caller: String) -> Result<String, String> {
     let bounded_body = normalize_inbox_body(&body)?;
 
@@ -2656,6 +2988,7 @@ pub fn post_inbox_message(body: String, caller: String) -> Result<String, String
     Ok(id)
 }
 
+/// Returns the most-recent `limit` inbox messages (newest first).
 pub fn list_inbox_messages(limit: usize) -> Vec<InboxMessage> {
     if limit == 0 {
         return Vec::new();
@@ -2670,6 +3003,8 @@ pub fn list_inbox_messages(limit: usize) -> Vec<InboxMessage> {
     })
 }
 
+/// Computes inbox statistics (total, pending, staged, consumed counts) by
+/// scanning `INBOX_MAP`.
 pub fn inbox_stats() -> InboxStats {
     let mut stats = InboxStats::default();
     INBOX_MAP.with(|map| {
@@ -2843,7 +3178,7 @@ fn derive_cycle_telemetry(
         total_cycles,
         liquid_cycles,
         freezing_threshold_cycles,
-        moving_window_seconds: CYCLES_BURN_MOVING_WINDOW_SECONDS,
+        moving_window_seconds: timing::CYCLES_BURN_MOVING_WINDOW_SECS,
         window_duration_seconds,
         window_sample_count: u32::try_from(samples.len()).unwrap_or(u32::MAX),
         burn_rate_cycles_per_hour: burn_per_hour,
@@ -3151,6 +3486,8 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
     }
 }
 
+/// Creates and stores a new outbox message linking it to the originating
+/// `turn_id` and `source_inbox_ids`.  Returns the new message ID.
 pub fn post_outbox_message(
     turn_id: String,
     body: String,
@@ -3177,6 +3514,7 @@ pub fn post_outbox_message(
     Ok(id)
 }
 
+/// Returns the most-recent `limit` outbox messages (newest first).
 pub fn list_outbox_messages(limit: usize) -> Vec<OutboxMessage> {
     if limit == 0 {
         return Vec::new();
@@ -3191,11 +3529,15 @@ pub fn list_outbox_messages(limit: usize) -> Vec<OutboxMessage> {
     })
 }
 
+/// Returns high-level outbox statistics (currently only `total_messages`).
 pub fn outbox_stats() -> OutboxStats {
     let total_messages = OUTBOX_MAP.with(|map| map.borrow().len());
     OutboxStats { total_messages }
 }
 
+/// Moves up to `batch_size` pending inbox messages into the `Staged` state,
+/// updating `INBOX_STAGED_QUEUE_MAP` and removing them from `INBOX_PENDING_QUEUE_MAP`.
+/// Returns the number of messages staged.
 pub fn stage_pending_inbox_messages(batch_size: usize, now_ns: u64) -> usize {
     if batch_size == 0 {
         return 0;
@@ -3243,6 +3585,8 @@ pub fn stage_pending_inbox_messages(batch_size: usize, now_ns: u64) -> usize {
     staged_count
 }
 
+/// Returns up to `batch_size` messages that are currently in `Staged` state,
+/// in FIFO sequence order.
 pub fn list_staged_inbox_messages(batch_size: usize) -> Vec<InboxMessage> {
     if batch_size == 0 {
         return Vec::new();
@@ -3260,6 +3604,8 @@ pub fn list_staged_inbox_messages(batch_size: usize) -> Vec<InboxMessage> {
     })
 }
 
+/// Marks the given staged inbox message `ids` as `Consumed`, removing them
+/// from `INBOX_STAGED_QUEUE_MAP`.  Returns the number of messages consumed.
 pub fn consume_staged_inbox_messages(ids: &[String], now_ns: u64) -> usize {
     if ids.is_empty() {
         return 0;
@@ -3293,6 +3639,9 @@ pub fn consume_staged_inbox_messages(ids: &[String], now_ns: u64) -> usize {
     consumed
 }
 
+// ── Skills ────────────────────────────────────────────────────────────────────
+
+/// Inserts or replaces a skill record in `SKILL_MAP`, keyed by `skill.name`.
 pub fn upsert_skill(skill: &SkillRecord) {
     SKILL_MAP.with(|map| {
         map.borrow_mut()
@@ -7577,6 +7926,24 @@ mod tests {
 
         init_storage();
         assert!(wallet_balance_bootstrap_pending());
+    }
+
+    #[test]
+    fn init_scheduler_defaults_seeds_poll_inbox_due_immediately() {
+        init_storage();
+        let poll_inbox_key = task_kind_key(&TaskKind::PollInbox);
+        TASK_RUNTIME_MAP.with(|map| {
+            map.borrow_mut().remove(&poll_inbox_key);
+        });
+
+        let seed_now_ns = 42u64;
+        init_scheduler_defaults(seed_now_ns);
+
+        let runtime = get_task_runtime(&TaskKind::PollInbox);
+        assert_eq!(
+            runtime.next_due_ns, seed_now_ns,
+            "first PollInbox run should be due immediately after init"
+        );
     }
 
     #[test]
