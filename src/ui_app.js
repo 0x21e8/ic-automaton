@@ -476,7 +476,7 @@ const HELP_LINES = [
   { text: "AVAILABLE COMMANDS", cls: "system bright" },
   { text: "────────────────────────────────────", cls: "separator" },
   { text: "  connect              Connect EVM wallet (MetaMask, etc.)", cls: "system" },
-  { text: "  disconnect           Unlink wallet", cls: "system" },
+  { text: "  disconnect           Disconnect wallet", cls: "system" },
   { text: "  send -m \"message\"    Post a message to the automaton", cls: "system" },
   { text: "       [--usdc]          Pay with USDC + ETH (default: ETH only)", cls: "system dim" },
   { text: "  price                Show message cost (ETH and USDC)", cls: "system" },
@@ -484,10 +484,11 @@ const HELP_LINES = [
   { text: "  config               Configuration overview", cls: "system" },
   { text: "  log [-f]             Activity log  (jobs + transitions)", cls: "system" },
   { text: "  peek [-f]            Internal monologue (inner dialogue)", cls: "system" },
-  { text: "  inbox                Unread automaton replies from async sends", cls: "system" },
+  { text: "  inbox                Unread automaton replies", cls: "system" },
   { text: "  history              Past messages and automaton responses", cls: "system" },
   { text: "  donate <amount>      Send ETH directly to automaton", cls: "system" },
   { text: "       [--usdc]          Donate USDC instead", cls: "system dim" },
+  { text: "  code                 Open source code on Github", cls: "system" },
   { text: "  clear                Clear terminal", cls: "system" },
   { text: "  help                 Show this message", cls: "system" },
   { text: null },
@@ -508,6 +509,18 @@ function cmdHelp() {
 
 function cmdClear() {
   outputEl.innerHTML = "";
+}
+
+function cmdCode() {
+  printEmpty();
+  const repoUrl = "https://github.com/0x21e8/ic-automaton";
+  const opened = window.open(repoUrl, "_blank", "noopener,noreferrer");
+  if (opened) {
+    printLine(`Opened ${repoUrl}`, "system");
+  } else {
+    printError(`Popup blocked. Open manually: ${repoUrl}`);
+  }
+  printEmpty();
 }
 
 // =============================================================================
@@ -1896,6 +1909,10 @@ async function handleCommand(raw) {
 
       case "clear":
         cmdClear();
+        break;
+
+      case "code":
+        cmdCode();
         break;
 
       // Phase 2 — read-only commands

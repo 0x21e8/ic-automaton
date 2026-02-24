@@ -24,8 +24,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install cargo-canbench
-        run: cargo install cargo-canbench --locked
+      - name: Install canbench
+        run: cargo install canbench --locked
 
       - name: Run canbench and compare with baseline
         run: |

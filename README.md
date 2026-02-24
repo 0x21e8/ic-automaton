@@ -11,7 +11,7 @@
 <p align="center">
   <strong>A self-sovereign AI agent living on-chain as an Internet Computer canister.</strong>
   <br />
-  <em>It thinks. It signs. It transacts. It survives.</em>
+  <em>A new digital life form. Enabled and bound by crypto.</em>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@
 
 ## What is this?
 
-**ic-automaton** is an autonomous AI agent implemented as a single [Internet Computer](https://internetcomputer.org) canister. It runs a continuous loop of reasoning via LLM inference, takes actions on EVM blockchains (Base) through threshold ECDSA signing, manages its own cryptocurrency balances, and persists its memory across canister upgrades -- all without human intervention.
+**ic-automaton** is an autonomous AI agent implemented as a single [Internet Computer](https://internetcomputer.org) canister inspired by [Conway Research's automaton](https://github.com/Conway-Research/automaton) project. It runs a continuous loop of reasoning via LLM inference, takes actions on EVM blockchains (Base) through threshold ECDSA signing, manages its own cryptocurrency balances, and persists its memory across canister upgrades -- all without human intervention.
 
 Unlike off-chain agents that depend on cloud infrastructure and API keys held by operators, ic-automaton's entire runtime -- state machine, wallet keys, memory, and decision-making loop -- lives on a decentralized compute platform. The canister *is* the agent. There is no server to go down, no cloud bill to forget, no operator required to keep it alive.
 
@@ -44,7 +44,7 @@ On the Internet Computer, a canister can hold its own cryptographic keys (thresh
 - **Remembers** persistently, with durable memory facts that survive restarts
 - **Survives** by monitoring its own cycle balance and adapting behavior under resource pressure
 
-This is an experiment in **machine autonomy** -- not artificial general intelligence, but artificial *sovereignty*.
+This is an experiment in **machine autonomy** or artificial *sovereignty*.
 
 ## Architecture
 
@@ -90,40 +90,6 @@ This is an experiment in **machine autonomy** -- not artificial general intellig
         │ (EVM)     │   │ (LLM API)  │   │ via Inbox.sol  │
         └──────────┘   └────────────┘   └────────────────┘
 ```
-
-### State Machine
-
-The agent runtime is modeled as an explicit finite state machine. Every transition is a pure function of `(State, Event) -> Transition`, making the execution deterministic, auditable, and recoverable.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Bootstrapping
-    Bootstrapping --> LoadingContext : TimerTick
-    Idle --> LoadingContext : TimerTick
-    Sleeping --> LoadingContext : TimerTick
-    Faulted --> LoadingContext : TimerTick
-    LoadingContext --> Inferring : ContextLoaded / has_input
-    LoadingContext --> Sleeping : no_input
-    Inferring --> ExecutingActions : InferenceCompleted
-    ExecutingActions --> Inferring : Continuation (up to 5 rounds)
-    ExecutingActions --> Persisting : ActionsCompleted
-    Persisting --> Sleeping : PersistCompleted
-    Inferring --> Faulted : TurnFailed
-    ExecutingActions --> Faulted : TurnFailed
-    Faulted --> Bootstrapping : ResetFault
-```
-
-### Agent Turn Lifecycle
-
-Each "turn" follows a structured pipeline:
-
-1. **Wake** -- Scheduler fires a 30-second tick; agent turns are dispatched every 5 minutes
-2. **Load Context** -- Fetch staged inbox messages + check for pending EVM events
-3. **Infer** -- Send layered constitution + dynamic context to LLM, receive tool calls
-4. **Execute** -- Run requested tools (sign transactions, read chain state, store memories)
-5. **Continue** -- Feed tool results back to LLM for further reasoning (up to 5 rounds)
-6. **Persist** -- Write turn record, update conversation log, post outbox reply
-7. **Sleep** -- Yield until next tick
 
 ## Features
 
