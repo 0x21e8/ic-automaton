@@ -3529,6 +3529,16 @@ pub fn list_outbox_messages(limit: usize) -> Vec<OutboxMessage> {
     })
 }
 
+/// Returns one outbox message by ID, or `None` if absent.
+pub fn get_outbox_message(message_id: &str) -> Option<OutboxMessage> {
+    if message_id.trim().is_empty() {
+        return None;
+    }
+    OUTBOX_MAP
+        .with(|map| map.borrow().get(&message_id.to_string()))
+        .and_then(|payload| read_json::<OutboxMessage>(Some(payload.as_slice())))
+}
+
 /// Returns high-level outbox statistics (currently only `total_messages`).
 pub fn outbox_stats() -> OutboxStats {
     let total_messages = OUTBOX_MAP.with(|map| map.borrow().len());
@@ -6502,6 +6512,7 @@ mod tests {
             &protected_sender,
             ConversationEntry {
                 inbox_message_id: protected_id.clone(),
+                outbox_message_id: None,
                 sender_body: "protected consumed".to_string(),
                 agent_reply: "ack".to_string(),
                 turn_id: "turn-protected".to_string(),
@@ -6985,6 +6996,7 @@ mod tests {
             "0xAbCd00000000000000000000000000000000Ef12",
             ConversationEntry {
                 inbox_message_id: "inbox:1".to_string(),
+                outbox_message_id: None,
                 sender_body: "hello".to_string(),
                 agent_reply: "hi".to_string(),
                 turn_id: "turn-1".to_string(),
@@ -7202,6 +7214,7 @@ mod tests {
             mixed_case,
             ConversationEntry {
                 inbox_message_id: "inbox:1".to_string(),
+                outbox_message_id: None,
                 sender_body: "hello".to_string(),
                 agent_reply: "hi".to_string(),
                 turn_id: "turn-1".to_string(),
@@ -7225,6 +7238,7 @@ mod tests {
             &sender,
             ConversationEntry {
                 inbox_message_id: "inbox:trunc".to_string(),
+                outbox_message_id: None,
                 sender_body: "s".repeat(700),
                 agent_reply: "r".repeat(900),
                 turn_id: "turn-trunc".to_string(),
@@ -7248,6 +7262,7 @@ mod tests {
                 &sender,
                 ConversationEntry {
                     inbox_message_id: format!("inbox:{idx}"),
+                    outbox_message_id: None,
                     sender_body: format!("msg-{idx}"),
                     agent_reply: "reply".to_string(),
                     turn_id: format!("turn-{idx}"),
@@ -7274,6 +7289,7 @@ mod tests {
                 &sender,
                 ConversationEntry {
                     inbox_message_id: format!("inbox:{idx}"),
+                    outbox_message_id: None,
                     sender_body: "hello".to_string(),
                     agent_reply: "reply".to_string(),
                     turn_id: format!("turn-{idx}"),
@@ -7293,6 +7309,7 @@ mod tests {
             &newest_sender,
             ConversationEntry {
                 inbox_message_id: "inbox:200".to_string(),
+                outbox_message_id: None,
                 sender_body: "hello".to_string(),
                 agent_reply: "reply".to_string(),
                 turn_id: "turn-200".to_string(),
@@ -7321,6 +7338,7 @@ mod tests {
             &sender_a,
             ConversationEntry {
                 inbox_message_id: "inbox:a".to_string(),
+                outbox_message_id: None,
                 sender_body: "hello".to_string(),
                 agent_reply: "reply".to_string(),
                 turn_id: "turn-a".to_string(),
@@ -7331,6 +7349,7 @@ mod tests {
             &sender_b,
             ConversationEntry {
                 inbox_message_id: "inbox:b".to_string(),
+                outbox_message_id: None,
                 sender_body: "hello".to_string(),
                 agent_reply: "reply".to_string(),
                 turn_id: "turn-b".to_string(),

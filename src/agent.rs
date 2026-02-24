@@ -661,10 +661,14 @@ fn record_conversation_entries(
     turn_id: &str,
     staged_messages: &[InboxMessage],
     consumed_message_ids: &[String],
+    outbox_message_id: &str,
     agent_reply: &str,
     timestamp_ns: u64,
 ) {
-    if consumed_message_ids.is_empty() || agent_reply.trim().is_empty() {
+    if consumed_message_ids.is_empty()
+        || outbox_message_id.trim().is_empty()
+        || agent_reply.trim().is_empty()
+    {
         return;
     }
 
@@ -680,6 +684,7 @@ fn record_conversation_entries(
             &message.posted_by,
             ConversationEntry {
                 inbox_message_id: message.id.clone(),
+                outbox_message_id: Some(outbox_message_id.to_string()),
                 sender_body: message.body.clone(),
                 agent_reply: agent_reply.to_string(),
                 turn_id: turn_id.to_string(),
@@ -1173,11 +1178,12 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                             reply.clone(),
                             staged_message_ids.clone(),
                         ) {
-                            Ok(_) => {
+                            Ok(outbox_message_id) => {
                                 record_conversation_entries(
                                     &turn_id,
                                     &staged_messages,
                                     &staged_message_ids,
+                                    &outbox_message_id,
                                     &reply,
                                     current_time_ns(),
                                 );
@@ -1658,6 +1664,7 @@ mod tests {
                 sender_a,
                 ConversationEntry {
                     inbox_message_id: format!("a-{idx}"),
+                    outbox_message_id: None,
                     sender_body: format!("a-msg-{idx}"),
                     agent_reply: format!("a-reply-{idx}"),
                     turn_id: "turn-history".to_string(),
@@ -1669,6 +1676,7 @@ mod tests {
             sender_c,
             ConversationEntry {
                 inbox_message_id: "c-0".to_string(),
+                outbox_message_id: None,
                 sender_body: "c-msg-0".to_string(),
                 agent_reply: "c-reply-0".to_string(),
                 turn_id: "turn-history".to_string(),
@@ -1740,6 +1748,7 @@ mod tests {
                 sender,
                 ConversationEntry {
                     inbox_message_id: format!("msg-{idx}"),
+                    outbox_message_id: None,
                     sender_body: format!("sender-{idx}"),
                     agent_reply: format!("reply-{idx}"),
                     turn_id: "turn-history".to_string(),
@@ -2185,12 +2194,17 @@ mod tests {
 
         let outbox = stable::list_outbox_messages(10);
         assert_eq!(outbox.len(), 1, "one assistant reply should be recorded");
+        let expected_outbox_id = outbox[0].id.clone();
         let expected_reply = outbox[0].body.clone();
 
         let sender_a_log = stable::get_conversation_log(&sender_a)
             .expect("sender A conversation should be recorded");
         assert_eq!(sender_a_log.entries.len(), 1);
         assert_eq!(sender_a_log.entries[0].sender_body, "hello sender a");
+        assert_eq!(
+            sender_a_log.entries[0].outbox_message_id.as_deref(),
+            Some(expected_outbox_id.as_str())
+        );
         assert_eq!(sender_a_log.entries[0].agent_reply, expected_reply);
 
         assert!(

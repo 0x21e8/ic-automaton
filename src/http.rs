@@ -126,6 +126,23 @@ fn evm_config_view() -> EvmConfigView {
     }
 }
 
+/// Expands conversation reply previews with full outbox payloads when linked.
+fn hydrate_conversation_agent_replies(
+    mut log: crate::domain::types::ConversationLog,
+) -> crate::domain::types::ConversationLog {
+    for entry in &mut log.entries {
+        let Some(outbox_message_id) = entry.outbox_message_id.as_deref() else {
+            continue;
+        };
+        if let Some(outbox_message) = stable::get_outbox_message(outbox_message_id) {
+            if !outbox_message.body.trim().is_empty() {
+                entry.agent_reply = outbox_message.body;
+            }
+        }
+    }
+    log
+}
+
 // ── Route handlers ───────────────────────────────────────────────────────────
 
 // Per-canister thread-local state holding the live certification tree.
@@ -230,7 +247,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
         (&Method::POST, "/api/conversation") => {
             match parse_conversation_lookup_request(request.body()) {
                 Ok(payload) => match stable::get_conversation_log(&payload.sender) {
-                    Some(log) => json_update_response(StatusCode::OK, &log),
+                    Some(log) => {
+                        let hydrated = hydrate_conversation_agent_replies(log);
+                        json_update_response(StatusCode::OK, &hydrated)
+                    }
                     None => json_update_response(
                         StatusCode::NOT_FOUND,
                         &ConversationLookupError {
@@ -934,6 +954,7 @@ mod tests {
             "0xAbCd00000000000000000000000000000000Ef12",
             crate::domain::types::ConversationEntry {
                 inbox_message_id: "inbox:1".to_string(),
+                outbox_message_id: None,
                 sender_body: "hello".to_string(),
                 agent_reply: "hi".to_string(),
                 turn_id: "turn-1".to_string(),
@@ -962,6 +983,92 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(|entries| entries.len()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn conversation_lookup_returns_full_agent_reply_when_available() {
+        init_certification();
+        stable::init_storage();
+
+        let sender = "0xAbCd00000000000000000000000000000000Ef12";
+        let full_reply = "r".repeat(900);
+        let outbox_id = stable::post_outbox_message(
+            "turn-1".to_string(),
+            full_reply.clone(),
+            vec!["inbox:1".to_string()],
+        )
+        .expect("outbox message should be accepted");
+        stable::append_conversation_entry(
+            sender,
+            crate::domain::types::ConversationEntry {
+                inbox_message_id: "inbox:1".to_string(),
+                outbox_message_id: Some(outbox_id),
+                sender_body: "hello".to_string(),
+                agent_reply: full_reply.clone(),
+                turn_id: "turn-1".to_string(),
+                timestamp_ns: 1,
+            },
+        );
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/conversation")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"sender":"0xabcd00000000000000000000000000000000ef12"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.pointer("/entries/0/agent_reply")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(900),
+            "history endpoint should expose full replies when available"
+        );
+    }
+
+    #[test]
+    fn conversation_lookup_falls_back_to_stored_preview_when_outbox_missing() {
+        init_certification();
+        stable::init_storage();
+
+        let sender = "0xAbCd00000000000000000000000000000000Ef12";
+        let full_reply = "r".repeat(900);
+        stable::append_conversation_entry(
+            sender,
+            crate::domain::types::ConversationEntry {
+                inbox_message_id: "inbox:1".to_string(),
+                outbox_message_id: Some("outbox:missing".to_string()),
+                sender_body: "hello".to_string(),
+                agent_reply: full_reply,
+                turn_id: "turn-1".to_string(),
+                timestamp_ns: 1,
+            },
+        );
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/conversation")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"sender":"0xabcd00000000000000000000000000000000ef12"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(
+            body.pointer("/entries/0/agent_reply")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(500),
+            "history endpoint should keep stored preview when full outbox payload is missing"
         );
     }
 

@@ -593,6 +593,8 @@ pub struct PromptLayerView {
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ConversationEntry {
     pub inbox_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox_message_id: Option<String>,
     pub sender_body: String,
     pub agent_reply: String,
     pub turn_id: String,

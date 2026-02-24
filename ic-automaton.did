@@ -56,6 +56,7 @@ type ContractRoleBinding = record {
 type ConversationEntry = record {
   timestamp_ns : nat64;
   turn_id : text;
+  outbox_message_id : opt text;
   sender_body : text;
   agent_reply : text;
   inbox_message_id : text;
