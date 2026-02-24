@@ -558,7 +558,7 @@ fn agent_turn_does_not_stage_pending_messages_without_poll_inbox() {
 }
 
 #[test]
-fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
+fn agent_blocks_inbox_prompt_layer_update_and_keeps_layer_6_default() {
     let (pic, canister_id) = with_backend_canister();
 
     for kind in [
@@ -591,8 +591,8 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
         .expect("layer 6 should be returned");
     assert!(layer_6.is_mutable);
     assert!(
-        layer_6.content.contains("phase5-layer6-marker"),
-        "layer 6 should be updated by tool call"
+        !layer_6.content.contains("phase5-layer6-marker"),
+        "inbox-driven prompt layer mutation should be blocked"
     );
 
     let update_outbox = list_outbox_messages(&pic, canister_id, 20)
@@ -602,6 +602,13 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
     assert!(
         update_outbox.body.contains("deterministic continuation"),
         "outbox should prefer continuation text after tool execution"
+    );
+    let turns_after_update = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns_after_update
+            .iter()
+            .any(|turn| turn.contains("tool sequence validator blocked")),
+        "turn logs should capture sequence-validator blocks for sensitive tools"
     );
 
     let probe_message_id = post_inbox_message(&pic, canister_id, "request_layer_6_probe:true")
@@ -630,8 +637,8 @@ fn agent_can_update_prompt_layer_and_next_turn_uses_updated_prompt() {
     assert!(
         turns
             .iter()
-            .any(|turn| turn.contains("layer6_probe:present")),
-        "turn logs should retain first-round probe explanation before continuation"
+            .any(|turn| turn.contains("layer6_probe:missing")),
+        "turn logs should show that layer 6 remained unchanged"
     );
 }
 
@@ -688,6 +695,13 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
         turn_outbox.body.contains("deterministic continuation"),
         "reply body should come from continuation round after tool output"
     );
+    let turns = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("tool sequence validator blocked")),
+        "inbox-driven sensitive tool should be blocked but not abort the turn"
+    );
 
     let agent_turn_jobs = list_scheduler_jobs(&pic, canister_id)
         .into_iter()
@@ -702,7 +716,7 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
 }
 
 #[test]
-fn non_controller_can_mutate_inference_config_but_not_control_plane() {
+fn non_controller_cannot_mutate_inference_config_or_control_plane() {
     let (pic, canister_id) = with_backend_canister();
     let outsider = non_controller_principal();
 
@@ -717,16 +731,15 @@ fn non_controller_can_mutate_inference_config_but_not_control_plane() {
 
     let inference_payload = encode_args((InferenceProvider::OpenRouter,))
         .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
-    let inference_result: String = call_update_as(
-        &pic,
+    let inference_call_result = pic.update_call(
         canister_id,
         outsider,
         "set_inference_provider",
         inference_payload,
     );
-    assert_eq!(
-        inference_result, "inference_provider=OpenRouter",
-        "set_inference_provider should allow non-controller callers"
+    assert!(
+        inference_call_result.is_err(),
+        "set_inference_provider should reject non-controller callers"
     );
 
     let model_payload = encode_args(("openai/gpt-4o-mini".to_string(),))
@@ -740,22 +753,21 @@ fn non_controller_can_mutate_inference_config_but_not_control_plane() {
     );
     assert_eq!(
         model_result,
-        Ok("openai/gpt-4o-mini".to_string()),
-        "set_inference_model should allow non-controller callers"
+        Err("caller is not a controller".to_string()),
+        "set_inference_model should enforce controller authorization"
     );
 
     let api_key_payload = encode_args((Some("test-openrouter-key".to_string()),))
         .unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
-    let api_key_result: String = call_update_as(
-        &pic,
+    let api_key_call_result = pic.update_call(
         canister_id,
         outsider,
         "set_openrouter_api_key",
         api_key_payload,
     );
-    assert_eq!(
-        api_key_result, "openrouter_api_key_updated",
-        "set_openrouter_api_key should allow non-controller callers"
+    assert!(
+        api_key_call_result.is_err(),
+        "set_openrouter_api_key should reject non-controller callers"
     );
 
     let rpc_payload = encode_args(("https://mainnet.base.org".to_string(),))

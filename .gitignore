@@ -29,6 +29,7 @@ target/
 
 # local-only design docs (not tracked in git)
 docs/design/
+docs/specs/
 
 # githooks
 .githooks/*
