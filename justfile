@@ -17,7 +17,7 @@ bootstrap_secondary_evm_address := "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca"
 automaton_wait_timeout_secs := "180"
 automaton_wait_poll_secs := "2"
 local_url := "http://127.0.0.1:8000"
-openrouter_default_model := "openai/gpt-4o-mini"
+openrouter_default_model := "google/gemini-3-flash-preview"
 ic_llm_default_model := "llama3.1:8b"
 ollama_host := "127.0.0.1"
 ollama_port := "11434"
@@ -144,7 +144,7 @@ deploy-inbox:
   echo "MockUSDC: $mock_usdc_address"
   echo "Inbox:    $inbox_address"
 
-deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_chain_id=anvil_chain_id evm_rpc_url=anvil_rpc_url:
+deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_chain_id=anvil_chain_id evm_rpc_url=anvil_rpc_url inference_mode="openrouter" openrouter_model=openrouter_default_model:
   #!/usr/bin/env bash
   set -euo pipefail
   escape_candid_text() {
@@ -154,6 +154,8 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_cha
   llm_canister_id="{{llm_canister_id}}"
   evm_chain_id="{{evm_chain_id}}"
   evm_rpc_url="{{evm_rpc_url}}"
+  inference_mode="{{inference_mode}}"
+  openrouter_model="{{openrouter_model}}"
   if [ -z "$inbox_address" ]; then
     inbox_address="$(cat .local/inbox_contract_address)"
   fi
@@ -162,10 +164,30 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_cha
     echo "backend canister already exists on local"
   fi
   icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ($evm_chain_id : nat64); evm_rpc_url = opt \"$evm_rpc_url\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\" })"
-  if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-    api_key_escaped="$(escape_candid_text "$OPENROUTER_API_KEY")"
-    icp canister call backend set_openrouter_api_key "(opt \"$api_key_escaped\")" -e local >/dev/null
-  fi
+  case "$inference_mode" in
+    openrouter)
+      model_escaped="$(escape_candid_text "$openrouter_model")"
+      icp canister call backend set_inference_provider '(variant { OpenRouter })' -e local >/dev/null
+      icp canister call backend set_inference_model "(\"$model_escaped\")" -e local >/dev/null
+      if [ -n "${OPENROUTER_BASE_URL:-}" ]; then
+        base_url_escaped="$(escape_candid_text "$OPENROUTER_BASE_URL")"
+        icp canister call backend set_openrouter_base_url "(\"$base_url_escaped\")" -e local >/dev/null
+      fi
+      if [ -z "${OPENROUTER_API_KEY:-}" ] || [ "${OPENROUTER_API_KEY}" = "replace-with-your-openrouter-api-key" ]; then
+        echo "OPENROUTER_API_KEY must be set to a valid OpenRouter API key." >&2
+        exit 1
+      fi
+      api_key_escaped="$(escape_candid_text "$OPENROUTER_API_KEY")"
+      icp canister call backend set_openrouter_api_key "(opt \"$api_key_escaped\")" -e local >/dev/null
+      echo "Configured OpenRouter provider with model=$openrouter_model and OPENROUTER_API_KEY"
+      ;;
+    icllm|ic-llm|ollama)
+      ;;
+    *)
+      echo "unsupported inference_mode=$inference_mode (supported: openrouter, icllm)" >&2
+      exit 1
+      ;;
+  esac
   canister_id="$(icp canister status backend -e local | awk '/Canister Id:/ { print $3 }')"
   echo "Canister ID: $canister_id"
   echo "UI URL: http://$canister_id.localhost:8000/"
@@ -462,7 +484,7 @@ bootstrap mode="openrouter" openrouter_model="" ic_llm_model="" evm_mode="local"
       ;;
   esac
 
-  just deploy-canister "" "$llm_canister_id" "$evm_chain_id" "{{anvil_rpc_url}}"
+  just deploy-canister "" "$llm_canister_id" "$evm_chain_id" "{{anvil_rpc_url}}" "$mode" "$openrouter_model"
   automaton_address="$(just --quiet automaton-evm-address)"
   echo "Automaton EVM address: $automaton_address"
   just seed-bootstrap-payer

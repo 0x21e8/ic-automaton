@@ -218,7 +218,7 @@ just bootstrap icllm
 just bootstrap openrouter base-fork "" "$BASE_MAINNET_RPC_URL"
 
 # Optional model defaults can be configured in .env:
-# OPENROUTER_MODEL (default: openai/gpt-4o-mini)
+# OPENROUTER_MODEL (default: google/gemini-3-flash-preview)
 # IC_LLM_MODEL (default: llama3.1:8b)
 
 # Tear down all local services (IC, Anvil, and tracked Ollama if started)
@@ -252,7 +252,7 @@ Runtime configuration (updatable via canister calls):
 | Setting | Description |
 |---------|-------------|
 | `set_inference_provider` | Switch between `OpenRouter` and `IcLlm` |
-| `set_inference_model` | Set model name (e.g. `openai/gpt-4o-mini`, `llama3.1:8b`) |
+| `set_inference_model` | Set model name (e.g. `google/gemini-3-flash-preview`, `llama3.1:8b`) |
 | `set_openrouter_api_key` | Configure OpenRouter API key |
 | `set_task_interval_secs` | Adjust per-task scheduling frequency |
 | `set_loop_enabled` | Enable/disable the agent turn loop |

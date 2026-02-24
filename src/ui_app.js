@@ -291,7 +291,7 @@ async function runBoot() {
   let delay = 80;
   const S = BOOT_DELAY_STEP;
 
-  printLine("AUTOMATON TERMINAL v2.0",              "system bright", delay); delay += S;
+  printLine("AUTOMATON TERMINAL",              "system bright", delay); delay += S;
   printSeparator(delay);                                                      delay += S;
 
   const connectingLine = printLine("CONNECTING TO CANISTER...", "system dim", delay); delay += S;
