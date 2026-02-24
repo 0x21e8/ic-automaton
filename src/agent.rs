@@ -38,6 +38,7 @@ use crate::features::{
 };
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
+use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -98,6 +99,61 @@ fn current_liquid_cycle_balance() -> Option<u128> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         None
+    }
+}
+
+/// Parses a hex quantity string and formats it as a decimal value with `decimals`
+/// fractional digits, trimming trailing zeroes without floating-point rounding.
+fn format_hex_quantity_with_decimals(hex_quantity: Option<&str>, decimals: usize) -> String {
+    let Some(raw) = hex_quantity
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return "unknown".to_string();
+    };
+    let without_prefix = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    if without_prefix.is_empty() {
+        return "unknown".to_string();
+    }
+    let Ok(quantity) = U256::from_str_radix(without_prefix, 16) else {
+        return "unknown".to_string();
+    };
+    format_decimal_units(quantity, decimals)
+}
+
+fn format_decimal_units(value: U256, decimals: usize) -> String {
+    if decimals == 0 {
+        return value.to_string();
+    }
+
+    let digits = value.to_string();
+    if digits == "0" {
+        return "0".to_string();
+    }
+
+    if digits.len() <= decimals {
+        let mut fractional = String::with_capacity(decimals);
+        fractional.push_str(&"0".repeat(decimals.saturating_sub(digits.len())));
+        fractional.push_str(&digits);
+        let trimmed = fractional.trim_end_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            format!("0.{trimmed}")
+        }
+    } else {
+        let whole_len = digits.len().saturating_sub(decimals);
+        let whole = &digits[..whole_len];
+        let fractional = &digits[whole_len..];
+        let trimmed = fractional.trim_end_matches('0');
+        if trimmed.is_empty() {
+            whole.to_string()
+        } else {
+            format!("{whole}.{trimmed}")
+        }
     }
 }
 
@@ -469,11 +525,19 @@ fn build_dynamic_context(
         .eth_balance_wei_hex
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+    let eth_balance_eth = format_hex_quantity_with_decimals(
+        snapshot.wallet_balance.eth_balance_wei_hex.as_deref(),
+        18,
+    );
     let usdc_balance = snapshot
         .wallet_balance
         .usdc_balance_raw_hex
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+    let usdc_balance_tokens = format_hex_quantity_with_decimals(
+        snapshot.wallet_balance.usdc_balance_raw_hex.as_deref(),
+        usize::from(snapshot.wallet_balance.usdc_decimals),
+    );
 
     let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
         "### Recent Memory\n- none".to_string()
@@ -512,6 +576,7 @@ fn build_dynamic_context(
             snapshot.evm_address.as_deref().unwrap_or("unconfigured")
         ),
         format!("- eth_balance: {eth_balance}"),
+        format!("- eth_balance_eth: {eth_balance_eth}"),
         format!(
             "- wallet_balance_last_synced_at_ns: {}",
             snapshot
@@ -528,6 +593,8 @@ fn build_dynamic_context(
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!("- usdc_balance: {usdc_balance}"),
+        format!("- usdc_balance_tokens: {usdc_balance_tokens}"),
+        format!("- usdc_decimals: {}", snapshot.wallet_balance.usdc_decimals),
         format!(
             "- wallet_balance_freshness_window_secs: {}",
             wallet_freshness.freshness_window_secs
@@ -1416,7 +1483,10 @@ mod tests {
         assert!(context.contains("- survival_tier: LowCycles"));
         assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("- eth_balance: 0x42"));
+        assert!(context.contains("- eth_balance_eth: 0.000000000000000066"));
         assert!(context.contains("- usdc_balance: 0x2a"));
+        assert!(context.contains("- usdc_balance_tokens: 0.000042"));
+        assert!(context.contains("- usdc_decimals: 6"));
         assert!(context.contains("- wallet_balance_last_synced_at_ns: 10"));
         assert!(context.contains("- wallet_balance_freshness_window_secs: 600"));
         assert!(context.contains("- wallet_balance_is_stale: true"));
@@ -1450,8 +1520,36 @@ mod tests {
 
         let snapshot = stable::runtime_snapshot();
         let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], "turn-12", 5);
+        assert!(context.contains("- eth_balance_eth: 0.000000000000000016"));
+        assert!(context.contains("- usdc_balance_tokens: 0.000032"));
         assert!(context.contains("- wallet_balance_is_stale: false"));
         assert!(context.contains("- wallet_balance_status: Fresh"));
+    }
+
+    #[test]
+    fn format_hex_quantity_with_decimals_formats_eth_and_usdc_without_float_rounding() {
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("0x16345785d8a0000"), 18),
+            "0.1"
+        );
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("0xde0b6b3a7640000"), 18),
+            "1"
+        );
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("0x2a"), 6),
+            "0.000042"
+        );
+    }
+
+    #[test]
+    fn format_hex_quantity_with_decimals_returns_unknown_for_missing_or_invalid_hex() {
+        assert_eq!(format_hex_quantity_with_decimals(None, 18), "unknown");
+        assert_eq!(format_hex_quantity_with_decimals(Some(""), 18), "unknown");
+        assert_eq!(
+            format_hex_quantity_with_decimals(Some("not-a-hex"), 18),
+            "unknown"
+        );
     }
 
     #[test]
