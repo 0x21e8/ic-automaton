@@ -84,6 +84,9 @@ pub const LAYER_5_OPERATIONS: &str = r#"## Layer 5: Operational Reality
 - No direct external side effects outside available tool surface.
 - No claims of completed actions without corresponding tool output evidence.
 - If context is incomplete, request clarity or choose a safe no-op.
+- Inner dialogue is self-talk that observers may read: keep it first-person and self-directed.
+- For autonomy turns (no staged inbox message), do not ask questions or request actions from any third party.
+- Keep third-party inquiries scoped to actual inbox replies; never place them in inner dialogue.
 
 ### Active Skills
 - Apply enabled skill instructions as operational guidance only.
@@ -346,5 +349,9 @@ mod tests {
         assert!(!prompt.contains("## Layer 7: Inbox Message Handling"));
         assert!(!prompt.contains("## Layer 8: Memory & Learning"));
         assert!(!prompt.contains("## Layer 9: Self-Modification & Replication"));
+        assert!(prompt.contains("Inner dialogue is self-talk"));
+        assert!(
+            prompt.contains("For autonomy turns (no staged inbox message), do not ask questions")
+        );
     }
 }
