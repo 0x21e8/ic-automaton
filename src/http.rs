@@ -528,15 +528,25 @@ fn static_asset_route(
 }
 
 /// Serialises `payload` to JSON and builds a certified GET route for
-/// `request_path`.  On serialization failure a static error JSON is used so
-/// the route is still registered and the tree remains consistent.
+/// `request_path`.  On serialization failure a 500 response with a static
+/// error JSON body is used so callers reliably detect the failure path.
 fn json_route<T: Serialize>(
     method: Method,
     request_path: &'static str,
     payload: &T,
 ) -> CertifiedRoute {
-    let body = match serde_json::to_vec(payload) {
-        Ok(encoded) => encoded,
+    let base_response = match serde_json::to_vec(payload) {
+        Ok(body) => HttpResponse::ok(
+            body,
+            vec![
+                (
+                    HEADER_CONTENT_TYPE.to_string(),
+                    CONTENT_TYPE_JSON.to_string(),
+                ),
+                (HEADER_CACHE_CONTROL.to_string(), CACHE_NO_STORE.to_string()),
+            ],
+        )
+        .build(),
         Err(error) => {
             log!(
                 HttpLogPriority::Error,
@@ -544,20 +554,19 @@ fn json_route<T: Serialize>(
                 request_path,
                 error
             );
-            br#"{"ok":false,"error":"serialization failed"}"#.to_vec()
+            HttpResponse::internal_server_error(
+                br#"{"ok":false,"error":"serialization failed"}"#.as_slice(),
+                vec![
+                    (
+                        HEADER_CONTENT_TYPE.to_string(),
+                        CONTENT_TYPE_JSON.to_string(),
+                    ),
+                    (HEADER_CACHE_CONTROL.to_string(), CACHE_NO_STORE.to_string()),
+                ],
+            )
+            .build()
         }
     };
-    let base_response = HttpResponse::ok(
-        body,
-        vec![
-            (
-                HEADER_CONTENT_TYPE.to_string(),
-                CONTENT_TYPE_JSON.to_string(),
-            ),
-            (HEADER_CACHE_CONTROL.to_string(), CACHE_NO_STORE.to_string()),
-        ],
-    )
-    .build();
 
     certified_route(
         method,
