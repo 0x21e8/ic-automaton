@@ -3,7 +3,7 @@
  * Phase 1: Terminal shell, command parser, help/clear, command history,
  *          status-bar canister polling, background canvas animation.
  *
- * Phase 2: read-only commands (status, config, log, peek, history, price),
+ * Phase 2: read-only commands (status, config, log, peek, inbox, history, price),
  *          EVM config bootstrap, viem public client setup.
  *
  * Phase 3: wallet connection/disconnection via viem (connect, disconnect),
@@ -44,6 +44,14 @@ const state = {
   pollHandle: null,
   lastSnapshotData: null,
 
+  // Async send/reply tracking
+  pendingReplyRequests: [],
+  unreadReplies: [],
+  deliveredReplyKeys: new Set(),
+  replyPollHandle: null,
+  replyPollInFlight: false,
+  nextPendingReplyId: 1,
+
   // Known IDs for follow mode deduplication
   knownJobIds: new Set(),
   knownTransitionIds: new Set(),
@@ -53,6 +61,8 @@ const state = {
 const STATUS_VIEW_REFRESH_MS = 2000;
 const UI_BASE_TICK_SECS = 30;
 const UI_TICKS_PER_TURN_INTERVAL = 10;
+const ASYNC_REPLY_POLL_INTERVAL_MS = 10_000;
+const ASYNC_REPLY_TRACK_TTL_MS = 6 * 60 * 60 * 1000;
 
 // =============================================================================
 // DOM ELEMENTS
@@ -474,6 +484,7 @@ const HELP_LINES = [
   { text: "  config               Configuration overview", cls: "system" },
   { text: "  log [-f]             Activity log  (jobs + transitions)", cls: "system" },
   { text: "  peek [-f]            Internal monologue (inner dialogue)", cls: "system" },
+  { text: "  inbox                Unread automaton replies from async sends", cls: "system" },
   { text: "  history              Past messages and automaton responses", cls: "system" },
   { text: "  donate <amount>      Send ETH directly to automaton", cls: "system" },
   { text: "       [--usdc]          Donate USDC instead", cls: "system dim" },
@@ -886,6 +897,37 @@ function renderTurns(turns) {
   }
 }
 
+async function cmdInbox() {
+  printEmpty();
+
+  if (state.unreadReplies.length === 0) {
+    printLine("No unread automaton replies.", "system dim");
+    printLine("Tip: run 'history' for the full conversation log.", "system dim");
+    printEmpty();
+    return;
+  }
+
+  const unread = [...state.unreadReplies].sort(
+    (a, b) => Number(a.timestampNs ?? 0) - Number(b.timestampNs ?? 0)
+  );
+
+  printLine(`UNREAD REPLIES (${unread.length})`, "system bright");
+  printSeparator();
+  for (const entry of unread) {
+    const ts = formatTs(entry.timestampNs);
+    printLine(`${ts}  AUTOMATON · req #${entry.requestId}`, "system dim");
+    for (const line of String(entry.agentReply ?? "").split("\n")) {
+      printLine(`  ${line}`, "system");
+    }
+    printEmpty();
+  }
+
+  state.unreadReplies = [];
+  updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
+  printLine("Unread inbox cleared. Use 'history' for full conversation.", "system dim");
+  printEmpty();
+}
+
 async function cmdHistory() {
   printEmpty();
 
@@ -1194,10 +1236,6 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
 ];
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Parse a decimal string (e.g. "5.0") into a raw BigInt with `decimals` places.
  * Returns null on parse failure.
@@ -1226,34 +1264,146 @@ function isTxRejected(err) {
   );
 }
 
-/**
- * Poll /api/conversation for `senderAddress` until a new agent reply appears
- * after `sentAfterMs`, or until 120s elapses.
- * Returns { reply, elapsed } or null on timeout.
- */
-async function waitForReply(senderAddress, sentAfterMs) {
-  const MAX_MS = 120_000;
-  const start = Date.now();
+function conversationEntryKey(sender, entry) {
+  return [
+    String(sender ?? "").toLowerCase(),
+    String(entry?.inbox_message_id ?? ""),
+    String(entry?.turn_id ?? ""),
+    String(entry?.timestamp_ns ?? ""),
+  ].join("|");
+}
 
-  while (Date.now() - start < MAX_MS) {
-    await sleep(2000);
-    try {
-      const convo = await apiFetch("/api/conversation", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sender: senderAddress }),
-      });
-      const entries = convo?.entries ?? [];
-      if (entries.length) {
-        const latest = entries[entries.length - 1];
-        const entryTs = Number(latest.timestamp_ns) / 1e6;
-        if (entryTs > sentAfterMs && latest.agent_reply) {
-          return { reply: latest.agent_reply, elapsed: Date.now() - start };
+function entryTimestampMs(entry) {
+  return Number(entry?.timestamp_ns ?? 0) / 1e6;
+}
+
+function queuePendingReply({ sender, senderBody, sentAfterMs }) {
+  const pending = {
+    id: state.nextPendingReplyId++,
+    sender,
+    senderBody,
+    sentAfterMs,
+    expiresAtMs: Date.now() + ASYNC_REPLY_TRACK_TTL_MS,
+  };
+  state.pendingReplyRequests.push(pending);
+  return pending;
+}
+
+function stopReplyPollingIfIdle() {
+  if (state.pendingReplyRequests.length > 0) return;
+  if (state.replyPollHandle) {
+    clearInterval(state.replyPollHandle);
+    state.replyPollHandle = null;
+  }
+}
+
+function startReplyPolling() {
+  if (state.replyPollHandle) return;
+  state.replyPollHandle = setInterval(pollPendingReplies, ASYNC_REPLY_POLL_INTERVAL_MS);
+  void pollPendingReplies();
+}
+
+async function pollPendingReplies() {
+  if (state.replyPollInFlight) return;
+  if (state.pendingReplyRequests.length === 0) {
+    stopReplyPollingIfIdle();
+    return;
+  }
+
+  state.replyPollInFlight = true;
+  try {
+    const senderToEntries = new Map();
+    const uniqueSenders = [...new Set(state.pendingReplyRequests.map((pending) => pending.sender))];
+
+    for (const sender of uniqueSenders) {
+      try {
+        const convo = await apiFetch("/api/conversation", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sender }),
+        });
+        const entries = [...(convo?.entries ?? [])].sort(
+          (a, b) => Number(a.timestamp_ns ?? 0) - Number(b.timestamp_ns ?? 0)
+        );
+        senderToEntries.set(sender, entries);
+      } catch (err) {
+        const message = String(err?.message ?? err).toLowerCase();
+        if (!message.includes("conversation not found")) {
+          // Keep polling silently on transient API errors.
         }
       }
-    } catch (_) {}
+    }
+
+    const nowMs = Date.now();
+    const matchedPendingIds = new Set();
+    const expiredPendingIds = new Set();
+    const expiredPending = [];
+    const usedEntryKeys = new Set();
+    const pendingSorted = [...state.pendingReplyRequests].sort((a, b) => a.sentAfterMs - b.sentAfterMs);
+
+    for (const pending of pendingSorted) {
+      if (nowMs > pending.expiresAtMs) {
+        expiredPendingIds.add(pending.id);
+        expiredPending.push(pending);
+        continue;
+      }
+
+      const entries = senderToEntries.get(pending.sender) ?? [];
+      const candidates = entries.filter((entry) => {
+        if (!String(entry?.agent_reply ?? "").trim()) return false;
+        if (entryTimestampMs(entry) <= pending.sentAfterMs) return false;
+        const key = conversationEntryKey(pending.sender, entry);
+        return !usedEntryKeys.has(key) && !state.deliveredReplyKeys.has(key);
+      });
+      if (candidates.length === 0) continue;
+
+      let matchedEntry = null;
+      const wantedBody = String(pending.senderBody ?? "").trim();
+      if (wantedBody) {
+        matchedEntry = candidates.find((entry) => String(entry?.sender_body ?? "").trim() === wantedBody) ?? null;
+      }
+      if (!matchedEntry) {
+        matchedEntry = candidates[0];
+      }
+
+      const entryKey = conversationEntryKey(pending.sender, matchedEntry);
+      usedEntryKeys.add(entryKey);
+      state.deliveredReplyKeys.add(entryKey);
+      matchedPendingIds.add(pending.id);
+      state.unreadReplies.push({
+        requestId: pending.id,
+        sender: pending.sender,
+        senderBody: matchedEntry.sender_body ?? pending.senderBody ?? "",
+        agentReply: matchedEntry.agent_reply ?? "",
+        timestampNs: matchedEntry.timestamp_ns,
+        turnId: matchedEntry.turn_id ?? "",
+        inboxMessageId: matchedEntry.inbox_message_id ?? "",
+      });
+
+      printEmpty();
+      printSuccess(`Automaton reply received for request #${pending.id}.`);
+      printLine("Use 'inbox' to read unread replies.", "system dim");
+      printEmpty();
+    }
+
+    if (matchedPendingIds.size > 0 || expiredPendingIds.size > 0) {
+      state.pendingReplyRequests = state.pendingReplyRequests.filter(
+        (pending) => !matchedPendingIds.has(pending.id) && !expiredPendingIds.has(pending.id)
+      );
+      updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
+    }
+
+    for (const pending of expiredPending) {
+      printEmpty();
+      printLine(`Reply tracking window expired for request #${pending.id}.`, "error");
+      printLine("Use 'history' to check whether the automaton responded later.", "system dim");
+      printEmpty();
+    }
+
+    stopReplyPollingIfIdle();
+  } finally {
+    state.replyPollInFlight = false;
   }
-  return null;
 }
 
 async function cmdSend(args, flags) {
@@ -1433,24 +1583,20 @@ async function cmdSend(args, flags) {
     return;
   }
 
-  // ── Poll for automaton reply ──────────────────────────────────────────────
+  // ── Queue async reply tracking (non-blocking) ─────────────────────────────
+  const pending = queuePendingReply({
+    sender: state.walletAddress,
+    senderBody: message,
+    sentAfterMs,
+  });
+  startReplyPolling();
+
   printEmpty();
-  const replySpinner = createSpinner("WAITING FOR AUTOMATON RESPONSE...");
-  const result = await waitForReply(state.walletAddress, sentAfterMs);
-  if (result) {
-    const elapsed = (result.elapsed / 1000).toFixed(1);
-    replySpinner.stop(`AUTOMATON REPLIED (${elapsed}s):`, "system bright");
-    printSeparator();
-    for (const l of String(result.reply).split("\n")) {
-      printLine(l, "system");
-    }
-    printSeparator();
-  } else {
-    replySpinner.stop(
-      "TIMEOUT: Automaton has not responded yet. Check 'log -f' for activity.",
-      "error"
-    );
-  }
+  printSuccess("Message queued in the automaton's inbox.");
+  printLine(`Request ID: ${pending.id}`, "system dim");
+  printLine("You will be notified when a response from the automaton is received.", "system dim");
+  printLine("Use 'inbox' for unread replies or 'history' for the full conversation.", "system dim");
+  updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
   printEmpty();
 }
 
@@ -1773,6 +1919,10 @@ async function handleCommand(raw) {
         await cmdHistory();
         break;
 
+      case "inbox":
+        await cmdInbox();
+        break;
+
       case "price":
         await cmdPrice();
         break;
@@ -1815,6 +1965,14 @@ async function handleCommand(raw) {
 function updateStatusBar({ online, stateName, walletAddress, chainId } = {}) {
   const now  = new Date();
   const time = now.toLocaleTimeString("en-US", { hour12: false });
+  const asyncHints = [];
+  if (state.pendingReplyRequests.length > 0) {
+    asyncHints.push(`awaiting ${state.pendingReplyRequests.length}`);
+  }
+  if (state.unreadReplies.length > 0) {
+    asyncHints.push(`unread ${state.unreadReplies.length}`);
+  }
+  const asyncSuffix = asyncHints.length > 0 ? ` · ${asyncHints.join(" · ")}` : "";
 
   if (online === false) {
     sbIndEl.className   = "sb-indicator offline";
@@ -1827,9 +1985,10 @@ function updateStatusBar({ online, stateName, walletAddress, chainId } = {}) {
 
   const addr = walletAddress ?? state.walletAddress;
   if (addr) {
-    sbWalletEl.textContent = `${addr.slice(0, 6)}…${addr.slice(-4)}${chainId ? ` · chain ${chainId}` : ""}`;
+    sbWalletEl.textContent =
+      `${addr.slice(0, 6)}…${addr.slice(-4)}${chainId ? ` · chain ${chainId}` : ""}` + asyncSuffix;
   } else {
-    sbWalletEl.textContent = "WALLET: not connected";
+    sbWalletEl.textContent = `WALLET: not connected${asyncSuffix}`;
   }
 
   sbTimeEl.textContent = time;
