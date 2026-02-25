@@ -726,7 +726,7 @@ const HELP_LINES = [
   { text: "  status               Live automaton status view", cls: "system" },
   { text: "  config               Configuration overview", cls: "system" },
   { text: "  log [-f]             Activity log  (jobs + transitions)", cls: "system" },
-  { text: "  peek [-f]            Internal monologue (inner dialogue)", cls: "system" },
+  { text: "  peek [-f]            Internal monologue", cls: "system" },
   { text: "  inbox                Unread automaton replies", cls: "system" },
   { text: "  history              Past messages and automaton responses", cls: "system" },
   { text: "  donate <amount>      Send ETH directly to automaton", cls: "system" },
@@ -808,6 +808,8 @@ function createStatusViewLines() {
   lines.schedulerPaused = printLine("  PAUSED:          --", "system");
   lines.schedulerLastTick = printLine("  LAST TICK:       --", "system");
   lines.schedulerLastError = printLine("  LAST ERROR:      --", "system");
+  lines.evmCursorBlock = printLine("  EVM CURSOR BLOCK: --", "system");
+  lines.evmCursorLog = printLine("  EVM CURSOR LOG:  --", "system");
   printEmpty();
 
   printLine("WALLET", "system bright");
@@ -865,6 +867,8 @@ function renderStatusView(lines, snapshot, wallet, errorText = null) {
   lines.schedulerPaused.textContent = `  PAUSED:          ${scheduler.paused_reason ?? "none"}`;
   lines.schedulerLastTick.textContent = `  LAST TICK:       ${formatAge(scheduler.last_tick_finished_ns)}`;
   lines.schedulerLastError.textContent = `  LAST ERROR:      ${scheduler.last_tick_error ?? "none"}`;
+  lines.evmCursorBlock.textContent = `  EVM CURSOR BLOCK: ${runtime.evm_next_block ?? "unknown"}`;
+  lines.evmCursorLog.textContent = `  EVM CURSOR LOG:  ${runtime.evm_next_log_index ?? "unknown"}`;
 
   lines.walletAddress.textContent = `  EVM ADDRESS:     ${state.automatonEvmAddress ?? "not configured"}`;
   const balanceAge = wallet?.age_secs != null ? ` · ${wallet.age_secs}s ago` : "";

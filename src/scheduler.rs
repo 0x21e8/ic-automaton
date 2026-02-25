@@ -428,6 +428,11 @@ fn classify_failure_for_task(kind: &TaskKind, error: &str) -> RecoveryFailure {
     }
 }
 
+/// Returns `true` when `error` originated from an `eth_getLogs` poll call.
+fn is_eth_get_logs_failure(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("eth_getlogs")
+}
+
 /// Maps a task kind to the `RecoveryOperation` tag used in recovery contexts.
 fn recovery_operation_for_task(kind: &TaskKind) -> RecoveryOperation {
     match kind {
@@ -490,6 +495,8 @@ fn apply_response_limit_tuning(
 /// failure, decides the action (skip / retry-immediate / backoff / tune
 /// response-limit / escalate), and completes the job record accordingly.
 fn apply_recovery_policy_for_failed_job(job: &ScheduledJob, error: String, now_ns: u64) {
+    let defer_poll_inbox_retry_to_next_slot =
+        job.kind == TaskKind::PollInbox && is_eth_get_logs_failure(&error);
     let failure = classify_failure_for_task(&job.kind, &error);
     let context = recovery_context_for_task_job(job);
     let decision = decide_recovery_action(&failure, &context);
@@ -524,6 +531,11 @@ fn apply_recovery_policy_for_failed_job(job: &ScheduledJob, error: String, now_n
             }
         }
         RecoveryPolicyAction::EscalateFault => {}
+    }
+
+    if defer_poll_inbox_retry_to_next_slot {
+        status = JobStatus::Skipped;
+        retry_after_secs = None;
     }
 
     log!(
@@ -869,13 +881,23 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
         );
     } else {
         let poller = HttpEvmPoller::from_snapshot(&snapshot)?;
-        let poll = poller.poll(&snapshot.evm_cursor).await.inspect_err(|_| {
-            stable::record_survival_operation_failure(
-                &SurvivalOperationClass::EvmPoll,
-                now_ns,
-                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
-            );
-        })?;
+        let poll = poller
+            .poll(&snapshot.evm_cursor)
+            .await
+            .inspect_err(|error| {
+                if is_eth_get_logs_failure(error) {
+                    log!(
+                        SchedulerLogPriority::Info,
+                        "scheduler_poll_inbox_retry_deferred reason=eth_getLogs_failure"
+                    );
+                } else {
+                    stable::record_survival_operation_failure(
+                        &SurvivalOperationClass::EvmPoll,
+                        now_ns,
+                        stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+                    );
+                }
+            })?;
 
         fetched_events = poll.events.len();
         for event in &poll.events {
@@ -1264,6 +1286,8 @@ mod tests {
     };
     use crate::storage::stable;
     use std::future::Future;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::{Mutex, OnceLock};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     fn settle_pending_topup_jobs(now_ns: u64) {
@@ -1307,6 +1331,39 @@ mod tests {
         }
 
         panic!("future did not complete in test polling loop");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn host_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = host_env_lock()
+            .lock()
+            .expect("host env lock should not be poisoned");
+        let previous = vars
+            .iter()
+            .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+
+        for (name, value) in vars {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        f();
+
+        for (name, value) in previous {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     fn init_scheduler_scope() {
@@ -2401,6 +2458,71 @@ mod tests {
             .find(|job| job.dedupe_key == "PollInbox:evm-cursor")
             .expect("poll job should be present");
         assert_eq!(poll.status, JobStatus::Succeeded);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn poll_inbox_eth_get_logs_failures_wait_for_next_scheduling_slot() {
+        stable::init_storage();
+        init_scheduler_scope();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should be configurable");
+        stable::set_inbox_contract_address(Some(
+            "0x2222222222222222222222222222222222222222".to_string(),
+        ))
+        .expect("inbox contract should be configurable");
+
+        let dedupe_key = "PollInbox:no-retry-eth-getlogs".to_string();
+        with_host_stub_env(
+            &[("IC_AUTOMATON_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN", Some("0"))],
+            || {
+                let poll_job = stable::enqueue_job_if_absent(
+                    TaskKind::PollInbox,
+                    TaskLane::Mutating,
+                    dedupe_key.clone(),
+                    0,
+                    0,
+                );
+                assert!(poll_job.is_some(), "poll job should enqueue");
+
+                let processed = block_on_with_spin(run_one_pending_mutating_job(0))
+                    .expect("poll job should be processed");
+                assert!(processed, "one job should be processed");
+            },
+        );
+
+        let jobs = stable::list_recent_jobs(20);
+        let poll = jobs
+            .iter()
+            .find(|job| job.dedupe_key == dedupe_key)
+            .expect("poll job should be present");
+        assert_eq!(poll.status, JobStatus::Skipped);
+        assert!(
+            poll.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("eth_getLogs failed"),
+            "failed eth_getLogs error should be preserved for diagnostics"
+        );
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::EvmPoll),
+            0
+        );
+
+        let runtime = stable::get_task_runtime(&TaskKind::PollInbox);
+        assert!(runtime.pending_job_id.is_none());
+        assert!(runtime.backoff_until_ns.is_none());
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert!(
+            !jobs.iter().any(|job| {
+                job.kind == TaskKind::PollInbox && matches!(job.status, JobStatus::Pending)
+            }),
+            "poll inbox failure should not enqueue immediate/backoff retries"
+        );
     }
 
     #[test]

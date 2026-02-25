@@ -49,10 +49,6 @@ const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 /// Larger ranges risk hitting RPC node limits and very large response bodies.
 const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 
-/// Maximum recursive split depth used when retrying `eth_getLogs` after
-/// provider-side range rejections (for example HTTP 400).
-const MAX_GET_LOGS_SPLIT_DEPTH: u8 = 6;
-
 /// Maximum number of response bytes included in non-2xx HTTP error previews.
 const HTTP_ERROR_BODY_PREVIEW_BYTES: usize = 256;
 
@@ -441,50 +437,24 @@ impl HttpEvmRpcClient {
         topics_filter: Option<&[String]>,
         max_response_bytes: u64,
     ) -> Result<Vec<RpcLog>, String> {
-        let mut pending_ranges = vec![(from_block, to_block, 0u8)];
-        let mut merged_logs = Vec::new();
+        let filter = build_eth_get_logs_filter(from_block, to_block, address_filter, topics_filter);
+        let response = self
+            .rpc_call(
+                "eth_getLogs",
+                Value::Array(vec![Value::Object(filter)]),
+                max_response_bytes,
+            )
+            .await
+            .map_err(|error| {
+                format!("eth_getLogs failed for range 0x{from_block:x}..0x{to_block:x}: {error}")
+            })?;
 
-        while let Some((range_from, range_to, split_depth)) = pending_ranges.pop() {
-            let filter =
-                build_eth_get_logs_filter(range_from, range_to, address_filter, topics_filter);
-            let response = match self
-                .rpc_call(
-                    "eth_getLogs",
-                    Value::Array(vec![Value::Object(filter)]),
-                    max_response_bytes,
-                )
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    if should_retry_eth_get_logs_with_smaller_range(
-                        &error,
-                        range_from,
-                        range_to,
-                        split_depth,
-                    ) {
-                        let mid = range_from.saturating_add((range_to - range_from) / 2);
-                        let next_depth = split_depth.saturating_add(1);
-                        pending_ranges.push((mid.saturating_add(1), range_to, next_depth));
-                        pending_ranges.push((range_from, mid, next_depth));
-                        continue;
-                    }
-                    return Err(format!(
-                        "eth_getLogs failed for range 0x{range_from:x}..0x{range_to:x}: {error}"
-                    ));
-                }
-            };
-
-            let raw_logs = response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| "eth_getLogs result was missing".to_string())?;
-            let mut logs = serde_json::from_value::<Vec<RpcLog>>(raw_logs)
-                .map_err(|error| format!("failed to decode eth_getLogs result: {error}"))?;
-            merged_logs.append(&mut logs);
-        }
-
-        Ok(merged_logs)
+        let raw_logs = response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "eth_getLogs result was missing".to_string())?;
+        serde_json::from_value::<Vec<RpcLog>>(raw_logs)
+            .map_err(|error| format!("failed to decode eth_getLogs result: {error}"))
     }
 
     /// Query the ETH balance of `address` at the latest block.
@@ -791,23 +761,6 @@ fn build_eth_get_logs_filter(
         );
     }
     filter
-}
-
-fn should_retry_eth_get_logs_with_smaller_range(
-    error: &str,
-    from_block: u64,
-    to_block: u64,
-    split_depth: u8,
-) -> bool {
-    if split_depth >= MAX_GET_LOGS_SPLIT_DEPTH || from_block >= to_block {
-        return false;
-    }
-    let normalized = error.to_ascii_lowercase();
-    normalized.contains("status 400")
-        || normalized.contains("code=-32005")
-        || normalized.contains("too many results")
-        || normalized.contains("block range")
-        || normalized.contains("query returned more than")
 }
 
 fn format_rpc_error(method: &str, error: &Value) -> String {
@@ -2571,7 +2524,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn eth_get_logs_retries_with_smaller_ranges_on_status_400() {
+    fn eth_get_logs_does_not_retry_on_status_400() {
         with_host_stub_env(
             &[(HOST_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN_ENV, Some("100"))],
             || {
@@ -2583,16 +2536,18 @@ mod tests {
                 let rpc =
                     HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should build");
 
-                let logs = block_on_with_spin(rpc.eth_get_logs(
+                let error = match block_on_with_spin(rpc.eth_get_logs(
                     1_000,
                     1_400,
                     None,
                     None,
                     snapshot.evm_rpc_max_response_bytes,
-                ))
-                .expect("eth_getLogs should adapt by splitting range");
-
-                assert!(logs.is_empty());
+                )) {
+                    Ok(_) => panic!("eth_getLogs should fail without in-call retries"),
+                    Err(error) => error,
+                };
+                assert!(error.contains("status 400"));
+                assert!(error.contains("exceeds max 100"));
             },
         );
     }
