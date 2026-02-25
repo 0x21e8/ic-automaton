@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.32;
 
 import {Inbox} from "../src/Inbox.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
@@ -14,6 +14,30 @@ interface Vm {
 
 contract EthReceiver {
     receive() external payable {}
+}
+
+contract ReentrantAutomaton {
+    Inbox public immutable inbox;
+    bool public attemptedReentry;
+    bool public blockedByGuard;
+
+    constructor(Inbox inbox_) {
+        inbox = inbox_;
+    }
+
+    function configureZeroMinPrices() external {
+        inbox.setMinPrices(0, 0);
+    }
+
+    receive() external payable {
+        if (!attemptedReentry) {
+            attemptedReentry = true;
+            try inbox.queueMessageEth(address(this), "reenter") {}
+            catch {
+                blockedByGuard = true;
+            }
+        }
+    }
 }
 
 contract InboxTest {
@@ -105,9 +129,7 @@ contract InboxTest {
         vm.prank(automaton);
         inbox.setMinPrices(3_000_000, 2_000_000_000_000_000);
 
-        vm.expectRevert(
-            abi.encodeWithSelector(Inbox.InsufficientUSDC.selector, uint256(2_999_999), uint256(3_000_000))
-        );
+        vm.expectRevert(abi.encodeWithSelector(Inbox.InsufficientUSDC.selector, uint256(2_999_999), uint256(3_000_000)));
         vm.prank(PAYER);
         inbox.queueMessage{value: 2_000_000_000_000_000}(automaton, "underfunded usdc", 2_999_999);
 
@@ -150,6 +172,24 @@ contract InboxTest {
         );
         vm.prank(PAYER);
         inbox.queueMessageEth{value: DEFAULT_ETH_MIN - 1}(automatonAddress, "underfunded eth only");
+    }
+
+    function test_ConstructorRejectsNonContractUsdcAddress() public {
+        vm.expectRevert(abi.encodeWithSelector(Inbox.InvalidTokenContract.selector, address(PAYER)));
+        new Inbox(PAYER);
+    }
+
+    function test_QueueMessageEthBlocksReentrancy() public {
+        ReentrantAutomaton automaton = new ReentrantAutomaton(inbox);
+        automaton.configureZeroMinPrices();
+
+        vm.prank(PAYER);
+        uint64 nonce = inbox.queueMessageEth{value: DEFAULT_ETH_MIN}(address(automaton), "trigger reentrancy");
+
+        _assertEq(uint256(nonce), 1, "outer call nonce mismatch");
+        _assertEq(uint256(inbox.nonces(address(automaton))), 1, "reentry should not increment nonce");
+        _assertTrue(automaton.attemptedReentry(), "reentry should be attempted");
+        _assertTrue(automaton.blockedByGuard(), "reentry should be blocked");
     }
 
     function _assertEq(uint256 lhs, uint256 rhs, string memory reason) private pure {
