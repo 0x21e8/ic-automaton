@@ -49,6 +49,13 @@ const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 /// Larger ranges risk hitting RPC node limits and very large response bodies.
 const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 
+/// Maximum recursive split depth used when retrying `eth_getLogs` after
+/// provider-side range rejections (for example HTTP 400).
+const MAX_GET_LOGS_SPLIT_DEPTH: u8 = 6;
+
+/// Maximum number of response bytes included in non-2xx HTTP error previews.
+const HTTP_ERROR_BODY_PREVIEW_BYTES: usize = 256;
+
 // Maximum number of decoded log events returned per poll; prevents unbounded memory use.
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
 
@@ -70,6 +77,13 @@ const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
 // Environment variable that switches the host (non-wasm32) RPC client from stub to real mode.
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_MODE_ENV: &str = "IC_AUTOMATON_EVM_RPC_HOST_MODE";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_EVM_RPC_STUB_FORCE_STATUS_ENV: &str = "IC_AUTOMATON_EVM_RPC_STUB_FORCE_STATUS";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_EVM_RPC_STUB_FORCE_BODY_ENV: &str = "IC_AUTOMATON_EVM_RPC_STUB_FORCE_BODY";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN_ENV: &str =
+    "IC_AUTOMATON_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN";
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum StrategyExecutionLogPriority {
@@ -427,45 +441,50 @@ impl HttpEvmRpcClient {
         topics_filter: Option<&[String]>,
         max_response_bytes: u64,
     ) -> Result<Vec<RpcLog>, String> {
-        let mut filter = serde_json::Map::new();
-        filter.insert(
-            "fromBlock".to_string(),
-            Value::String(format!("0x{from_block:x}")),
-        );
-        filter.insert(
-            "toBlock".to_string(),
-            Value::String(format!("0x{to_block:x}")),
-        );
-        if let Some(address) = address_filter {
-            filter.insert("address".to_string(), Value::String(address.to_string()));
-        }
-        if let Some(topics) = topics_filter {
-            filter.insert(
-                "topics".to_string(),
-                Value::Array(
-                    topics
-                        .iter()
-                        .map(|topic| Value::String(topic.clone()))
-                        .collect(),
-                ),
-            );
+        let mut pending_ranges = vec![(from_block, to_block, 0u8)];
+        let mut merged_logs = Vec::new();
+
+        while let Some((range_from, range_to, split_depth)) = pending_ranges.pop() {
+            let filter =
+                build_eth_get_logs_filter(range_from, range_to, address_filter, topics_filter);
+            let response = match self
+                .rpc_call(
+                    "eth_getLogs",
+                    Value::Array(vec![Value::Object(filter)]),
+                    max_response_bytes,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    if should_retry_eth_get_logs_with_smaller_range(
+                        &error,
+                        range_from,
+                        range_to,
+                        split_depth,
+                    ) {
+                        let mid = range_from.saturating_add((range_to - range_from) / 2);
+                        let next_depth = split_depth.saturating_add(1);
+                        pending_ranges.push((mid.saturating_add(1), range_to, next_depth));
+                        pending_ranges.push((range_from, mid, next_depth));
+                        continue;
+                    }
+                    return Err(format!(
+                        "eth_getLogs failed for range 0x{range_from:x}..0x{range_to:x}: {error}"
+                    ));
+                }
+            };
+
+            let raw_logs = response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| "eth_getLogs result was missing".to_string())?;
+            let mut logs = serde_json::from_value::<Vec<RpcLog>>(raw_logs)
+                .map_err(|error| format!("failed to decode eth_getLogs result: {error}"))?;
+            merged_logs.append(&mut logs);
         }
 
-        let response = self
-            .rpc_call(
-                "eth_getLogs",
-                Value::Array(vec![Value::Object(filter)]),
-                max_response_bytes,
-            )
-            .await
-            .map_err(|error| format!("eth_getLogs failed: {error}"))?;
-
-        let raw_logs = response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| "eth_getLogs result was missing".to_string())?;
-        serde_json::from_value::<Vec<RpcLog>>(raw_logs)
-            .map_err(|error| format!("failed to decode eth_getLogs result: {error}"))
+        Ok(merged_logs)
     }
 
     /// Query the ETH balance of `address` at the latest block.
@@ -640,7 +659,7 @@ impl HttpEvmRpcClient {
         let value: Value = serde_json::from_slice(&raw)
             .map_err(|error| format!("failed to parse {method} response JSON: {error}"))?;
         if let Some(error) = value.get("error") {
-            return Err(format!("rpc returned error for {method}: {error}"));
+            return Err(format_rpc_error(method, error));
         }
         Ok(value)
     }
@@ -693,7 +712,7 @@ impl HttpEvmRpcClient {
             .map_err(|error| format!("evm rpc outcall failed: {error}"))?;
         let status = nat_to_u16(&response.status)?;
         if !(200..300).contains(&status) {
-            return Err(format!("evm rpc returned status {status}"));
+            return Err(format_http_status_error(status, &response.body));
         }
         Ok(response.body)
     }
@@ -714,8 +733,13 @@ impl HttpEvmRpcClient {
             .set("content-type", "application/json")
             .send_bytes(body)
             .map_err(|error| match error {
-                ureq::Error::Status(status, _) => {
-                    format!("evm rpc returned status {status}")
+                ureq::Error::Status(status, response) => {
+                    let mut preview = Vec::new();
+                    let _ = response
+                        .into_reader()
+                        .take(HTTP_ERROR_BODY_PREVIEW_BYTES as u64)
+                        .read_to_end(&mut preview);
+                    format_http_status_error(status, &preview)
                 }
                 ureq::Error::Transport(transport) => {
                     format!("evm rpc host transport failed: {transport}")
@@ -735,6 +759,91 @@ impl HttpEvmRpcClient {
         }
         Ok(raw)
     }
+}
+
+fn build_eth_get_logs_filter(
+    from_block: u64,
+    to_block: u64,
+    address_filter: Option<&str>,
+    topics_filter: Option<&[String]>,
+) -> serde_json::Map<String, Value> {
+    let mut filter = serde_json::Map::new();
+    filter.insert(
+        "fromBlock".to_string(),
+        Value::String(format!("0x{from_block:x}")),
+    );
+    filter.insert(
+        "toBlock".to_string(),
+        Value::String(format!("0x{to_block:x}")),
+    );
+    if let Some(address) = address_filter {
+        filter.insert("address".to_string(), Value::String(address.to_string()));
+    }
+    if let Some(topics) = topics_filter {
+        filter.insert(
+            "topics".to_string(),
+            Value::Array(
+                topics
+                    .iter()
+                    .map(|topic| Value::String(topic.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    filter
+}
+
+fn should_retry_eth_get_logs_with_smaller_range(
+    error: &str,
+    from_block: u64,
+    to_block: u64,
+    split_depth: u8,
+) -> bool {
+    if split_depth >= MAX_GET_LOGS_SPLIT_DEPTH || from_block >= to_block {
+        return false;
+    }
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("status 400")
+        || normalized.contains("code=-32005")
+        || normalized.contains("too many results")
+        || normalized.contains("block range")
+        || normalized.contains("query returned more than")
+}
+
+fn format_rpc_error(method: &str, error: &Value) -> String {
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error.get("message").and_then(Value::as_str);
+    match (code, message) {
+        (Some(code), Some(message)) => {
+            format!("rpc returned error for {method}: code={code} message={message}")
+        }
+        (Some(code), None) => format!("rpc returned error for {method}: code={code}"),
+        _ => format!("rpc returned error for {method}: {error}"),
+    }
+}
+
+fn format_http_status_error(status: u16, body: &[u8]) -> String {
+    let preview = http_error_body_preview(body);
+    if preview.is_empty() {
+        return format!("evm rpc returned status {status}");
+    }
+    format!("evm rpc returned status {status}: {preview}")
+}
+
+fn http_error_body_preview(body: &[u8]) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    let preview_len = body.len().min(HTTP_ERROR_BODY_PREVIEW_BYTES);
+    let preview = String::from_utf8_lossy(&body[..preview_len]).replace(['\r', '\n'], " ");
+    let preview = preview.trim().to_string();
+    if preview.is_empty() {
+        return String::new();
+    }
+    if body.len() > preview_len {
+        return format!("{preview}...");
+    }
+    preview
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -807,6 +916,18 @@ pub fn classify_evm_failure(error: &str) -> RecoveryFailure {
 
 #[allow(dead_code)]
 fn classify_evm_outcall_failure_kind(normalized_error: &str) -> OutcallFailureKind {
+    if normalized_error.contains("code=-32011") {
+        return OutcallFailureKind::UpstreamUnavailable;
+    }
+    if normalized_error.contains("code=-32005") {
+        return OutcallFailureKind::RateLimited;
+    }
+    if normalized_error.contains("code=-32600")
+        || normalized_error.contains("code=-32601")
+        || normalized_error.contains("code=-32602")
+    {
+        return OutcallFailureKind::InvalidRequest;
+    }
     if normalized_error.contains("http body exceeds size limit")
         || normalized_error.contains("header size exceeds specified response size limit")
         || normalized_error.contains("response exceeded max_response_bytes")
@@ -906,6 +1027,12 @@ fn host_rpc_real_mode_enabled() -> bool {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
+    if let Some(status) = host_rpc_stub_forced_status_code() {
+        let forced_body = std::env::var(HOST_EVM_RPC_STUB_FORCE_BODY_ENV)
+            .unwrap_or_else(|_| "forced host rpc stub error".to_string());
+        return Err(format_http_status_error(status, forced_body.as_bytes()));
+    }
+
     let request: Value = serde_json::from_slice(body)
         .map_err(|error| format!("host rpc stub could not parse request JSON: {error}"))?;
     let method = request
@@ -915,7 +1042,7 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
 
     let response = match method {
         "eth_blockNumber" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
-        "eth_getLogs" => json!({"jsonrpc":"2.0","id":1,"result":[]}),
+        "eth_getLogs" => host_rpc_stub_eth_get_logs_result(&request)?,
         "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
         "eth_call" => host_rpc_stub_eth_call_result(&request),
         "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
@@ -935,6 +1062,48 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
 
     serde_json::to_vec(&response)
         .map_err(|error| format!("host rpc stub failed to serialize response: {error}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_stub_forced_status_code() -> Option<u16> {
+    std::env::var(HOST_EVM_RPC_STUB_FORCE_STATUS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_stub_max_log_block_span() -> Option<u64> {
+    std::env::var(HOST_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_stub_eth_get_logs_result(request: &Value) -> Result<Value, String> {
+    if let Some(max_span) = host_rpc_stub_max_log_block_span() {
+        let from_block = request
+            .pointer("/params/0/fromBlock")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "host rpc stub eth_getLogs missing fromBlock".to_string())?;
+        let to_block = request
+            .pointer("/params/0/toBlock")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "host rpc stub eth_getLogs missing toBlock".to_string())?;
+        let from = parse_hex_u64(from_block, "host stub fromBlock")?;
+        let to = parse_hex_u64(to_block, "host stub toBlock")?;
+        let span = to.saturating_sub(from).saturating_add(1);
+        if span > max_span {
+            return Err(format_http_status_error(
+                400,
+                format!(
+                    "{{\"error\":\"eth_getLogs requested span {span} exceeds max {max_span}\"}}"
+                )
+                .as_bytes(),
+            ));
+        }
+    }
+
+    Ok(json!({"jsonrpc":"2.0","id":1,"result":[]}))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1903,7 +2072,7 @@ mod tests {
     use std::path::PathBuf;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::process::{Child, Command, Stdio};
-    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
+    #[cfg(not(target_arch = "wasm32"))]
     use std::sync::{Mutex, OnceLock};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
@@ -1936,6 +2105,39 @@ mod tests {
         }
 
         panic!("future did not complete in test polling loop");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn host_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = host_env_lock()
+            .lock()
+            .expect("host env lock should not be poisoned");
+        let previous = vars
+            .iter()
+            .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+
+        for (name, value) in vars {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        f();
+
+        for (name, value) in previous {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     #[test]
@@ -2337,6 +2539,88 @@ mod tests {
                 retry_after_secs: None,
                 observed_response_bytes: None,
             })
+        );
+    }
+
+    #[test]
+    fn classify_evm_failure_maps_rpc_error_codes() {
+        let rate_limited = classify_evm_failure(
+            "rpc returned error for eth_getLogs: code=-32005 message=query returned more than 10000 results",
+        );
+        assert_eq!(
+            rate_limited,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::RateLimited,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
+
+        let unavailable = classify_evm_failure(
+            "rpc returned error for eth_getLogs: code=-32011 message=backend unhealthy",
+        );
+        assert_eq!(
+            unavailable,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::UpstreamUnavailable,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn eth_get_logs_retries_with_smaller_ranges_on_status_400() {
+        with_host_stub_env(
+            &[(HOST_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN_ENV, Some("100"))],
+            || {
+                let snapshot = RuntimeSnapshot {
+                    evm_rpc_url: "https://base.publicnode.com".to_string(),
+                    evm_rpc_max_response_bytes: 65_536,
+                    ..RuntimeSnapshot::default()
+                };
+                let rpc =
+                    HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should build");
+
+                let logs = block_on_with_spin(rpc.eth_get_logs(
+                    1_000,
+                    1_400,
+                    None,
+                    None,
+                    snapshot.evm_rpc_max_response_bytes,
+                ))
+                .expect("eth_getLogs should adapt by splitting range");
+
+                assert!(logs.is_empty());
+            },
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn rpc_errors_include_http_status_body_preview() {
+        with_host_stub_env(
+            &[
+                (HOST_EVM_RPC_STUB_FORCE_STATUS_ENV, Some("400")),
+                (
+                    HOST_EVM_RPC_STUB_FORCE_BODY_ENV,
+                    Some("provider says invalid"),
+                ),
+            ],
+            || {
+                let snapshot = RuntimeSnapshot {
+                    evm_rpc_url: "https://base.publicnode.com".to_string(),
+                    ..RuntimeSnapshot::default()
+                };
+                let rpc =
+                    HttpEvmRpcClient::from_snapshot(&snapshot).expect("rpc client should build");
+
+                let error =
+                    block_on_with_spin(rpc.eth_block_number()).expect_err("rpc should fail");
+                assert!(error.contains("evm rpc returned status 400"));
+                assert!(error.contains("provider says invalid"));
+            },
         );
     }
 

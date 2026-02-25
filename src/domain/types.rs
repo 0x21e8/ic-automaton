@@ -1825,7 +1825,7 @@ fn default_openrouter_max_response_bytes() -> u64 {
 }
 
 fn default_evm_rpc_url() -> String {
-    "https://mainnet.base.org".to_string()
+    "https://base.publicnode.com".to_string()
 }
 
 fn default_evm_rpc_max_response_bytes() -> u64 {

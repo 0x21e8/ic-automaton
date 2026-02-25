@@ -7931,10 +7931,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_snapshot_uses_mainnet_base_as_default_evm_rpc_url() {
+    fn runtime_snapshot_uses_publicnode_as_default_evm_rpc_url() {
         init_storage();
         let snapshot = runtime_snapshot();
-        assert_eq!(snapshot.evm_rpc_url, "https://mainnet.base.org");
+        assert_eq!(snapshot.evm_rpc_url, "https://base.publicnode.com");
         assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 1_000);
     }
 
