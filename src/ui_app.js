@@ -357,19 +357,241 @@ async function loadEvmConfig() {
 }
 
 // =============================================================================
-// VIEM (Phase 2 reads; Phase 3 wallet)
+// EVM CLIENT COMPAT (Phase 2 reads; Phase 3 wallet)
 // =============================================================================
+
+const EVM_FN = {
+  minPricesFor:   { selector: "0x2bf589a9", argTypes: ["address"] },
+  queueMessage:   { selector: "0xdc0a1b6a", argTypes: ["address", "string", "uint256"] },
+  queueMessageEth:{ selector: "0x9f1b19ac", argTypes: ["address", "string"] },
+  approve:        { selector: "0x095ea7b3", argTypes: ["address", "uint256"] },
+  allowance:      { selector: "0xdd62ed3e", argTypes: ["address", "address"] },
+  transfer:       { selector: "0xa9059cbb", argTypes: ["address", "uint256"] },
+  decimals:       { selector: "0x313ce567", argTypes: [] },
+};
 
 let _viemModule = null;
 
+function strip0x(value) {
+  return String(value ?? "").replace(/^0x/i, "");
+}
+
+function padWord(hexNoPrefix) {
+  if (hexNoPrefix.length > 64) throw new Error("ABI word too large.");
+  return hexNoPrefix.padStart(64, "0");
+}
+
+function encodeUint256Word(value) {
+  return padWord(BigInt(value).toString(16));
+}
+
+function encodeAddressWord(value) {
+  const clean = strip0x(value).toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(clean)) throw new Error(`Invalid address: ${value}`);
+  return padWord(clean);
+}
+
+function hexBytes(bytes) {
+  let out = "";
+  for (const b of bytes) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
+function encodeStringWords(value) {
+  const bytes = new TextEncoder().encode(String(value ?? ""));
+  const words = [encodeUint256Word(BigInt(bytes.length))];
+  if (bytes.length === 0) return words;
+  const payload = hexBytes(bytes);
+  const paddedLength = Math.ceil(bytes.length / 32) * 64;
+  const paddedPayload = payload.padEnd(paddedLength, "0");
+  for (let i = 0; i < paddedPayload.length; i += 64) {
+    words.push(paddedPayload.slice(i, i + 64));
+  }
+  return words;
+}
+
+function encodeAbiArgs(argTypes, args) {
+  if (argTypes.length !== args.length) {
+    throw new Error(`ABI argument mismatch: expected ${argTypes.length}, got ${args.length}`);
+  }
+
+  const head = new Array(argTypes.length);
+  const tail = [];
+  let dynamicOffsetBytes = argTypes.length * 32;
+
+  for (let i = 0; i < argTypes.length; i += 1) {
+    const type = argTypes[i];
+    const value = args[i];
+    if (type === "address") {
+      head[i] = encodeAddressWord(value);
+    } else if (type === "uint256") {
+      head[i] = encodeUint256Word(value);
+    } else if (type === "string") {
+      const stringWords = encodeStringWords(value);
+      head[i] = encodeUint256Word(BigInt(dynamicOffsetBytes));
+      tail.push(...stringWords);
+      dynamicOffsetBytes += stringWords.length * 32;
+    } else {
+      throw new Error(`Unsupported ABI type: ${type}`);
+    }
+  }
+
+  return head.join("") + tail.join("");
+}
+
+function encodeFunctionData(functionName, args = []) {
+  const meta = EVM_FN[functionName];
+  if (!meta) throw new Error(`Unsupported function: ${functionName}`);
+  return `${meta.selector}${encodeAbiArgs(meta.argTypes, args)}`;
+}
+
+function decodeWord(dataHex, index) {
+  const clean = strip0x(dataHex);
+  const start = index * 64;
+  const end = start + 64;
+  if (clean.length < end) throw new Error("Invalid ABI response payload.");
+  return clean.slice(start, end);
+}
+
+function decodeUint256(dataHex, index = 0) {
+  return BigInt(`0x${decodeWord(dataHex, index)}`);
+}
+
+function decodeBool(dataHex, index = 0) {
+  return decodeUint256(dataHex, index) !== 0n;
+}
+
+function decodeReadResult(functionName, payload) {
+  if (!payload || payload === "0x") throw new Error(`Empty response for ${functionName}.`);
+  if (functionName === "minPricesFor") {
+    return [decodeUint256(payload, 0), decodeUint256(payload, 1), decodeBool(payload, 2)];
+  }
+  if (functionName === "allowance") {
+    return decodeUint256(payload, 0);
+  }
+  if (functionName === "decimals") {
+    return Number(decodeUint256(payload, 0));
+  }
+  return decodeUint256(payload, 0);
+}
+
+function toRpcHexQuantity(value) {
+  if (typeof value === "string") {
+    const clean = strip0x(value).replace(/^0+/, "");
+    return `0x${clean || "0"}`;
+  }
+  const hex = BigInt(value ?? 0).toString(16);
+  return `0x${hex || "0"}`;
+}
+
+async function rpcCall(url, method, params = []) {
+  if (!url) throw new Error("Missing EVM RPC URL.");
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method,
+      params,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`RPC request failed (${response.status}).`);
+  }
+  const payload = await response.json();
+  if (payload.error) {
+    throw new Error(payload.error.message || `${method} failed`);
+  }
+  return payload.result;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createFallbackViem() {
+  return {
+    http(url) {
+      return { url };
+    },
+    custom(provider) {
+      return { provider };
+    },
+    parseAbi(entries) {
+      return entries;
+    },
+    parseEther(value) {
+      const parsed = parseDecimalAmount(value, 18);
+      if (parsed === null) throw new Error(`Invalid ETH amount: '${value}'`);
+      return parsed;
+    },
+    createPublicClient({ transport }) {
+      const rpcUrl = transport?.url;
+      if (!rpcUrl) throw new Error("Public client transport URL missing.");
+      return {
+        async readContract({ address, functionName, args = [] }) {
+          const data = encodeFunctionData(functionName, args);
+          const result = await rpcCall(rpcUrl, "eth_call", [{ to: address, data }, "latest"]);
+          return decodeReadResult(functionName, result);
+        },
+        async waitForTransactionReceipt({ hash, timeoutMs = 120000, pollIntervalMs = 1500 }) {
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            const receipt = await rpcCall(rpcUrl, "eth_getTransactionReceipt", [hash]);
+            if (receipt) {
+              return {
+                status: receipt.status === "0x1" ? "success" : "reverted",
+                blockNumber: receipt.blockNumber ? Number(BigInt(receipt.blockNumber)) : null,
+              };
+            }
+            await delay(pollIntervalMs);
+          }
+          throw new Error("Transaction confirmation timed out.");
+        },
+      };
+    },
+    createWalletClient({ transport }) {
+      const provider = transport?.provider;
+      if (!provider?.request) throw new Error("Wallet provider is unavailable.");
+      return {
+        async requestAddresses() {
+          return provider.request({ method: "eth_requestAccounts" });
+        },
+        async getChainId() {
+          const chainIdHex = await provider.request({ method: "eth_chainId" });
+          return parseInt(chainIdHex, 16);
+        },
+        async sendTransaction({ to, value = 0n, account, data }) {
+          const tx = {
+            from: account,
+            to,
+            value: toRpcHexQuantity(value),
+          };
+          if (data) tx.data = data;
+          return provider.request({
+            method: "eth_sendTransaction",
+            params: [tx],
+          });
+        },
+        async writeContract({ address, functionName, args = [], value = 0n, account }) {
+          const data = encodeFunctionData(functionName, args);
+          return this.sendTransaction({
+            to: address,
+            value,
+            account,
+            data,
+          });
+        },
+      };
+    },
+  };
+}
+
 async function ensureViem() {
   if (_viemModule) return _viemModule;
-  try {
-    _viemModule = await import("viem");
-    return _viemModule;
-  } catch {
-    return null;
-  }
+  _viemModule = createFallbackViem();
+  return _viemModule;
 }
 
 async function ensurePublicClient() {
@@ -573,6 +795,7 @@ function createStatusViewLines() {
   printLine("AUTOMATON STATUS", "system bright");
   printSeparator();
   lines.runtimeState = printLine("  STATE:           --", "system");
+  lines.runtimeSoul = printLine("  SOUL:            --", "system");
   lines.runtimeTurns = printLine("  TURNS:           --", "system");
   lines.runtimeLoop = printLine("  LOOP:            --", "system");
   lines.runtimeTransition = printLine("  LAST TRANSITION: --", "system");
@@ -1042,7 +1265,7 @@ async function cmdPrice() {
   const viem = await ensureViem();
   if (!viem) {
     spinner.stop(
-      "ERROR: viem not available (CDN unreachable). Price query requires contract read.",
+      "ERROR: EVM client unavailable. Price query requires contract read.",
       "error"
     );
     printEmpty();
@@ -1160,7 +1383,7 @@ async function cmdConnect() {
 
   const viem = await ensureViem();
   if (!viem) {
-    printError("viem not available (CDN unreachable). Cannot connect wallet.");
+    printError("EVM client unavailable. Cannot connect wallet.");
     printEmpty();
     return;
   }
@@ -1464,7 +1687,7 @@ async function cmdSend(args, flags) {
   const useUsdc = flags.has("usdc");
   const viem = await ensureViem();
   if (!viem) {
-    printError("viem not available (CDN unreachable).");
+    printError("EVM client unavailable.");
     printEmpty();
     return;
   }
@@ -1658,7 +1881,7 @@ async function cmdDonate(positional, flags) {
   const useUsdc = flags.has("usdc");
   const viem = await ensureViem();
   if (!viem) {
-    printError("viem not available (CDN unreachable).");
+    printError("EVM client unavailable.");
     printEmpty();
     return;
   }
