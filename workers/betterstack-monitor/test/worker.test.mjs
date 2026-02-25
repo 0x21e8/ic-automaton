@@ -147,3 +147,41 @@ test('extractLogEvents emits health log when enabled and no errors found', () =>
   assert.equal(events[0].level, 'info');
   assert.equal(events[0].category, 'health_heartbeat');
 });
+
+test('extractLogEvents includes survival operation details for survival-policy blocks', () => {
+  const snapshot = {
+    runtime: { last_error: null },
+    scheduler: { last_tick_error: null },
+    recent_jobs: [
+      {
+        id: 'job-1',
+        kind: 'PollInbox',
+        status: 'Skipped',
+        last_error: 'operation blocked by survival policy',
+        attempts: 2,
+      },
+      {
+        id: 'job-2',
+        kind: 'AgentTurn',
+        status: 'Skipped',
+        last_error: 'operation blocked by survival policy (operation=Inference)',
+        attempts: 1,
+      },
+    ],
+    recent_turns: [],
+    recent_transitions: [],
+  };
+
+  const events = extractLogEvents(snapshot, {
+    canisterBaseUrl: 'https://abcde-aaaaa-aaaab-qaxuq-cai.icp0.io',
+    trigger: 'scheduled',
+    emitHealthLog: false,
+  });
+
+  assert.equal(events.length, 2);
+  assert.equal(events[0].survival_policy_blocked, true);
+  assert.equal(events[0].survival_operation, 'evm_poll');
+  assert.equal(events[0].message, 'operation blocked by survival policy (operation=evm_poll)');
+  assert.equal(events[1].survival_policy_blocked, true);
+  assert.equal(events[1].survival_operation, 'inference');
+});

@@ -115,6 +115,37 @@ struct EvmConfigView {
     rpc_url: String,
 }
 
+/// Returns a public-safe RPC endpoint string for open HTTP views.
+///
+/// Keeps only `scheme://host[:port]` (or bare `host[:port]` if no scheme),
+/// stripping user-info, path, query, and fragment components so API keys and
+/// tokens embedded in the URL are never exposed.
+fn redact_public_rpc_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let (scheme, remainder) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, trimmed),
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, value)| value)
+        .unwrap_or(authority)
+        .trim();
+    if host_port.is_empty() {
+        return String::new();
+    }
+
+    match scheme {
+        Some(value) if !value.is_empty() => format!("{value}://{host_port}"),
+        _ => host_port.to_string(),
+    }
+}
+
 fn evm_config_view() -> EvmConfigView {
     let route = stable::evm_route_state_view();
     EvmConfigView {
@@ -122,7 +153,7 @@ fn evm_config_view() -> EvmConfigView {
         inbox_contract_address: route.inbox_contract_address,
         usdc_address: stable::get_discovered_usdc_address(),
         chain_id: route.chain_id,
-        rpc_url: stable::get_evm_rpc_url(),
+        rpc_url: redact_public_rpc_url(&stable::get_evm_rpc_url()),
     }
 }
 
@@ -776,6 +807,10 @@ mod tests {
     #[test]
     fn get_evm_config_returns_expected_fields() {
         stable::init_storage();
+        stable::set_evm_rpc_url(
+            "https://base-mainnet.g.alchemy.com/v2/secret-api-key?foo=bar".to_string(),
+        )
+        .expect("rpc url should store");
         stable::set_evm_address(Some(
             "0x1111111111111111111111111111111111111111".to_string(),
         ))
@@ -807,10 +842,14 @@ mod tests {
             body.get("chain_id").and_then(serde_json::Value::as_u64),
             Some(31337)
         );
-        assert!(body
+        let rpc_url = body
             .get("rpc_url")
             .and_then(serde_json::Value::as_str)
-            .is_some());
+            .expect("rpc_url should be present");
+        assert_eq!(rpc_url, "https://base-mainnet.g.alchemy.com");
+        assert!(!rpc_url.contains("secret-api-key"));
+        assert!(!rpc_url.contains("/v2/"));
+        assert!(!rpc_url.contains('?'));
     }
 
     #[test]

@@ -280,6 +280,27 @@ function formatMb(mb) {
   return `${Number(mb).toFixed(2)} MB`;
 }
 
+function sanitizeRpcUrlForDisplay(raw) {
+  if (typeof raw !== "string") return "unknown";
+  const trimmed = raw.trim();
+  if (!trimmed) return "unknown";
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol && parsed.host) {
+      return `${parsed.protocol}//${parsed.host}`;
+    }
+  } catch (_) {
+    // Fall through to conservative string parsing.
+  }
+
+  const withoutScheme = trimmed.includes("://") ? trimmed.split("://", 2)[1] : trimmed;
+  const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? "";
+  const host = authority.includes("@") ? authority.split("@").pop() : authority;
+  if (!host) return "unknown";
+  return trimmed.includes("://") ? `${trimmed.split("://", 2)[0]}://${host}` : host;
+}
+
 // =============================================================================
 // BOOT SEQUENCE
 // =============================================================================
@@ -552,7 +573,6 @@ function createStatusViewLines() {
   printLine("AUTOMATON STATUS", "system bright");
   printSeparator();
   lines.runtimeState = printLine("  STATE:           --", "system");
-  lines.runtimeSoul = printLine("  SOUL:            --", "system");
   lines.runtimeTurns = printLine("  TURNS:           --", "system");
   lines.runtimeLoop = printLine("  LOOP:            --", "system");
   lines.runtimeTransition = printLine("  LAST TRANSITION: --", "system");
@@ -752,7 +772,7 @@ async function cmdConfig() {
   printLine("EVM", "system bright");
   printSeparator();
   printLine(`  CHAIN ID:                 ${evmConfig?.chain_id ?? "unknown"}`, "system");
-  printLine(`  RPC URL:                  ${evmConfig?.rpc_url ?? "unknown"}`, "system");
+  printLine(`  RPC URL:                  ${sanitizeRpcUrlForDisplay(evmConfig?.rpc_url)}`, "system");
   printLine(`  AUTOMATON ADDRESS:        ${evmConfig?.automaton_address ?? "not configured"}`, "system");
   printLine(
     `  INBOX CONTRACT:           ${evmConfig?.inbox_contract_address ?? "not configured"}`,

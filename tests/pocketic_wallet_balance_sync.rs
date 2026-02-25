@@ -413,11 +413,11 @@ fn wallet_rpc_response(
 
     let reject_oversized = matches!(mode, WalletRpcMode::RejectOversizedUntilTuned)
         && matches!(method.as_str(), "eth_getBalance" | "eth_call")
-        && max_response_bytes <= 256;
+        && max_response_bytes <= 1_024;
     if reject_oversized {
         return CanisterHttpResponse::CanisterHttpReject(CanisterHttpReject {
             reject_code: 1,
-            message: "Http body exceeds size limit of 256 bytes.".to_string(),
+            message: "Header size exceeds specified response size limit 1024".to_string(),
         });
     }
 
@@ -690,12 +690,12 @@ fn wallet_sync_oversized_outcall_tunes_response_limit_and_recovers_without_manua
     set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
 
     let before = get_wallet_balance_sync_config(&pic, canister_id);
-    assert_eq!(before.max_response_bytes, 256);
+    assert_eq!(before.max_response_bytes, 1_024);
 
     advance_and_run_due_poll_inbox(&pic, canister_id, WalletRpcMode::RejectOversizedUntilTuned);
 
     let after = get_wallet_balance_sync_config(&pic, canister_id);
-    assert_eq!(after.max_response_bytes, 512);
+    assert_eq!(after.max_response_bytes, 2_048);
 
     let synced = get_wallet_balance_telemetry(&pic, canister_id);
     assert!(!synced.bootstrap_pending);
@@ -733,7 +733,7 @@ fn wallet_sync_oversized_outcall_tunes_response_limit_and_recovers_without_manua
     );
     let stable_config = get_wallet_balance_sync_config(&pic, canister_id);
     assert_eq!(
-        stable_config.max_response_bytes, 512,
+        stable_config.max_response_bytes, 2_048,
         "response limit should stay tuned without additional manual intervention"
     );
 }

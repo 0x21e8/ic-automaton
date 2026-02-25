@@ -47,6 +47,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 // ── Initialization ──────────────────────────────────────────────────────────
+const WALLET_SYNC_RESPONSE_BYTES_FLOOR: u64 = 1_024;
 
 /// Arguments supplied once at canister creation via `dfx deploy --argument`.
 #[derive(CandidType, Deserialize)]
@@ -216,8 +217,17 @@ fn apply_init_args(args: InitArgs) {
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
     stable::init_storage();
+    enforce_wallet_sync_response_bytes_floor();
     crate::http::init_certification();
     arm_timer();
+}
+
+fn enforce_wallet_sync_response_bytes_floor() {
+    let mut snapshot = stable::runtime_snapshot();
+    if snapshot.wallet_balance_sync.max_response_bytes < WALLET_SYNC_RESPONSE_BYTES_FLOOR {
+        snapshot.wallet_balance_sync.max_response_bytes = WALLET_SYNC_RESPONSE_BYTES_FLOOR;
+        stable::save_runtime_snapshot(&snapshot);
+    }
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -836,6 +846,22 @@ mod tests {
 
         let snapshot = stable::runtime_snapshot();
         assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 0);
+    }
+
+    #[test]
+    fn enforce_wallet_sync_response_bytes_floor_raises_low_values() {
+        stable::init_storage();
+        let mut snapshot = stable::runtime_snapshot();
+        snapshot.wallet_balance_sync.max_response_bytes = 512;
+        stable::save_runtime_snapshot(&snapshot);
+
+        enforce_wallet_sync_response_bytes_floor();
+
+        let upgraded = stable::runtime_snapshot();
+        assert_eq!(
+            upgraded.wallet_balance_sync.max_response_bytes,
+            WALLET_SYNC_RESPONSE_BYTES_FLOOR
+        );
     }
 
     fn sample_strategy_key() -> StrategyTemplateKey {

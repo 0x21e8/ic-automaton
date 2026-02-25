@@ -1869,7 +1869,7 @@ fn default_strategy_gas_buffer_bps() -> u16 {
 }
 
 fn default_wallet_balance_sync_max_response_bytes() -> u64 {
-    256
+    1_024
 }
 
 fn default_wallet_balance_sync_discover_usdc_via_inbox() -> bool {
@@ -2003,7 +2003,7 @@ mod tests {
         assert_eq!(config.normal_interval_secs, 300);
         assert_eq!(config.low_cycles_interval_secs, 900);
         assert_eq!(config.freshness_window_secs, 600);
-        assert_eq!(config.max_response_bytes, 256);
+        assert_eq!(config.max_response_bytes, 1_024);
         assert!(config.discover_usdc_via_inbox);
 
         let snapshot = WalletBalanceSnapshot::default();

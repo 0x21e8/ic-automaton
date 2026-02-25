@@ -240,11 +240,14 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
 
     if let Some(operation_class) = operation_class_for_task(&job.kind) {
         if !stable::can_run_survival_operation(&operation_class, now_ns) {
-            let reason = "operation blocked by survival policy";
+            let reason = format!(
+                "operation blocked by survival policy (operation={:?})",
+                operation_class
+            );
             stable::complete_job(
                 &job.id,
                 JobStatus::Skipped,
-                Some(reason.to_string()),
+                Some(reason.clone()),
                 current_time_ns(),
                 None,
             );

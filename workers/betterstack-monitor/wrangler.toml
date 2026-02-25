@@ -8,7 +8,7 @@ crons = ["*/1 * * * *"]
 
 [vars]
 # Example: "https://<canister-id>.icp0.io"
-CANISTER_BASE_URL = ""
+CANISTER_BASE_URL = "https://oc3hk-viaaa-aaaak-qxcuq-cai.icp0.io"
 # Example: "s123456.eu-nbg-2.betterstackdata.com"
 BETTERSTACK_INGESTING_HOST = "s1761427.eu-fsn-3.betterstackdata.com"
 # Optional, defaults to "/api/snapshot"

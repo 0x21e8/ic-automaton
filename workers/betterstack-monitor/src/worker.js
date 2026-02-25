@@ -82,6 +82,39 @@ function nonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function toSnakeCase(raw) {
+  return String(raw ?? '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[\s-]+/g, '_')
+    .toLowerCase();
+}
+
+function inferSurvivalOperationFromJobKind(jobKind) {
+  switch (String(jobKind ?? '').trim()) {
+    case 'PollInbox':
+      return 'evm_poll';
+    case 'AgentTurn':
+      return 'inference';
+    default:
+      return null;
+  }
+}
+
+function extractSurvivalOperation(message, jobKind) {
+  if (!nonEmptyString(message)) {
+    return null;
+  }
+  const match = message.match(/\boperation\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\b/);
+  if (match) {
+    return toSnakeCase(match[1]);
+  }
+  if (message.toLowerCase().includes('blocked by survival policy')) {
+    return inferSurvivalOperationFromJobKind(jobKind);
+  }
+  return null;
+}
+
 function baseEvent(level, category, message, context) {
   return {
     dt: new Date().toISOString(),
@@ -138,12 +171,21 @@ export function extractLogEvents(snapshot, options) {
     if (!hasError && !failedStatus) {
       continue;
     }
+    const rawMessage = hasError
+      ? job.last_error
+      : `job ${job?.id ?? 'unknown'} has status ${job?.status ?? 'unknown'}`;
+    const survivalOperation = extractSurvivalOperation(rawMessage, job?.kind);
+    const survivalBlocked = rawMessage.toLowerCase().includes('blocked by survival policy');
+    const message =
+      survivalBlocked && survivalOperation && !/\boperation\s*=/.test(rawMessage)
+        ? `${rawMessage} (operation=${survivalOperation})`
+        : rawMessage;
 
     events.push(
       baseEvent(
         'error',
         'recent_job_error',
-        hasError ? job.last_error : `job ${job?.id ?? 'unknown'} has status ${job?.status ?? 'unknown'}`,
+        message,
         {
           source: 'ic-automaton-monitor',
           trigger,
@@ -152,6 +194,8 @@ export function extractLogEvents(snapshot, options) {
           job_kind: job?.kind ?? null,
           job_status: job?.status ?? null,
           job_attempts: job?.attempts ?? null,
+          survival_policy_blocked: survivalBlocked,
+          survival_operation: survivalOperation,
         },
       ),
     );

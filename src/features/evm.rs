@@ -808,6 +808,7 @@ pub fn classify_evm_failure(error: &str) -> RecoveryFailure {
 #[allow(dead_code)]
 fn classify_evm_outcall_failure_kind(normalized_error: &str) -> OutcallFailureKind {
     if normalized_error.contains("http body exceeds size limit")
+        || normalized_error.contains("header size exceeds specified response size limit")
         || normalized_error.contains("response exceeded max_response_bytes")
         || (normalized_error.contains("max_response_bytes") && normalized_error.contains("exceed"))
     {
@@ -2289,7 +2290,7 @@ mod tests {
 
     #[test]
     fn classify_evm_failure_maps_response_too_large_errors() {
-        let failure = classify_evm_failure("HTTP body exceeds size limit");
+        let failure = classify_evm_failure("Header size exceeds specified response size limit");
         assert_eq!(
             failure,
             crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {

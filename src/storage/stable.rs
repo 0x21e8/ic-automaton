@@ -7962,7 +7962,7 @@ mod tests {
         assert_eq!(loaded.wallet_balance_sync.normal_interval_secs, 300);
         assert_eq!(loaded.wallet_balance_sync.low_cycles_interval_secs, 900);
         assert_eq!(loaded.wallet_balance_sync.freshness_window_secs, 600);
-        assert_eq!(loaded.wallet_balance_sync.max_response_bytes, 256);
+        assert_eq!(loaded.wallet_balance_sync.max_response_bytes, 1_024);
         assert!(loaded.wallet_balance_bootstrap_pending);
         assert_eq!(loaded.evm_bootstrap_lookback_blocks, 1_000);
         assert_eq!(loaded.timing_telemetry.turns_over_budget, 0);
