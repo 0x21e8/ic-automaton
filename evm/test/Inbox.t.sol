@@ -192,6 +192,18 @@ contract InboxTest {
         _assertTrue(automaton.blockedByGuard(), "reentry should be blocked");
     }
 
+    function test_SetMinPricesRejectsValuesThatExceedPackedRange() public {
+        uint256 aboveMax = uint256(type(uint112).max) + 1;
+
+        vm.expectRevert(abi.encodeWithSelector(Inbox.MinPriceTooLarge.selector));
+        vm.prank(AUTOMATON);
+        inbox.setMinPrices(aboveMax, 1);
+
+        vm.expectRevert(abi.encodeWithSelector(Inbox.MinPriceTooLarge.selector));
+        vm.prank(AUTOMATON);
+        inbox.setMinPrices(1, aboveMax);
+    }
+
     function _assertEq(uint256 lhs, uint256 rhs, string memory reason) private pure {
         require(lhs == rhs, reason);
     }

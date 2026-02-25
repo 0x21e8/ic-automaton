@@ -35,6 +35,8 @@ contract Inbox {
     error TransferFailed();
     /// @notice Raised when a reentrant call is attempted.
     error ReentrancyBlocked();
+    /// @notice Raised when min-price input cannot fit into packed storage.
+    error MinPriceTooLarge();
 
     /// @notice Hard cap for message body length.
     uint256 public constant MAX_MESSAGE_LENGTH = 4_096; // mirrors MAX_INBOX_BODY_CHARS in the backend
@@ -43,19 +45,14 @@ contract Inbox {
     /// @notice Default minimum ETH required by both queue paths.
     uint256 public constant DEFAULT_MIN_ETH_WEI = 500_000_000_000_000; // 0.0005 ETH
 
-    /// @dev Reentrancy status value when no protected function is executing.
-    uint256 private constant _NOT_ENTERED = 1;
-    /// @dev Reentrancy status value while executing a protected function.
-    uint256 private constant _ENTERED = 2;
-
     /// @notice ERC-20 token used for USDC path payments.
     IERC20 public immutable usdc;
-    uint256 private _reentrancyStatus;
+    bytes32 private constant _REENTRANCY_SLOT = keccak256("ic-automaton.inbox.reentrancy.lock");
 
     /// @notice Per-automaton minimum payment configuration.
     struct MinPrices {
-        uint256 usdcMin;
-        uint256 ethMinWei;
+        uint112 usdcMin;
+        uint112 ethMinWei;
         bool isCustom;
     }
 
@@ -82,17 +79,25 @@ contract Inbox {
         if (usdcToken.code.length == 0) revert InvalidTokenContract(usdcToken);
 
         usdc = IERC20(usdcToken);
-        _reentrancyStatus = _NOT_ENTERED;
     }
 
     /// @notice Prevents nested (reentrant) entry into guarded functions.
-    /// @dev Lightweight local guard equivalent to OpenZeppelin's `nonReentrant` modifier.
+    /// @dev Uses Cancun transient storage (`tload`/`tstore`) to avoid persistent SSTORE overhead.
     modifier nonReentrant() {
-        if (_reentrancyStatus == _ENTERED) revert ReentrancyBlocked();
+        bytes32 lockSlot = _REENTRANCY_SLOT;
+        uint256 entered;
+        assembly ("memory-safe") {
+            entered := tload(lockSlot)
+        }
+        if (entered != 0) revert ReentrancyBlocked();
 
-        _reentrancyStatus = _ENTERED;
+        assembly ("memory-safe") {
+            tstore(lockSlot, 1)
+        }
         _;
-        _reentrancyStatus = _NOT_ENTERED;
+        assembly ("memory-safe") {
+            tstore(lockSlot, 0)
+        }
     }
 
     /// @notice Sets custom minimum prices for the caller's automaton address.
@@ -100,7 +105,9 @@ contract Inbox {
     /// @param usdcMin Minimum USDC required for `queueMessage`.
     /// @param ethMinWei Minimum ETH required for both queue paths.
     function setMinPrices(uint256 usdcMin, uint256 ethMinWei) external {
-        _minPricesByAutomaton[msg.sender] = MinPrices({usdcMin: usdcMin, ethMinWei: ethMinWei, isCustom: true});
+        if (usdcMin > type(uint112).max || ethMinWei > type(uint112).max) revert MinPriceTooLarge();
+        _minPricesByAutomaton[msg.sender] =
+            MinPrices({usdcMin: uint112(usdcMin), ethMinWei: uint112(ethMinWei), isCustom: true});
         emit MinPricesUpdated(msg.sender, usdcMin, ethMinWei);
     }
 
@@ -115,7 +122,7 @@ contract Inbox {
             return (DEFAULT_MIN_USDC, DEFAULT_MIN_ETH_WEI, true);
         }
 
-        return (prices.usdcMin, prices.ethMinWei, false);
+        return (uint256(prices.usdcMin), uint256(prices.ethMinWei), false);
     }
 
     /**
@@ -131,12 +138,18 @@ contract Inbox {
         if (automaton == address(0)) revert InvalidAddress();
         if (messageLength > MAX_MESSAGE_LENGTH) revert MessageTooLong(messageLength, MAX_MESSAGE_LENGTH);
 
-        (uint256 minUsdc, uint256 minEthWei,) = minPricesFor(automaton);
+        MinPrices storage prices = _minPricesByAutomaton[automaton];
+        uint256 minUsdc = prices.isCustom ? uint256(prices.usdcMin) : DEFAULT_MIN_USDC;
+        uint256 minEthWei = prices.isCustom ? uint256(prices.ethMinWei) : DEFAULT_MIN_ETH_WEI;
         if (usdcAmount < minUsdc) revert InsufficientUSDC(usdcAmount, minUsdc);
         if (msg.value < minEthWei) revert InsufficientETH(msg.value, minEthWei);
 
         // 1. Effects: Update state before external calls (CEI Pattern)
-        nonce = ++nonces[automaton];
+        uint64 currentNonce = nonces[automaton];
+        unchecked {
+            nonce = currentNonce + 1;
+        }
+        nonces[automaton] = nonce;
 
         // 2. Interactions:
         if (usdcAmount > 0) {
@@ -165,11 +178,16 @@ contract Inbox {
         if (automaton == address(0)) revert InvalidAddress();
         if (messageLength > MAX_MESSAGE_LENGTH) revert MessageTooLong(messageLength, MAX_MESSAGE_LENGTH);
 
-        (, uint256 minEthWei,) = minPricesFor(automaton);
+        MinPrices storage prices = _minPricesByAutomaton[automaton];
+        uint256 minEthWei = prices.isCustom ? uint256(prices.ethMinWei) : DEFAULT_MIN_ETH_WEI;
         if (msg.value < minEthWei) revert InsufficientETH(msg.value, minEthWei);
 
         // 1. Effects:
-        nonce = ++nonces[automaton];
+        uint64 currentNonce = nonces[automaton];
+        unchecked {
+            nonce = currentNonce + 1;
+        }
+        nonces[automaton] = nonce;
 
         // 2. Interactions:
         if (msg.value > 0) {
