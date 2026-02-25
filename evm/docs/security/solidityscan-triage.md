@@ -28,6 +28,7 @@ This document tracks remediation status for the reported findings against the cu
 
 - Additional hardening
   - Constructor now rejects non-contract token addresses using `code.length` check.
+  - Removed low-level token call helper; USDC transfers now use typed `IERC20.transferFrom`.
 
 ## Accepted-by-design / false positive
 
@@ -52,4 +53,3 @@ This document tracks remediation status for the reported findings against the cu
 
 - `#15 underscore naming`, `#21 constants visibility`, `#23/#26/#27 micro gas if-condition tweaks`, `#24 payable constructor`, `#25 struct assignment style`, `#28 inline single-use function`.
   - Deferred intentionally to preserve readability and avoid unnecessary semantic risk for negligible gas savings.
-

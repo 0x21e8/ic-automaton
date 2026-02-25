@@ -2,12 +2,15 @@
 pragma solidity 0.8.32;
 
 /// @title Minimal ERC-20 interface used by the Inbox contract
+/// @author ic-automaton contributors
+/// @dev This interface is intentionally minimal because the inbox only requires `transferFrom`.
 interface IERC20 {
     /// @notice Move tokens from one account to another using allowance
     /// @param from Source address
     /// @param to Destination address
     /// @param value Amount to transfer
     /// @return success True if the transfer succeeded
+    /// @dev Base USDC returns a boolean on successful transfer.
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
 
@@ -40,7 +43,9 @@ contract Inbox {
     /// @notice Default minimum ETH required by both queue paths.
     uint256 public constant DEFAULT_MIN_ETH_WEI = 500_000_000_000_000; // 0.0005 ETH
 
+    /// @dev Reentrancy status value when no protected function is executing.
     uint256 private constant _NOT_ENTERED = 1;
+    /// @dev Reentrancy status value while executing a protected function.
     uint256 private constant _ENTERED = 2;
 
     /// @notice ERC-20 token used for USDC path payments.
@@ -80,6 +85,8 @@ contract Inbox {
         _reentrancyStatus = _NOT_ENTERED;
     }
 
+    /// @notice Prevents nested (reentrant) entry into guarded functions.
+    /// @dev Lightweight local guard equivalent to OpenZeppelin's `nonReentrant` modifier.
     modifier nonReentrant() {
         if (_reentrancyStatus == _ENTERED) revert ReentrancyBlocked();
 
@@ -102,11 +109,7 @@ contract Inbox {
     /// @return usdcMin Minimum USDC required for the USDC queue path.
     /// @return ethMinWei Minimum ETH required for message queueing.
     /// @return usesDefault True when no custom minimum is configured.
-    function minPricesFor(address automaton)
-        public
-        view
-        returns (uint256 usdcMin, uint256 ethMinWei, bool usesDefault)
-    {
+    function minPricesFor(address automaton) public view returns (uint256, uint256, bool) {
         MinPrices storage prices = _minPricesByAutomaton[automaton];
         if (!prices.isCustom) {
             return (DEFAULT_MIN_USDC, DEFAULT_MIN_ETH_WEI, true);
@@ -137,7 +140,8 @@ contract Inbox {
 
         // 2. Interactions:
         if (usdcAmount > 0) {
-            _safeTransferFrom(address(usdc), msg.sender, automaton, usdcAmount);
+            bool transferOk = usdc.transferFrom(msg.sender, automaton, usdcAmount);
+            if (!transferOk) revert TransferFailed();
         }
 
         if (msg.value > 0) {
@@ -174,12 +178,5 @@ contract Inbox {
         }
 
         emit MessageQueued(automaton, nonce, msg.sender, message, 0, msg.value);
-    }
-
-    // --- Internal Helpers ---
-    function _safeTransferFrom(address token, address from, address to, uint256 value) internal {
-        (bool success, bytes memory data) =
-            token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, value));
-        if (!(success && (data.length == 0 || abi.decode(data, (bool))))) revert TransferFailed();
     }
 }
