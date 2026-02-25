@@ -105,11 +105,17 @@ contract InboxTest {
         vm.prank(automaton);
         inbox.setMinPrices(3_000_000, 2_000_000_000_000_000);
 
-        vm.expectRevert(bytes("insufficient usdc"));
+        vm.expectRevert(
+            abi.encodeWithSelector(Inbox.InsufficientUSDC.selector, uint256(2_999_999), uint256(3_000_000))
+        );
         vm.prank(PAYER);
         inbox.queueMessage{value: 2_000_000_000_000_000}(automaton, "underfunded usdc", 2_999_999);
 
-        vm.expectRevert(bytes("insufficient eth"));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Inbox.InsufficientETH.selector, uint256(1_999_999_999_999_999), uint256(2_000_000_000_000_000)
+            )
+        );
         vm.prank(PAYER);
         inbox.queueMessage{value: 1_999_999_999_999_999}(automaton, "underfunded eth", 3_000_000);
 
@@ -137,7 +143,11 @@ contract InboxTest {
         EthReceiver automaton = new EthReceiver();
         address automatonAddress = address(automaton);
 
-        vm.expectRevert(bytes("insufficient eth"));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Inbox.InsufficientETH.selector, uint256(DEFAULT_ETH_MIN - 1), uint256(DEFAULT_ETH_MIN)
+            )
+        );
         vm.prank(PAYER);
         inbox.queueMessageEth{value: DEFAULT_ETH_MIN - 1}(automatonAddress, "underfunded eth only");
     }
