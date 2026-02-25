@@ -35,3 +35,10 @@ docs/specs/
 .githooks/*
 !.githooks/pre-commit
 !.githooks/pre-push
+
+# JavaScript workers
+workers/**/node_modules/
+workers/**/.wrangler/
+workers/**/.dev.vars
+workers/**/.env
+workers/**/.env.*
