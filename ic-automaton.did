@@ -155,6 +155,7 @@ type InitArgs = record {
   auto_topup_cycle_threshold : opt nat64;
   cycle_topup_enabled : opt bool;
   inbox_contract_address : opt text;
+  evm_bootstrap_lookback_blocks : opt nat64;
   http_allowed_domains : opt vec text;
 };
 type JobStatus = variant {

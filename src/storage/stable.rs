@@ -1935,6 +1935,18 @@ pub fn set_evm_confirmation_depth(confirmation_depth: u64) -> Result<u64, String
     Ok(confirmation_depth)
 }
 
+/// Sets the initial lookback window (in blocks) used when `evm_cursor.next_block == 0`.
+///
+/// - `0` means start polling from the current confirmed head (no backfill).
+/// - `N > 0` means bootstrap from `confirmed_head - N`.
+pub fn set_evm_bootstrap_lookback_blocks(lookback_blocks: u64) -> Result<u64, String> {
+    let mut snapshot = runtime_snapshot();
+    snapshot.evm_bootstrap_lookback_blocks = lookback_blocks;
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(lookback_blocks)
+}
+
 /// Inserts or replaces a memory fact.  Returns an error if the store is full
 /// (`MAX_MEMORY_FACTS`) and the key does not already exist.
 pub fn set_memory_fact(fact: &MemoryFact) -> Result<(), String> {
@@ -7861,6 +7873,14 @@ mod tests {
     }
 
     #[test]
+    fn evm_bootstrap_lookback_blocks_persist() {
+        init_storage();
+        let stored = set_evm_bootstrap_lookback_blocks(0).expect("lookback should persist");
+        assert_eq!(stored, 0);
+        assert_eq!(runtime_snapshot().evm_bootstrap_lookback_blocks, 0);
+    }
+
+    #[test]
     fn evm_ingest_idempotency_key_dedupes_tx_hash_and_log_index() {
         init_storage();
         let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -7915,6 +7935,7 @@ mod tests {
         init_storage();
         let snapshot = runtime_snapshot();
         assert_eq!(snapshot.evm_rpc_url, "https://mainnet.base.org");
+        assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 1_000);
     }
 
     #[test]
@@ -7928,6 +7949,7 @@ mod tests {
         legacy_obj.remove("wallet_balance");
         legacy_obj.remove("wallet_balance_sync");
         legacy_obj.remove("wallet_balance_bootstrap_pending");
+        legacy_obj.remove("evm_bootstrap_lookback_blocks");
         legacy_obj.remove("timing_telemetry");
         let payload = serde_json::to_vec(&legacy).expect("legacy json should serialize");
 
@@ -7942,6 +7964,7 @@ mod tests {
         assert_eq!(loaded.wallet_balance_sync.freshness_window_secs, 600);
         assert_eq!(loaded.wallet_balance_sync.max_response_bytes, 256);
         assert!(loaded.wallet_balance_bootstrap_pending);
+        assert_eq!(loaded.evm_bootstrap_lookback_blocks, 1_000);
         assert_eq!(loaded.timing_telemetry.turns_over_budget, 0);
         assert_eq!(loaded.timing_telemetry.max_turn_duration_ms, 0);
         assert_eq!(loaded.timing_telemetry.inference_outcall.total_calls, 0);

@@ -244,6 +244,7 @@ Key init arguments (set at deploy time via `icp canister install`):
 | `evm_chain_id` | Target EVM chain ID | `31337` (local Anvil) / `8453` (Base) |
 | `evm_rpc_url` | JSON-RPC endpoint | `"https://mainnet.base.org"` |
 | `evm_confirmation_depth` | Block confirmations before event processing | `6` (mainnet default) |
+| `evm_bootstrap_lookback_blocks` | Initial/fallback log backfill window; set `0` to start from current confirmed head | `1000` |
 | `inbox_contract_address` | Deployed Inbox.sol address | -- |
 | `llm_canister_id` | IcLlm canister for local inference | `w36hm-eqaaa-aaaal-qr76a-cai` |
 

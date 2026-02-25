@@ -466,6 +466,8 @@ pub struct RuntimeSnapshot {
     pub evm_rpc_fallback_url: Option<String>,
     #[serde(default = "default_evm_rpc_max_response_bytes")]
     pub evm_rpc_max_response_bytes: u64,
+    #[serde(default = "default_evm_bootstrap_lookback_blocks")]
+    pub evm_bootstrap_lookback_blocks: u64,
     #[serde(default)]
     pub wallet_balance: WalletBalanceSnapshot,
     #[serde(default)]
@@ -504,6 +506,7 @@ impl Default for RuntimeSnapshot {
             evm_rpc_url: default_evm_rpc_url(),
             evm_rpc_fallback_url: None,
             evm_rpc_max_response_bytes: default_evm_rpc_max_response_bytes(),
+            evm_bootstrap_lookback_blocks: default_evm_bootstrap_lookback_blocks(),
             wallet_balance: WalletBalanceSnapshot::default(),
             wallet_balance_sync: WalletBalanceSyncConfig::default(),
             wallet_balance_bootstrap_pending: default_wallet_balance_bootstrap_pending(),
@@ -1829,6 +1832,10 @@ fn default_evm_rpc_max_response_bytes() -> u64 {
     64 * 1024
 }
 
+fn default_evm_bootstrap_lookback_blocks() -> u64 {
+    1_000
+}
+
 fn default_evm_confirmation_depth() -> u64 {
     6
 }
@@ -2049,6 +2056,7 @@ mod tests {
     fn runtime_snapshot_defaults_bootstrap_pending_for_wallet_sync() {
         let snapshot = RuntimeSnapshot::default();
         assert!(snapshot.wallet_balance_bootstrap_pending);
+        assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 1_000);
         assert!(snapshot.cycle_topup.enabled);
         assert_eq!(
             snapshot.cycle_topup.auto_topup_cycle_threshold,

@@ -61,6 +61,8 @@ struct InitArgs {
     #[serde(default)]
     evm_confirmation_depth: Option<u64>,
     #[serde(default)]
+    evm_bootstrap_lookback_blocks: Option<u64>,
+    #[serde(default)]
     http_allowed_domains: Option<Vec<String>>,
     #[serde(default)]
     llm_canister_id: Option<Principal>,
@@ -176,6 +178,10 @@ fn apply_init_args(args: InitArgs) {
     }
     if let Some(confirmation_depth) = args.evm_confirmation_depth {
         let _ = stable::set_evm_confirmation_depth(confirmation_depth)
+            .unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
+    if let Some(lookback_blocks) = args.evm_bootstrap_lookback_blocks {
+        let _ = stable::set_evm_bootstrap_lookback_blocks(lookback_blocks)
             .unwrap_or_else(|error| ic_cdk::trap(&error));
     }
     let _ = stable::set_inbox_contract_address(args.inbox_contract_address)
@@ -755,6 +761,7 @@ mod tests {
             evm_chain_id: None,
             evm_rpc_url: None,
             evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: None,
             http_allowed_domains: Some(vec!["api.coingecko.com".to_string()]),
             llm_canister_id: None,
             cycle_topup_enabled: None,
@@ -776,6 +783,7 @@ mod tests {
             evm_chain_id: None,
             evm_rpc_url: None,
             evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: None,
             http_allowed_domains: None,
             llm_canister_id: Some(
                 Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
@@ -796,6 +804,7 @@ mod tests {
             evm_chain_id: None,
             evm_rpc_url: None,
             evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: None,
             http_allowed_domains: None,
             llm_canister_id: None,
             cycle_topup_enabled: Some(false),
@@ -808,6 +817,25 @@ mod tests {
             snapshot.cycle_topup.auto_topup_cycle_threshold,
             150_000_000_000
         );
+    }
+
+    #[test]
+    fn apply_init_args_can_override_evm_bootstrap_lookback_blocks() {
+        apply_init_args(InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: None,
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: Some(0),
+            http_allowed_domains: None,
+            llm_canister_id: None,
+            cycle_topup_enabled: None,
+            auto_topup_cycle_threshold: None,
+        });
+
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 0);
     }
 
     fn sample_strategy_key() -> StrategyTemplateKey {

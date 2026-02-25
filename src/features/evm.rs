@@ -52,10 +52,6 @@ const MAX_BLOCK_RANGE_PER_POLL: u64 = 1_000;
 // Maximum number of decoded log events returned per poll; prevents unbounded memory use.
 const DEFAULT_MAX_LOGS_PER_POLL: usize = 200;
 
-// Initial catch-up window (blocks) used when the poll cursor is unset (`next_block == 0`).
-// This avoids scanning from genesis on long-lived chains while still catching recent messages.
-const INITIAL_POLL_LOOKBACK_BLOCKS: u64 = MAX_BLOCK_RANGE_PER_POLL;
-
 // If cursor lag exceeds this threshold, skip historical backfill and fast-forward to the
 // recent head window so inbox responsiveness recovers for active users.
 const MAX_CURSOR_LAG_BEFORE_FAST_FORWARD_BLOCKS: u64 = MAX_BLOCK_RANGE_PER_POLL * 20;
@@ -197,6 +193,7 @@ pub trait EvmPoller {
 pub struct HttpEvmPoller {
     rpc: HttpEvmRpcClient,
     max_logs_per_poll: usize,
+    bootstrap_lookback_blocks: u64,
     log_filter_address: String,
     log_filter_topics: Vec<String>,
 }
@@ -228,6 +225,7 @@ impl HttpEvmPoller {
         Ok(Self {
             rpc,
             max_logs_per_poll: DEFAULT_MAX_LOGS_PER_POLL,
+            bootstrap_lookback_blocks: snapshot.evm_bootstrap_lookback_blocks,
             log_filter_address,
             log_filter_topics: vec![inbox_message_queued_topic0(), log_filter_topic1],
         })
@@ -239,7 +237,8 @@ impl EvmPoller for HttpEvmPoller {
     async fn poll(&self, cursor: &EvmPollCursor) -> Result<EvmPollResult, String> {
         let latest_block = self.rpc.eth_block_number().await?;
         let confirmed_head = latest_block.saturating_sub(cursor.confirmation_depth);
-        let from_block = effective_from_block(cursor, confirmed_head);
+        let from_block =
+            effective_from_block(cursor, confirmed_head, self.bootstrap_lookback_blocks);
         if from_block != cursor.next_block {
             log!(
                 StrategyExecutionLogPriority::Info,
@@ -306,14 +305,18 @@ impl EvmPoller for HttpEvmPoller {
     }
 }
 
-fn effective_from_block(cursor: &EvmPollCursor, confirmed_head: u64) -> u64 {
+fn effective_from_block(
+    cursor: &EvmPollCursor,
+    confirmed_head: u64,
+    bootstrap_lookback_blocks: u64,
+) -> u64 {
     if cursor.next_block == 0 {
-        return confirmed_head.saturating_sub(INITIAL_POLL_LOOKBACK_BLOCKS);
+        return confirmed_head.saturating_sub(bootstrap_lookback_blocks);
     }
 
     let lag = confirmed_head.saturating_sub(cursor.next_block);
     if lag > MAX_CURSOR_LAG_BEFORE_FAST_FORWARD_BLOCKS {
-        return confirmed_head.saturating_sub(INITIAL_POLL_LOOKBACK_BLOCKS);
+        return confirmed_head.saturating_sub(bootstrap_lookback_blocks);
     }
 
     cursor.next_block
@@ -1984,8 +1987,18 @@ mod tests {
             next_block: 0,
             ..EvmPollCursor::default()
         };
-        assert_eq!(effective_from_block(&cursor, 5_000), 4_000);
-        assert_eq!(effective_from_block(&cursor, 100), 0);
+        assert_eq!(effective_from_block(&cursor, 5_000, 1_000), 4_000);
+        assert_eq!(effective_from_block(&cursor, 100, 1_000), 0);
+    }
+
+    #[test]
+    fn poll_bootstrap_from_block_can_start_from_current_head_when_lookback_is_zero() {
+        let cursor = EvmPollCursor {
+            next_block: 0,
+            ..EvmPollCursor::default()
+        };
+        assert_eq!(effective_from_block(&cursor, 5_000, 0), 5_000);
+        assert_eq!(effective_from_block(&cursor, 100, 0), 100);
     }
 
     #[test]
@@ -1994,7 +2007,7 @@ mod tests {
             next_block: 4_321,
             ..EvmPollCursor::default()
         };
-        assert_eq!(effective_from_block(&cursor, 9_999), 4_321);
+        assert_eq!(effective_from_block(&cursor, 9_999, 1_000), 4_321);
     }
 
     #[test]
@@ -2003,7 +2016,16 @@ mod tests {
             next_block: 1_000,
             ..EvmPollCursor::default()
         };
-        assert_eq!(effective_from_block(&cursor, 100_000), 99_000);
+        assert_eq!(effective_from_block(&cursor, 100_000, 1_000), 99_000);
+    }
+
+    #[test]
+    fn poll_bootstrap_from_block_fast_forward_uses_configured_lookback_window() {
+        let cursor = EvmPollCursor {
+            next_block: 1_000,
+            ..EvmPollCursor::default()
+        };
+        assert_eq!(effective_from_block(&cursor, 100_000, 250), 99_750);
     }
 
     #[test]
@@ -2153,6 +2175,21 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
         assert!(HttpEvmPoller::from_snapshot(&missing_agent).is_err());
+    }
+
+    #[test]
+    fn http_evm_poller_uses_snapshot_bootstrap_lookback_blocks() {
+        let snapshot = RuntimeSnapshot {
+            evm_rpc_url: "https://mainnet.base.org".to_string(),
+            evm_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            inbox_contract_address: Some("0x2222222222222222222222222222222222222222".to_string()),
+            evm_bootstrap_lookback_blocks: 0,
+            ..RuntimeSnapshot::default()
+        };
+
+        let poller =
+            HttpEvmPoller::from_snapshot(&snapshot).expect("poller should initialize from config");
+        assert_eq!(poller.bootstrap_lookback_blocks, 0);
     }
 
     #[test]
