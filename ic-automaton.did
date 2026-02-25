@@ -202,6 +202,17 @@ type OutboxMessage = record {
   turn_id : text;
 };
 type OutboxStats = record { total_messages : nat64 };
+type OutcallTimingStats = record {
+  last_error : opt text;
+  max_duration_ms : nat64;
+  failure_calls : nat64;
+  timeout_failures : nat64;
+  total_duration_ms : nat64;
+  last_started_at_ns : opt nat64;
+  last_finished_at_ns : opt nat64;
+  last_duration_ms : opt nat64;
+  total_calls : nat64;
+};
 type PromptLayer = record {
   content : text;
   updated_at_ns : nat64;
@@ -264,6 +275,13 @@ type RetentionMaintenanceRuntime = record {
   summarization_progress_percent : nat8;
   last_generated_memory_rollups : nat32;
 };
+type RuntimeTimingTelemetry = record {
+  last_turn_duration_ms : opt nat64;
+  inference_outcall : OutcallTimingStats;
+  turns_over_budget : nat64;
+  http_fetch_outcall : OutcallTimingStats;
+  max_turn_duration_ms : nat64;
+};
 type RuntimeView = record {
   last_error : opt text;
   evm_chain_id : nat64;
@@ -271,6 +289,7 @@ type RuntimeView = record {
   soul : text;
   turn_counter : nat64;
   last_turn_id : opt text;
+  timing_telemetry : RuntimeTimingTelemetry;
   state : AgentState;
   inference_provider : InferenceProvider;
   evm_next_log_index : nat64;
@@ -478,6 +497,7 @@ type TransitionLogRecord = record {
 type TurnRecord = record {
   id : text;
   inference_round_count : nat32;
+  finished_at_ns : opt nat64;
   continuation_stop_reason : ContinuationStopReason;
   state_to : AgentState;
   input_summary : text;
@@ -486,6 +506,7 @@ type TurnRecord = record {
   created_at_ns : nat64;
   source_events : nat32;
   state_from : AgentState;
+  duration_ms : opt nat64;
   tool_call_count : nat32;
 };
 type TurnWindowSummary = record {

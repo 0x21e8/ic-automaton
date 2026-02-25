@@ -42,6 +42,19 @@ const DETERMINISTIC_IC_LLM_MODEL: &str = "deterministic-local";
 const DETERMINISTIC_LAYER_6_MARKER: &str = "phase5-layer6-marker";
 const DETERMINISTIC_LAYER_6_UPDATE_CONTENT: &str =
     "## Layer 6: Economic Decision Loop (Mutable Default)\n- phase5-layer6-marker";
+const INFERENCE_OUTCALL_TIMEOUT_MS: u64 = 45_000;
+const INFERENCE_OUTCALL_TIMEOUT_NS: u64 = INFERENCE_OUTCALL_TIMEOUT_MS * 1_000_000;
+
+fn outcall_elapsed_ms(started_at_ns: u64, finished_at_ns: u64) -> u64 {
+    finished_at_ns.saturating_sub(started_at_ns) / 1_000_000
+}
+
+fn outcall_timeout_message(service: &str, timeout_ms: u64, elapsed_ms: u64) -> String {
+    format!(
+        "{service} outcall timeout envelope exceeded: elapsed={} ms timeout={} ms",
+        elapsed_ms, timeout_ms
+    )
+}
 
 #[derive(Clone, Copy, Serialize, Deserialize, LogPriorityLevels)]
 enum InferenceLogPriority {
@@ -318,15 +331,66 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
 
         let llm_canister = Principal::from_text(self.llm_canister_id.trim())
             .map_err(|error| format!("invalid ic_llm canister principal: {error}"))?;
-        let call_result = ic_cdk::call::Call::unbounded_wait(llm_canister, "v1_chat")
+        let outcall_started_at_ns = current_time_ns();
+        let call_result = match ic_cdk::call::Call::unbounded_wait(llm_canister, "v1_chat")
             .with_arg(&request)
             .await
-            .map_err(|error| format!("ic_llm call failed: {error}"))?;
-        let (response,): (IcLlmResponse,) = call_result
-            .candid()
-            .map_err(|error| format!("ic_llm response decode failed: {error}"))?;
+        {
+            Ok(call_result) => call_result,
+            Err(error) => {
+                let outcall_finished_at_ns = current_time_ns();
+                let elapsed_ms = outcall_elapsed_ms(outcall_started_at_ns, outcall_finished_at_ns);
+                let timed_out = outcall_finished_at_ns.saturating_sub(outcall_started_at_ns)
+                    > INFERENCE_OUTCALL_TIMEOUT_NS;
+                let message = if timed_out {
+                    outcall_timeout_message("ic_llm call", INFERENCE_OUTCALL_TIMEOUT_MS, elapsed_ms)
+                } else {
+                    format!("ic_llm call failed: {error}")
+                };
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(message.as_str()),
+                    timed_out,
+                );
+                return Err(message);
+            }
+        };
 
-        parse_ic_llm_response(response).map_err(|error| {
+        let outcall_finished_at_ns = current_time_ns();
+        let elapsed_ms = outcall_elapsed_ms(outcall_started_at_ns, outcall_finished_at_ns);
+        if outcall_finished_at_ns.saturating_sub(outcall_started_at_ns)
+            > INFERENCE_OUTCALL_TIMEOUT_NS
+        {
+            let message =
+                outcall_timeout_message("ic_llm call", INFERENCE_OUTCALL_TIMEOUT_MS, elapsed_ms);
+            stable::record_outcall_timing(
+                stable::RuntimeOutcallKind::Inference,
+                outcall_started_at_ns,
+                outcall_finished_at_ns,
+                Some(message.as_str()),
+                true,
+            );
+            return Err(message);
+        }
+
+        let (response,): (IcLlmResponse,) = match call_result.candid() {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let message = format!("ic_llm response decode failed: {error}");
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(message.as_str()),
+                    false,
+                );
+                return Err(message);
+            }
+        };
+
+        let parsed = parse_ic_llm_response(response).map_err(|error| {
             log!(
                 InferenceLogPriority::Error,
                 "turn={} provider=ic_llm parse_failed={}",
@@ -334,7 +398,29 @@ impl InferenceAdapter for IcLlmInferenceAdapter {
                 error
             );
             error
-        })
+        });
+        match parsed {
+            Ok(output) => {
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    None,
+                    false,
+                );
+                Ok(output)
+            }
+            Err(error) => {
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(error.as_str()),
+                    false,
+                );
+                Err(error)
+            }
+        }
     }
 }
 
@@ -976,10 +1062,40 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
             self.model
         );
 
+        let outcall_started_at_ns = current_time_ns();
         let response = match http_request(&request).await {
             Ok(response) => response,
             Err(error) => {
-                let message = format!("openrouter http outcall failed: {error}");
+                let outcall_finished_at_ns = current_time_ns();
+                let elapsed_ms = outcall_elapsed_ms(outcall_started_at_ns, outcall_finished_at_ns);
+                let timed_out = outcall_finished_at_ns.saturating_sub(outcall_started_at_ns)
+                    > INFERENCE_OUTCALL_TIMEOUT_NS;
+                let message = if timed_out {
+                    outcall_timeout_message(
+                        "openrouter http",
+                        INFERENCE_OUTCALL_TIMEOUT_MS,
+                        elapsed_ms,
+                    )
+                } else {
+                    format!("openrouter http outcall failed: {error}")
+                };
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(message.as_str()),
+                    timed_out,
+                );
+                if timed_out {
+                    log!(
+                        InferenceLogPriority::Error,
+                        "turn={} provider=openrouter outcall_timeout elapsed_ms={} timeout_ms={}",
+                        input.turn_id,
+                        elapsed_ms,
+                        INFERENCE_OUTCALL_TIMEOUT_MS
+                    );
+                    return Err(message);
+                }
                 if is_insufficient_cycles_error(&message) {
                     stable::record_survival_operation_failure(
                         &SurvivalOperationClass::Inference,
@@ -1003,7 +1119,57 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                 return Err(message);
             }
         };
-        parse_openrouter_http_response(response)
+
+        let outcall_finished_at_ns = current_time_ns();
+        let elapsed_ms = outcall_elapsed_ms(outcall_started_at_ns, outcall_finished_at_ns);
+        if outcall_finished_at_ns.saturating_sub(outcall_started_at_ns)
+            > INFERENCE_OUTCALL_TIMEOUT_NS
+        {
+            let message = outcall_timeout_message(
+                "openrouter http",
+                INFERENCE_OUTCALL_TIMEOUT_MS,
+                elapsed_ms,
+            );
+            stable::record_outcall_timing(
+                stable::RuntimeOutcallKind::Inference,
+                outcall_started_at_ns,
+                outcall_finished_at_ns,
+                Some(message.as_str()),
+                true,
+            );
+            log!(
+                InferenceLogPriority::Error,
+                "turn={} provider=openrouter outcall_timeout elapsed_ms={} timeout_ms={}",
+                input.turn_id,
+                elapsed_ms,
+                INFERENCE_OUTCALL_TIMEOUT_MS
+            );
+            return Err(message);
+        }
+
+        let parsed = parse_openrouter_http_response(response);
+        match parsed {
+            Ok(output) => {
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    None,
+                    false,
+                );
+                Ok(output)
+            }
+            Err(error) => {
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(error.as_str()),
+                    false,
+                );
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1644,6 +1810,21 @@ mod tests {
             failure,
             crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
                 kind: crate::domain::types::OutcallFailureKind::RateLimited,
+                retry_after_secs: None,
+                observed_response_bytes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_inference_failure_maps_timeout_envelope_errors() {
+        let failure = classify_inference_failure(
+            "openrouter http outcall timeout envelope exceeded: elapsed=47000 ms timeout=45000 ms",
+        );
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+                kind: crate::domain::types::OutcallFailureKind::Timeout,
                 retry_after_secs: None,
                 observed_response_bytes: None,
             })

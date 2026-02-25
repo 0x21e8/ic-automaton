@@ -16,6 +16,7 @@ use crate::domain::cycle_admission::{
 };
 use crate::sanitize::frame_untrusted_content;
 use crate::storage::stable;
+use crate::timing::current_time_ns;
 use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -36,6 +37,15 @@ const HTTP_FETCH_MAX_OUTPUT_CHARS: usize = 8_000;
 const HTTP_FETCH_REGEX_MAX_PATTERN_CHARS: usize = 256;
 const HTTP_FETCH_REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const HTTP_FETCH_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
+const HTTP_FETCH_OUTCALL_TIMEOUT_MS: u64 = 20_000;
+const HTTP_FETCH_OUTCALL_TIMEOUT_NS: u64 = HTTP_FETCH_OUTCALL_TIMEOUT_MS * 1_000_000;
+
+fn http_fetch_timeout_message(elapsed_ms: u64) -> String {
+    format!(
+        "http_fetch outcall timeout envelope exceeded: elapsed={} ms timeout={} ms",
+        elapsed_ms, HTTP_FETCH_OUTCALL_TIMEOUT_MS
+    )
+}
 
 // ── Tool entry point ─────────────────────────────────────────────────────────
 
@@ -70,7 +80,45 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
         HTTP_FETCH_MAX_RESPONSE_BYTES,
     )?;
 
-    let body = http_get(&args.url, HTTP_FETCH_MAX_RESPONSE_BYTES).await?;
+    let outcall_started_at_ns = current_time_ns();
+    let body_result = http_get(&args.url, HTTP_FETCH_MAX_RESPONSE_BYTES).await;
+    let outcall_finished_at_ns = current_time_ns();
+    let outcall_elapsed_ms =
+        outcall_finished_at_ns.saturating_sub(outcall_started_at_ns) / 1_000_000;
+    if outcall_finished_at_ns.saturating_sub(outcall_started_at_ns) > HTTP_FETCH_OUTCALL_TIMEOUT_NS
+    {
+        let message = http_fetch_timeout_message(outcall_elapsed_ms);
+        stable::record_outcall_timing(
+            stable::RuntimeOutcallKind::HttpFetch,
+            outcall_started_at_ns,
+            outcall_finished_at_ns,
+            Some(message.as_str()),
+            true,
+        );
+        return Err(message);
+    }
+    let body = match body_result {
+        Ok(body) => {
+            stable::record_outcall_timing(
+                stable::RuntimeOutcallKind::HttpFetch,
+                outcall_started_at_ns,
+                outcall_finished_at_ns,
+                None,
+                false,
+            );
+            body
+        }
+        Err(error) => {
+            stable::record_outcall_timing(
+                stable::RuntimeOutcallKind::HttpFetch,
+                outcall_started_at_ns,
+                outcall_finished_at_ns,
+                Some(error.as_str()),
+                false,
+            );
+            return Err(error);
+        }
+    };
     let body =
         String::from_utf8(body).unwrap_or_else(|_| "binary response (not UTF-8)".to_string());
     let extracted = extract_http_fetch_content(&body, args.extract.as_ref())?;
@@ -108,25 +156,15 @@ fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
         format!("json_path extraction failed: response is not valid JSON: {error}")
     })?;
 
-    let segments = trimmed_path.split('.').collect::<Vec<_>>();
-    if segments.iter().any(|segment| segment.trim().is_empty()) {
-        return Err(format!(
-            "json_path extraction failed: invalid path `{trimmed_path}`"
-        ));
-    }
-    if segments
-        .iter()
-        .any(|segment| segment.contains('[') || segment.contains(']'))
-    {
-        return Err("json_path extraction failed: array indexing is not supported".to_string());
-    }
+    let segments = parse_json_path_segments(trimmed_path)?;
 
     let mut current = &root;
     for segment in segments {
-        let segment = segment.trim();
-        current = current.get(segment).ok_or_else(|| {
-            format!("json_path extraction failed: path `{trimmed_path}` not found")
-        })?;
+        current = match segment {
+            JsonPathSegment::Field(name) => current.get(name),
+            JsonPathSegment::Index(index) => current.as_array().and_then(|array| array.get(index)),
+        }
+        .ok_or_else(|| format!("json_path extraction failed: path `{trimmed_path}` not found"))?;
     }
 
     match current {
@@ -135,6 +173,102 @@ fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
             format!("json_path extraction failed: could not serialize extracted value: {error}")
         }),
     }
+}
+
+#[derive(Debug)]
+enum JsonPathSegment {
+    Field(String),
+    Index(usize),
+}
+
+fn parse_json_path_segments(path: &str) -> Result<Vec<JsonPathSegment>, String> {
+    let mut segments = Vec::<JsonPathSegment>::new();
+    let chars = path.chars().collect::<Vec<_>>();
+    let mut i = 0usize;
+    let len = chars.len();
+
+    while i < len {
+        if chars[i] == '.' {
+            return Err(format!(
+                "json_path extraction failed: invalid path `{path}`"
+            ));
+        }
+
+        if chars[i] == '[' {
+            let (index, next) = parse_json_path_index(&chars, i, path)?;
+            segments.push(JsonPathSegment::Index(index));
+            i = next;
+        } else {
+            let start = i;
+            while i < len && chars[i] != '.' && chars[i] != '[' {
+                i = i.saturating_add(1);
+            }
+            let field = chars[start..i].iter().collect::<String>();
+            if field.trim().is_empty() {
+                return Err(format!(
+                    "json_path extraction failed: invalid path `{path}`"
+                ));
+            }
+            segments.push(JsonPathSegment::Field(field));
+        }
+
+        while i < len && chars[i] == '[' {
+            let (index, next) = parse_json_path_index(&chars, i, path)?;
+            segments.push(JsonPathSegment::Index(index));
+            i = next;
+        }
+
+        if i < len {
+            if chars[i] != '.' {
+                return Err(format!(
+                    "json_path extraction failed: invalid path `{path}`"
+                ));
+            }
+            i = i.saturating_add(1);
+            if i == len {
+                return Err(format!(
+                    "json_path extraction failed: invalid path `{path}`"
+                ));
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err(format!(
+            "json_path extraction failed: invalid path `{path}`"
+        ));
+    }
+    Ok(segments)
+}
+
+fn parse_json_path_index(
+    chars: &[char],
+    start: usize,
+    raw_path: &str,
+) -> Result<(usize, usize), String> {
+    let mut i = start.saturating_add(1);
+    let mut digits = String::new();
+
+    while i < chars.len() && chars[i] != ']' {
+        digits.push(chars[i]);
+        i = i.saturating_add(1);
+    }
+
+    if i >= chars.len() || chars[i] != ']' {
+        return Err(format!(
+            "json_path extraction failed: invalid path `{raw_path}`"
+        ));
+    }
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "json_path extraction failed: invalid path `{raw_path}`"
+        ));
+    }
+
+    let index = digits
+        .parse::<usize>()
+        .map_err(|_| format!("json_path extraction failed: invalid path `{raw_path}`"))?;
+    Ok((index, i.saturating_add(1)))
 }
 
 fn extract_regex_lines(body: &str, pattern: &str) -> Result<String, String> {
@@ -374,6 +508,24 @@ mod tests {
     }
 
     #[test]
+    fn http_fetch_tool_records_outcall_latency_telemetry() {
+        stable::init_storage();
+
+        let _ = block_on_with_spin(http_fetch_tool(r#"{"url":"https://example.com/anything"}"#))
+            .expect("host stub request should pass");
+        let snapshot = stable::runtime_snapshot();
+        let stats = snapshot.timing_telemetry.http_fetch_outcall;
+        assert_eq!(stats.total_calls, 1);
+        assert_eq!(stats.failure_calls, 0);
+        assert_eq!(stats.timeout_failures, 0);
+        assert!(
+            stats.last_duration_ms.is_some(),
+            "outcall telemetry should capture latency"
+        );
+        assert!(stats.last_error.is_none());
+    }
+
+    #[test]
     fn http_fetch_tool_uses_allowlist_when_configured() {
         stable::init_storage();
         stable::set_http_allowed_domains(vec!["api.coingecko.com".to_string()])
@@ -442,6 +594,23 @@ mod tests {
         let err = extract_json_path(r#"{"data":{"price":42}}"#, "data.missing")
             .expect_err("missing path should fail json_path extraction");
         assert!(err.contains("path `data.missing` not found"));
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_supports_array_indexing() {
+        let out = extract_json_path(
+            r#"{"pairs":[{"priceUsd":"0.31"},{"priceUsd":"0.32"}]}"#,
+            "pairs[1].priceUsd",
+        )
+        .expect("array-index json_path extraction should succeed");
+        assert_eq!(out, "0.32");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_rejects_invalid_array_index_path() {
+        let err = extract_json_path(r#"{"pairs":[{"priceUsd":"0.31"}]}"#, "pairs[one].priceUsd")
+            .expect_err("non-numeric array index should fail json_path extraction");
+        assert!(err.contains("invalid path"));
     }
 
     #[test]

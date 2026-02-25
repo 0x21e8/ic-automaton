@@ -325,6 +325,30 @@ fn is_sequence_validator_block(record: &ToolCallRecord) -> bool {
         .unwrap_or(false)
 }
 
+fn is_http_fetch_extraction_failure(record: &ToolCallRecord) -> bool {
+    if record.tool != "http_fetch" {
+        return false;
+    }
+    let Some(error) = record.error.as_deref() else {
+        return false;
+    };
+    let normalized = error.trim().to_ascii_lowercase();
+    normalized.starts_with("json_path extraction failed:")
+        || normalized.starts_with("regex extraction failed:")
+}
+
+fn should_degrade_tool_failures_for_autonomy(
+    tool_failures: &[&ToolCallRecord],
+    has_external_input: bool,
+) -> bool {
+    if has_external_input || tool_failures.is_empty() {
+        return false;
+    }
+    tool_failures
+        .iter()
+        .all(|record| is_http_fetch_extraction_failure(record))
+}
+
 /// Persists the fingerprint and timestamp of every successful autonomy tool call
 /// so future ticks can suppress identical calls within the dedup window.
 fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeeded_at_ns: u64) {
@@ -379,6 +403,42 @@ fn append_inner_dialogue(inner_dialogue: &mut Option<String>, segment: &str) {
         }
         None => *inner_dialogue = Some(trimmed.to_string()),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stop_for_turn_deadline_if_elapsed(
+    turn_id: &str,
+    started_at_ns: u64,
+    max_turn_duration_ns: u64,
+    inference_round_count: usize,
+    tool_calls_so_far: usize,
+    checkpoint: &str,
+    inner_dialogue: &mut Option<String>,
+    continuation_stop_reason: &mut ContinuationStopReason,
+) -> bool {
+    let elapsed_ns = current_time_ns().saturating_sub(started_at_ns);
+    if elapsed_ns < max_turn_duration_ns {
+        return false;
+    }
+    append_inner_dialogue(
+        inner_dialogue,
+        &format!(
+            "continuation stopped: max turn duration reached ({} ms)",
+            max_turn_duration_ns / 1_000_000
+        ),
+    );
+    *continuation_stop_reason = ContinuationStopReason::MaxDuration;
+    log!(
+        AgentLogPriority::Info,
+        "turn={} continuation_stop reason=max_duration checkpoint={} rounds={} elapsed_ms={} max_duration_ms={} tool_calls_so_far={}",
+        turn_id,
+        checkpoint,
+        inference_round_count,
+        elapsed_ns / 1_000_000,
+        max_turn_duration_ns / 1_000_000,
+        tool_calls_so_far,
+    );
+    true
 }
 
 /// Returns a `(goal, why)` pair describing the purpose of the current turn for
@@ -741,6 +801,11 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     }
 
     let snapshot = stable::increment_turn_counter();
+    let turn_id = snapshot
+        .last_turn_id
+        .clone()
+        .unwrap_or_else(|| "turn-0".to_string());
+    let started_at_ns = current_time_ns();
     #[cfg(target_arch = "wasm32")]
     if snapshot.evm_address.is_none() && !snapshot.ecdsa_key_name.trim().is_empty() {
         let _ = crate::features::threshold_signer::derive_and_cache_evm_address(
@@ -749,11 +814,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         .await;
     }
 
-    let turn_id = snapshot
-        .last_turn_id
-        .clone()
-        .unwrap_or_else(|| "turn-0".to_string());
-    let started_at_ns = current_time_ns();
     let initial_state = snapshot.state.clone();
     let mut state = snapshot.state.clone();
     let mut last_error: Option<String> = None;
@@ -872,25 +932,16 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
 
-            let elapsed_ns = current_time_ns().saturating_sub(started_at_ns);
-            if elapsed_ns >= max_turn_duration_ns {
-                append_inner_dialogue(
-                    &mut inner_dialogue,
-                    &format!(
-                        "continuation stopped: max turn duration reached ({} ms)",
-                        max_turn_duration_ns / 1_000_000
-                    ),
-                );
-                continuation_stop_reason = ContinuationStopReason::MaxDuration;
-                log!(
-                    AgentLogPriority::Info,
-                    "turn={} continuation_stop reason=max_duration rounds={} elapsed_ms={} max_duration_ms={} tool_calls_so_far={}",
-                    turn_id,
-                    inference_round_count,
-                    elapsed_ns / 1_000_000,
-                    max_turn_duration_ns / 1_000_000,
-                    all_tool_calls.len(),
-                );
+            if stop_for_turn_deadline_if_elapsed(
+                &turn_id,
+                started_at_ns,
+                max_turn_duration_ns,
+                inference_round_count,
+                all_tool_calls.len(),
+                "before_inference",
+                &mut inner_dialogue,
+                &mut continuation_stop_reason,
+            ) {
                 break;
             }
 
@@ -900,6 +951,18 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             } else {
                 infer_with_provider_transcript(&snapshot, &input, &transcript).await
             };
+            if stop_for_turn_deadline_if_elapsed(
+                &turn_id,
+                started_at_ns,
+                max_turn_duration_ns,
+                inference_round_count,
+                all_tool_calls.len(),
+                "after_inference_await",
+                &mut inner_dialogue,
+                &mut continuation_stop_reason,
+            ) {
+                break;
+            }
             let inference = match inference_result {
                 Ok(inference) => inference,
                 Err(reason) => {
@@ -981,7 +1044,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         turn_id,
                         inference_round_count,
                         max_tool_calls_per_turn,
-                        elapsed_ns / 1_000_000,
+                        current_time_ns().saturating_sub(started_at_ns) / 1_000_000,
                     );
                     break;
                 }
@@ -1078,9 +1141,33 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 tool_calls: planned_tool_calls.clone(),
             });
 
+            if stop_for_turn_deadline_if_elapsed(
+                &turn_id,
+                started_at_ns,
+                max_turn_duration_ns,
+                inference_round_count,
+                all_tool_calls.len(),
+                "before_tool_execution",
+                &mut inner_dialogue,
+                &mut continuation_stop_reason,
+            ) {
+                break;
+            }
             let executed = manager
                 .execute_actions(&state, &executable_tool_calls, signer.as_ref(), &turn_id)
                 .await;
+            if stop_for_turn_deadline_if_elapsed(
+                &turn_id,
+                started_at_ns,
+                max_turn_duration_ns,
+                inference_round_count,
+                all_tool_calls.len(),
+                "after_tool_execution_await",
+                &mut inner_dialogue,
+                &mut continuation_stop_reason,
+            ) {
+                break;
+            }
             executed_any_tool = executed_any_tool || !executed.is_empty();
 
             let execution_completed_ns = current_time_ns();
@@ -1127,11 +1214,31 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 assistant_reply = Some(tool_results_reply);
             }
 
-            if round_tool_records
+            let failed_tool_records = round_tool_records
                 .iter()
-                .any(|record| !record.success && !is_sequence_validator_block(record))
-            {
-                last_error = Some("tool execution reported failures".to_string());
+                .filter(|record| !record.success && !is_sequence_validator_block(record))
+                .collect::<Vec<_>>();
+            let mut stop_after_degraded_tool_failures = false;
+            if !failed_tool_records.is_empty() {
+                if should_degrade_tool_failures_for_autonomy(
+                    &failed_tool_records,
+                    has_external_input,
+                ) {
+                    let details = failed_tool_records
+                        .iter()
+                        .map(|record| summarize_tool_call(record))
+                        .collect::<Vec<_>>()
+                        .join("\n- ");
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        &format!(
+                            "autonomy degraded after recoverable http_fetch extraction failure(s):\n- {details}"
+                        ),
+                    );
+                    stop_after_degraded_tool_failures = true;
+                } else {
+                    last_error = Some("tool execution reported failures".to_string());
+                }
             }
 
             for (call, record) in planned_tool_calls.iter().zip(round_tool_records.iter()) {
@@ -1145,6 +1252,9 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 
             all_tool_calls.extend(round_tool_records);
 
+            if stop_after_degraded_tool_failures {
+                break;
+            }
             if last_error.is_some() {
                 break;
             }
@@ -1213,10 +1323,14 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     if inner_dialogue.is_none() && !has_external_input && last_error.is_none() {
         inner_dialogue = Some("autonomy tick complete: no action".to_string());
     }
+    let finished_at_ns = current_time_ns();
+    let turn_duration_ms = finished_at_ns.saturating_sub(started_at_ns) / 1_000_000;
 
     let turn_record = TurnRecord {
         id: turn_id.clone(),
         created_at_ns: started_at_ns,
+        finished_at_ns: Some(finished_at_ns),
+        duration_ms: Some(turn_duration_ms),
         state_from: initial_state,
         state_to: state.clone(),
         source_events: (evm_events as u32)
@@ -1237,6 +1351,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     };
 
     stable::append_turn_record(&turn_record, &all_tool_calls);
+    stable::record_turn_duration(started_at_ns, finished_at_ns, max_turn_duration_ns);
 
     stable::complete_turn(state, last_error.clone());
     log!(
@@ -1248,7 +1363,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         turn_record.inference_round_count,
         turn_record.continuation_stop_reason,
         all_tool_calls.len(),
-        current_time_ns().saturating_sub(started_at_ns) / 1_000_000,
+        turn_duration_ms,
     );
     if let Some(reason) = last_error {
         return Err(reason);
@@ -1386,6 +1501,56 @@ mod tests {
         assert!(reply.contains("Tool results: 1 succeeded, 1 failed."));
         assert!(reply.contains("`remember`: stored"));
         assert!(reply.contains("`evm_read` failed: rpc timeout"));
+    }
+
+    #[test]
+    fn autonomy_degrades_http_fetch_extraction_failures_without_external_input() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some("regex extraction failed: no matching lines".to_string()),
+        };
+        let failures = vec![&failed];
+        assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn external_input_keeps_http_fetch_extraction_failures_terminal() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some("json_path extraction failed: path `pairs[0]` not found".to_string()),
+        };
+        let failures = vec![&failed];
+        assert!(!should_degrade_tool_failures_for_autonomy(&failures, true));
+    }
+
+    #[test]
+    fn autonomy_does_not_degrade_non_extraction_tool_failures() {
+        let failed_http = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some("HTTP fetch failed: call rejected: 2 - timed out".to_string()),
+        };
+        let failed_other = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "evm_read".to_string(),
+            args_json: "{}".to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some("rpc timeout".to_string()),
+        };
+        let failures = vec![&failed_http, &failed_other];
+        assert!(!should_degrade_tool_failures_for_autonomy(&failures, false));
     }
 
     #[test]
@@ -1803,6 +1968,19 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Tool results"),
             "inner dialogue should include tool execution summary"
+        );
+        assert!(
+            turn.finished_at_ns.is_some(),
+            "turn records should capture completion timestamp"
+        );
+        assert!(
+            turn.duration_ms.is_some(),
+            "turn records should capture duration in milliseconds"
+        );
+        let runtime = stable::runtime_snapshot();
+        assert_eq!(
+            runtime.timing_telemetry.last_turn_duration_ms, turn.duration_ms,
+            "runtime timing telemetry should track the most recent turn duration"
         );
     }
 

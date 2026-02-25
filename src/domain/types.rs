@@ -474,6 +474,8 @@ pub struct RuntimeSnapshot {
     pub wallet_balance_bootstrap_pending: bool,
     #[serde(default)]
     pub cycle_topup: CycleTopUpConfig,
+    #[serde(default)]
+    pub timing_telemetry: RuntimeTimingTelemetry,
 }
 
 impl Default for RuntimeSnapshot {
@@ -506,6 +508,7 @@ impl Default for RuntimeSnapshot {
             wallet_balance_sync: WalletBalanceSyncConfig::default(),
             wallet_balance_bootstrap_pending: default_wallet_balance_bootstrap_pending(),
             cycle_topup: CycleTopUpConfig::default(),
+            timing_telemetry: RuntimeTimingTelemetry::default(),
         }
     }
 }
@@ -538,6 +541,10 @@ pub enum ContinuationStopReason {
 pub struct TurnRecord {
     pub id: String,
     pub created_at_ns: u64,
+    #[serde(default)]
+    pub finished_at_ns: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
     pub state_from: AgentState,
     pub state_to: AgentState,
     pub source_events: u32,
@@ -984,6 +991,8 @@ pub struct RuntimeView {
     pub last_transition_at_ns: u64,
     pub inference_provider: InferenceProvider,
     pub inference_model: String,
+    #[serde(default)]
+    pub timing_telemetry: RuntimeTimingTelemetry,
 }
 
 /// Read-only view of the EVM polling configuration and cursor, returned by queries.
@@ -1016,8 +1025,45 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             last_transition_at_ns: snapshot.last_transition_at_ns,
             inference_provider: snapshot.inference_provider.clone(),
             inference_model: snapshot.inference_model.clone(),
+            timing_telemetry: snapshot.timing_telemetry.clone(),
         }
     }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct OutcallTimingStats {
+    #[serde(default)]
+    pub total_calls: u64,
+    #[serde(default)]
+    pub failure_calls: u64,
+    #[serde(default)]
+    pub timeout_failures: u64,
+    #[serde(default)]
+    pub total_duration_ms: u64,
+    #[serde(default)]
+    pub max_duration_ms: u64,
+    #[serde(default)]
+    pub last_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub last_started_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_finished_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct RuntimeTimingTelemetry {
+    #[serde(default)]
+    pub last_turn_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub max_turn_duration_ms: u64,
+    #[serde(default)]
+    pub turns_over_budget: u64,
+    #[serde(default)]
+    pub inference_outcall: OutcallTimingStats,
+    #[serde(default)]
+    pub http_fetch_outcall: OutcallTimingStats,
 }
 
 impl From<&RuntimeSnapshot> for EvmRouteStateView {

@@ -144,6 +144,8 @@ const MAX_TURN_INNER_DIALOGUE_CHARS: usize = 12_000;
 const MAX_TOOL_ARGS_JSON_CHARS: usize = 4_000;
 /// Character limit for tool call `output` stored in `TOOL_MAP`.
 const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
+/// Character limit for telemetry error text retained in runtime timing stats.
+const MAX_TIMING_ERROR_CHARS: usize = 512;
 const MIN_RETENTION_BATCH_SIZE: u32 = 1;
 const MAX_RETENTION_BATCH_SIZE: u32 = 1_000;
 const MIN_RETENTION_INTERVAL_SECS: u64 = 1;
@@ -2844,6 +2846,62 @@ pub fn append_turn_record(record: &TurnRecord, tool_calls: &[ToolCallRecord]) {
     });
 
     set_tool_records(&bounded_record.id, tool_calls);
+}
+
+/// Distinguishes which outcall telemetry bucket should be updated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeOutcallKind {
+    Inference,
+    HttpFetch,
+}
+
+/// Records aggregate turn duration telemetry in the runtime snapshot.
+pub fn record_turn_duration(started_at_ns: u64, finished_at_ns: u64, max_turn_duration_ns: u64) {
+    let mut snapshot = runtime_snapshot();
+    let duration_ns = finished_at_ns.saturating_sub(started_at_ns);
+    let duration_ms = duration_ns / 1_000_000;
+    snapshot.timing_telemetry.last_turn_duration_ms = Some(duration_ms);
+    snapshot.timing_telemetry.max_turn_duration_ms = snapshot
+        .timing_telemetry
+        .max_turn_duration_ms
+        .max(duration_ms);
+    if duration_ns >= max_turn_duration_ns {
+        snapshot.timing_telemetry.turns_over_budget = snapshot
+            .timing_telemetry
+            .turns_over_budget
+            .saturating_add(1);
+    }
+    save_runtime_snapshot(&snapshot);
+}
+
+/// Records one inference/http-fetch outcall latency sample in runtime telemetry.
+pub fn record_outcall_timing(
+    kind: RuntimeOutcallKind,
+    started_at_ns: u64,
+    finished_at_ns: u64,
+    error: Option<&str>,
+    timed_out: bool,
+) {
+    let mut snapshot = runtime_snapshot();
+    let duration_ms = finished_at_ns.saturating_sub(started_at_ns) / 1_000_000;
+    let stats = match kind {
+        RuntimeOutcallKind::Inference => &mut snapshot.timing_telemetry.inference_outcall,
+        RuntimeOutcallKind::HttpFetch => &mut snapshot.timing_telemetry.http_fetch_outcall,
+    };
+    stats.total_calls = stats.total_calls.saturating_add(1);
+    if error.is_some() {
+        stats.failure_calls = stats.failure_calls.saturating_add(1);
+    }
+    if timed_out {
+        stats.timeout_failures = stats.timeout_failures.saturating_add(1);
+    }
+    stats.total_duration_ms = stats.total_duration_ms.saturating_add(duration_ms);
+    stats.max_duration_ms = stats.max_duration_ms.max(duration_ms);
+    stats.last_duration_ms = Some(duration_ms);
+    stats.last_started_at_ns = Some(started_at_ns);
+    stats.last_finished_at_ns = Some(finished_at_ns);
+    stats.last_error = error.map(|message| truncate_text_field(message, MAX_TIMING_ERROR_CHARS));
+    save_runtime_snapshot(&snapshot);
 }
 
 /// Returns the most-recent `limit` FSM transition records (newest first).
@@ -5551,6 +5609,8 @@ mod canbench_pilots {
             let turn = TurnRecord {
                 id: format!("turn-{seq}"),
                 created_at_ns,
+                finished_at_ns: Some(created_at_ns.saturating_add(1)),
+                duration_ms: Some(0),
                 state_from: AgentState::Sleeping,
                 state_to: AgentState::Sleeping,
                 source_events: 0,
@@ -6596,6 +6656,8 @@ mod tests {
         let turn = TurnRecord {
             id: "turn-old".to_string(),
             created_at_ns: old_ns,
+            finished_at_ns: Some(old_ns.saturating_add(1)),
+            duration_ms: Some(0),
             state_from: AgentState::Sleeping,
             state_to: AgentState::Sleeping,
             source_events: 0,
@@ -6920,6 +6982,8 @@ mod tests {
         let turn = TurnRecord {
             id: turn_id.to_string(),
             created_at_ns: 42,
+            finished_at_ns: Some(43),
+            duration_ms: Some(0),
             state_from: AgentState::Inferring,
             state_to: AgentState::Persisting,
             source_events: 1,
@@ -7864,6 +7928,7 @@ mod tests {
         legacy_obj.remove("wallet_balance");
         legacy_obj.remove("wallet_balance_sync");
         legacy_obj.remove("wallet_balance_bootstrap_pending");
+        legacy_obj.remove("timing_telemetry");
         let payload = serde_json::to_vec(&legacy).expect("legacy json should serialize");
 
         RUNTIME_MAP.with(|map| {
@@ -7877,6 +7942,70 @@ mod tests {
         assert_eq!(loaded.wallet_balance_sync.freshness_window_secs, 600);
         assert_eq!(loaded.wallet_balance_sync.max_response_bytes, 256);
         assert!(loaded.wallet_balance_bootstrap_pending);
+        assert_eq!(loaded.timing_telemetry.turns_over_budget, 0);
+        assert_eq!(loaded.timing_telemetry.max_turn_duration_ms, 0);
+        assert_eq!(loaded.timing_telemetry.inference_outcall.total_calls, 0);
+    }
+
+    #[test]
+    fn record_turn_duration_tracks_last_max_and_budget_overruns() {
+        init_storage();
+
+        record_turn_duration(10, 1_500_000_010, 1_000_000_000);
+        let first = runtime_snapshot();
+        assert_eq!(first.timing_telemetry.last_turn_duration_ms, Some(1_500));
+        assert_eq!(first.timing_telemetry.max_turn_duration_ms, 1_500);
+        assert_eq!(first.timing_telemetry.turns_over_budget, 1);
+
+        record_turn_duration(20, 700_000_020, 1_000_000_000);
+        let second = runtime_snapshot();
+        assert_eq!(second.timing_telemetry.last_turn_duration_ms, Some(700));
+        assert_eq!(second.timing_telemetry.max_turn_duration_ms, 1_500);
+        assert_eq!(second.timing_telemetry.turns_over_budget, 1);
+    }
+
+    #[test]
+    fn record_outcall_timing_tracks_latency_failures_and_timeouts() {
+        init_storage();
+
+        record_outcall_timing(RuntimeOutcallKind::Inference, 10, 500_000_010, None, false);
+        record_outcall_timing(
+            RuntimeOutcallKind::Inference,
+            20,
+            200_000_020,
+            Some("upstream timeout"),
+            true,
+        );
+        record_outcall_timing(
+            RuntimeOutcallKind::HttpFetch,
+            40,
+            100_000_040,
+            Some("HTTP 500"),
+            false,
+        );
+
+        let snapshot = runtime_snapshot();
+        let inference = &snapshot.timing_telemetry.inference_outcall;
+        assert_eq!(inference.total_calls, 2);
+        assert_eq!(inference.failure_calls, 1);
+        assert_eq!(inference.timeout_failures, 1);
+        assert_eq!(inference.total_duration_ms, 700);
+        assert_eq!(inference.max_duration_ms, 500);
+        assert_eq!(inference.last_duration_ms, Some(200));
+        assert_eq!(inference.last_started_at_ns, Some(20));
+        assert_eq!(inference.last_finished_at_ns, Some(200_000_020));
+        assert_eq!(inference.last_error.as_deref(), Some("upstream timeout"));
+
+        let http_fetch = &snapshot.timing_telemetry.http_fetch_outcall;
+        assert_eq!(http_fetch.total_calls, 1);
+        assert_eq!(http_fetch.failure_calls, 1);
+        assert_eq!(http_fetch.timeout_failures, 0);
+        assert_eq!(http_fetch.total_duration_ms, 100);
+        assert_eq!(http_fetch.max_duration_ms, 100);
+        assert_eq!(http_fetch.last_duration_ms, Some(100));
+        assert_eq!(http_fetch.last_started_at_ns, Some(40));
+        assert_eq!(http_fetch.last_finished_at_ns, Some(100_000_040));
+        assert_eq!(http_fetch.last_error.as_deref(), Some("HTTP 500"));
     }
 
     #[test]
