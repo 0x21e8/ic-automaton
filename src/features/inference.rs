@@ -680,7 +680,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "object".to_string(),
                         name: "extract".to_string(),
                         description: Some(
-                            "Optional extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"data.price\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"^price:\\\\d+$\"}. Prefer extraction to minimize untrusted content."
+                            "Optional extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"data.price\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"^price:\\\\d+$\"}. Paths use dot notation from the root WITHOUT a leading $ prefix. Examples: \"pairs[0].priceUsd\", \"data.attributes.base_token_price_usd\". Prefer extraction to minimize untrusted content."
                                 .to_string(),
                         ),
                     },

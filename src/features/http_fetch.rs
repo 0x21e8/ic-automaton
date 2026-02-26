@@ -183,6 +183,11 @@ enum JsonPathSegment {
 
 fn parse_json_path_segments(path: &str) -> Result<Vec<JsonPathSegment>, String> {
     let mut segments = Vec::<JsonPathSegment>::new();
+    // Strip optional JSONPath root prefix ($. or standalone $)
+    let path = path
+        .strip_prefix("$.")
+        .or_else(|| path.strip_prefix("$"))
+        .unwrap_or(path);
     let chars = path.chars().collect::<Vec<_>>();
     let mut i = 0usize;
     let len = chars.len();
@@ -611,6 +616,20 @@ mod tests {
         let err = extract_json_path(r#"{"pairs":[{"priceUsd":"0.31"}]}"#, "pairs[one].priceUsd")
             .expect_err("non-numeric array index should fail json_path extraction");
         assert!(err.contains("invalid path"));
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_strips_dollar_dot_prefix() {
+        let out = extract_json_path(r#"{"pairs":[{"priceUsd":"0.31"}]}"#, "$.pairs[0].priceUsd")
+            .expect("$.prefix json_path extraction should succeed");
+        assert_eq!(out, "0.31");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_strips_standalone_dollar_prefix() {
+        let out = extract_json_path(r#"{"pairs":[{"priceUsd":"0.31"}]}"#, "$pairs[0].priceUsd")
+            .expect("$prefix json_path extraction should succeed");
+        assert_eq!(out, "0.31");
     }
 
     #[test]

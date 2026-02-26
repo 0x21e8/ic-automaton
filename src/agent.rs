@@ -325,7 +325,7 @@ fn is_sequence_validator_block(record: &ToolCallRecord) -> bool {
         .unwrap_or(false)
 }
 
-fn is_http_fetch_extraction_failure(record: &ToolCallRecord) -> bool {
+fn is_http_fetch_recoverable_failure(record: &ToolCallRecord) -> bool {
     if record.tool != "http_fetch" {
         return false;
     }
@@ -335,6 +335,7 @@ fn is_http_fetch_extraction_failure(record: &ToolCallRecord) -> bool {
     let normalized = error.trim().to_ascii_lowercase();
     normalized.starts_with("json_path extraction failed:")
         || normalized.starts_with("regex extraction failed:")
+        || normalized.starts_with("http 4")
 }
 
 fn should_degrade_tool_failures_for_autonomy(
@@ -346,7 +347,7 @@ fn should_degrade_tool_failures_for_autonomy(
     }
     tool_failures
         .iter()
-        .all(|record| is_http_fetch_extraction_failure(record))
+        .all(|record| is_http_fetch_recoverable_failure(record))
 }
 
 /// Persists the fingerprint and timestamp of every successful autonomy tool call
@@ -1232,7 +1233,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     append_inner_dialogue(
                         &mut inner_dialogue,
                         &format!(
-                            "autonomy degraded after recoverable http_fetch extraction failure(s):\n- {details}"
+                            "autonomy degraded after recoverable http_fetch failure(s):\n- {details}"
                         ),
                     );
                     stop_after_degraded_tool_failures = true;
@@ -1532,7 +1533,26 @@ mod tests {
     }
 
     #[test]
-    fn autonomy_does_not_degrade_non_extraction_tool_failures() {
+    fn autonomy_degrades_http_fetch_4xx_failures_without_external_input() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json:
+                r#"{"url":"https://api.geckoterminal.com/api/v2/networks/base/pools/0xdead"}"#
+                    .to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some(
+                "HTTP 404 from https://api.geckoterminal.com/api/v2/networks/base/pools/0xdead"
+                    .to_string(),
+            ),
+        };
+        let failures = vec![&failed];
+        assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn autonomy_does_not_degrade_non_recoverable_tool_failures() {
         let failed_http = ToolCallRecord {
             turn_id: "turn-1".to_string(),
             tool: "http_fetch".to_string(),
