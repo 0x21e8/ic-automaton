@@ -64,10 +64,11 @@ Shows the raw FSM events. Look for `TurnFailed { reason: "..." }` events — the
 ### Tool calls for a specific turn
 
 ```bash
-icp canister call $CANISTER list_tool_calls_for_turn '("turn-451")' -n ic
+icp canister call $CANISTER get_tool_calls_for_turn '("turn-451")' -n ic
 ```
 
 Returns every `ToolCallRecord` for that turn: tool name, args JSON, output, success flag, error string. The most direct way to see exactly what failed and why.
+If your deployment is older and this method is missing, try `list_tool_calls_for_turn`.
 
 ### Observability snapshot (everything at once)
 

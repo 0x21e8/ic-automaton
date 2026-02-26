@@ -5376,6 +5376,7 @@ fn save_runtime_u64(key: &str, value: u64) {
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn runtime_u128(key: &str) -> Option<u128> {
     RUNTIME_MAP
         .with(|map| map.borrow().get(&key.to_string()))

@@ -289,6 +289,28 @@ fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Returns `true` when `call` is a `recall` over the config endpoint namespace.
+///
+/// These recalls are cheap local reads and critical for grounding external URLs,
+/// so they bypass autonomy dedupe even within the freshness window.
+fn is_config_endpoint_recall(call: &ToolCall) -> bool {
+    if call.tool.trim() != "recall" {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.args_json) else {
+        return false;
+    };
+    args.get("prefix")
+        .and_then(|value| value.as_str())
+        .map(|prefix| {
+            prefix
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("config.endpoint.")
+        })
+        .unwrap_or(false)
+}
+
 /// Partitions `calls` into an allowed set and a suppressed set.
 ///
 /// A call is suppressed when an identical call (same fingerprint) succeeded
@@ -302,6 +324,10 @@ fn suppress_duplicate_autonomy_tool_calls(
     let mut suppressed = Vec::new();
 
     for (index, call) in calls.iter().enumerate() {
+        if is_config_endpoint_recall(call) {
+            allowed.push(call.clone());
+            continue;
+        }
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
         let Some(last_success_ns) = stable::autonomy_tool_last_success_ns(&fingerprint) else {
             allowed.push(call.clone());
@@ -1818,6 +1844,56 @@ mod tests {
         );
         assert_eq!(allowed_late.len(), 1);
         assert!(suppressed_late.is_empty());
+    }
+
+    #[test]
+    fn recall_config_endpoint_calls_bypass_autonomy_dedupe_window() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let call = ToolCall {
+            tool_call_id: None,
+            tool: "recall".to_string(),
+            args_json: r#"{"prefix":"config.endpoint.dexscreener.base_v3_degen_weth"}"#.to_string(),
+        };
+        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        stable::record_autonomy_tool_success(&fingerprint, 1_000);
+
+        let (allowed, suppressed) = suppress_duplicate_autonomy_tool_calls(
+            std::slice::from_ref(&call),
+            1_000 + timing::AUTONOMY_DEDUPE_WINDOW_NS - 1,
+        );
+
+        assert_eq!(
+            allowed.len(),
+            1,
+            "config.endpoint recall should never dedupe"
+        );
+        assert!(
+            suppressed.is_empty(),
+            "config.endpoint recall should not produce synthetic skipped records"
+        );
+    }
+
+    #[test]
+    fn recall_non_config_prefix_still_uses_autonomy_dedupe() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let call = ToolCall {
+            tool_call_id: None,
+            tool: "recall".to_string(),
+            args_json: r#"{"prefix":"strategy."}"#.to_string(),
+        };
+        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        stable::record_autonomy_tool_success(&fingerprint, 1_000);
+
+        let (allowed, suppressed) = suppress_duplicate_autonomy_tool_calls(
+            std::slice::from_ref(&call),
+            1_000 + timing::AUTONOMY_DEDUPE_WINDOW_NS - 1,
+        );
+
+        assert!(
+            allowed.is_empty(),
+            "non-config recall should continue deduping"
+        );
+        assert_eq!(suppressed.len(), 1);
     }
 
     #[test]

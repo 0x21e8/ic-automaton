@@ -58,6 +58,7 @@ pub const DEFAULT_SAFETY_MARGIN_BPS: u32 = 2_500;
 /// Default reserve floor: cycles that must remain in the canister at all times.
 pub const DEFAULT_RESERVE_FLOOR_CYCLES: u128 = 200_000_000_000;
 /// Assumed subnet size for non-replicated (host/test) cost estimation.
+#[cfg(not(target_arch = "wasm32"))]
 const NON_REPLICATED_DEFAULT_SUBNET_SIZE: u128 = 13;
 
 // ── Public API ───────────────────────────────────────────────────────────────
