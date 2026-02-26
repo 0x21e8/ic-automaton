@@ -1,7 +1,10 @@
 const DEFAULT_SNAPSHOT_PATH = '/api/snapshot';
 const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_DEDUPE_TTL_SECS = 24 * 60 * 60;
 const TERMINAL_JOB_STATUSES = new Set(['Failed', 'TimedOut', 'Skipped']);
 const TOOL_FAILURE_PREFIX = 'tool execution reported failures:';
+const DEDUPE_KEY_PREFIX = 'seen_event:';
+const IN_MEMORY_DEDUPE = new Map();
 
 export function normalizeBaseUrl(raw) {
   const trimmed = String(raw ?? '').trim().replace(/\/+$/, '');
@@ -74,6 +77,11 @@ export function buildConfig(env) {
     ingestUrl,
     sourceToken,
     timeoutMs: parsePositiveInt(env.HTTP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 'HTTP_TIMEOUT_MS'),
+    dedupeTtlSecs: parsePositiveInt(
+      env.ERROR_DEDUPE_TTL_SECS,
+      DEFAULT_DEDUPE_TTL_SECS,
+      'ERROR_DEDUPE_TTL_SECS',
+    ),
     emitHealthLog: parseBool(env.EMIT_HEALTH_LOG, false),
     source: String(env.LOG_SOURCE ?? 'ic-automaton-monitor').trim() || 'ic-automaton-monitor',
   };
@@ -156,6 +164,94 @@ function parseToolExecutionFailureMessage(message) {
     failedTools,
     failedToolNames: [...new Set(failedTools.map((entry) => entry.tool))],
   };
+}
+
+function summarizeToolFailureMessage(toolFailure) {
+  if (!toolFailure || !Array.isArray(toolFailure.failedTools) || toolFailure.failedTools.length === 0) {
+    return null;
+  }
+  return toolFailure.failedTools
+    .map((entry) => `${entry.tool}: ${entry.reason}`)
+    .join(' | ')
+    .slice(0, 500);
+}
+
+function stableHash(raw) {
+  let hash = 5381;
+  for (let i = 0; i < raw.length; i += 1) {
+    hash = ((hash << 5) + hash) ^ raw.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function dedupeIdentityForEvent(event) {
+  switch (event.category) {
+    case 'runtime_last_error':
+      return `${event.category}|${event.runtime_state ?? 'unknown'}|${event.turn_counter ?? 'unknown'}|${event.message}`;
+    case 'scheduler_last_tick_error':
+      return `${event.category}|${event.last_tick_finished_ns ?? 'unknown'}|${event.survival_tier ?? 'unknown'}|${event.message}`;
+    case 'recent_job_error':
+      return `${event.category}|${event.job_id ?? 'unknown'}|${event.job_status ?? 'unknown'}|${event.message}`;
+    case 'recent_turn_error':
+      return `${event.category}|${event.turn_id ?? 'unknown'}|${event.message}`;
+    case 'recent_transition_error':
+      return `${event.category}|${event.transition_id ?? 'unknown'}|${event.message}`;
+    default:
+      return `${event.category}|${event.message}`;
+  }
+}
+
+function dedupeStorageKey(event) {
+  const identity = dedupeIdentityForEvent(event);
+  return `${DEDUPE_KEY_PREFIX}${stableHash(identity)}`;
+}
+
+function resolveDedupeStore(env) {
+  if (env?.MONITOR_STATE_KV && typeof env.MONITOR_STATE_KV.get === 'function') {
+    return { kind: 'kv', store: env.MONITOR_STATE_KV };
+  }
+  return { kind: 'memory', store: IN_MEMORY_DEDUPE };
+}
+
+async function hasSeenEvent(dedupeStore, key, nowMs) {
+  if (dedupeStore.kind === 'kv') {
+    const existing = await dedupeStore.store.get(key);
+    return typeof existing === 'string' && existing.length > 0;
+  }
+  const expiresAtMs = dedupeStore.store.get(key);
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+    dedupeStore.store.delete(key);
+    return false;
+  }
+  return true;
+}
+
+async function markEventSeen(dedupeStore, key, ttlSecs, nowMs) {
+  if (dedupeStore.kind === 'kv') {
+    await dedupeStore.store.put(key, String(nowMs), { expirationTtl: ttlSecs });
+    return;
+  }
+  dedupeStore.store.set(key, nowMs + ttlSecs * 1000);
+}
+
+export async function dedupeEvents(events, env, ttlSecs = DEFAULT_DEDUPE_TTL_SECS) {
+  const dedupeStore = resolveDedupeStore(env);
+  const nowMs = Date.now();
+  const freshEvents = [];
+
+  for (const event of events) {
+    const key = dedupeStorageKey(event);
+    // eslint-disable-next-line no-await-in-loop
+    const seen = await hasSeenEvent(dedupeStore, key, nowMs);
+    if (seen) {
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await markEventSeen(dedupeStore, key, ttlSecs, nowMs);
+    freshEvents.push(event);
+  }
+
+  return freshEvents;
 }
 
 function baseEvent(level, category, message, context) {
@@ -249,8 +345,12 @@ export function extractLogEvents(snapshot, options) {
       continue;
     }
     const toolFailure = parseToolExecutionFailureMessage(turn.error);
+    const summarizedToolFailure = summarizeToolFailureMessage(toolFailure);
+    const message = summarizedToolFailure
+      ? `${TOOL_FAILURE_PREFIX} ${summarizedToolFailure}`
+      : turn.error;
     events.push(
-      baseEvent('error', 'recent_turn_error', turn.error, {
+      baseEvent('error', 'recent_turn_error', message, {
         source: 'ic-automaton-monitor',
         trigger,
         canister_base_url: canisterBaseUrl,
@@ -264,6 +364,7 @@ export function extractLogEvents(snapshot, options) {
         failed_tool_count: toolFailure?.failedToolCount ?? null,
         failed_tool_names: toolFailure?.failedToolNames ?? null,
         failed_tools: toolFailure?.failedTools ?? null,
+        turn_error_raw: turn.error,
       }),
     );
   }
@@ -357,11 +458,12 @@ async function sendToBetterStack(events, config) {
 export async function runForwarder(env, trigger) {
   const config = buildConfig(env);
   const snapshot = await fetchSnapshot(config);
-  const events = extractLogEvents(snapshot, {
+  const extractedEvents = extractLogEvents(snapshot, {
     canisterBaseUrl: config.canisterBaseUrl,
     trigger,
     emitHealthLog: config.emitHealthLog,
   }).map((event) => ({ ...event, source: config.source }));
+  const events = await dedupeEvents(extractedEvents, env, config.dedupeTtlSecs);
 
   const ingest = await sendToBetterStack(events, config);
 
@@ -369,7 +471,8 @@ export async function runForwarder(env, trigger) {
     ok: true,
     trigger,
     snapshot_url: config.snapshotUrl,
-    events_extracted: events.length,
+    events_extracted: extractedEvents.length,
+    events_deduped: extractedEvents.length - events.length,
     events_sent: ingest.sent,
     ingest_status: ingest.status,
   };

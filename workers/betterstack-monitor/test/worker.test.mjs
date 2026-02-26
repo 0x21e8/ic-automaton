@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildConfig,
+  dedupeEvents,
   extractLogEvents,
   normalizeBaseUrl,
   normalizeIngestEndpoint,
@@ -214,6 +215,10 @@ test('extractLogEvents parses structured tool-failure details from turn errors',
 
   assert.equal(events.length, 1);
   assert.equal(events[0].category, 'recent_turn_error');
+  assert.equal(
+    events[0].message,
+    'tool execution reported failures: evm_read: rpc timeout | http_fetch: HTTP 404 from https://example.com/missing',
+  );
   assert.equal(events[0].turn_error_kind, 'tool_execution_failures');
   assert.equal(events[0].failed_tool_count, 2);
   assert.equal(events[0].turn_tool_call_count, 2);
@@ -224,4 +229,49 @@ test('extractLogEvents parses structured tool-failure details from turn errors',
     { tool: 'evm_read', reason: 'rpc timeout' },
     { tool: 'http_fetch', reason: 'HTTP 404 from https://example.com/missing' },
   ]);
+});
+
+test('dedupeEvents suppresses repeated event payloads across runs via KV store', async () => {
+  const kvBacking = new Map();
+  const env = {
+    MONITOR_STATE_KV: {
+      async get(key) {
+        return kvBacking.has(key) ? kvBacking.get(key) : null;
+      },
+      async put(key, value) {
+        kvBacking.set(key, value);
+      },
+    },
+  };
+  const events = [
+    {
+      category: 'recent_turn_error',
+      message: 'tool execution reported failures: http_fetch: HTTP 404',
+      turn_id: 'turn-461',
+    },
+    {
+      category: 'recent_turn_error',
+      message: 'tool execution reported failures: http_fetch: timeout',
+      turn_id: 'turn-489',
+    },
+  ];
+
+  const first = await dedupeEvents(events, env, 60);
+  assert.equal(first.length, 2);
+
+  const second = await dedupeEvents(events, env, 60);
+  assert.equal(second.length, 0);
+
+  const changed = await dedupeEvents(
+    [
+      {
+        category: 'recent_turn_error',
+        message: 'tool execution reported failures: http_fetch: timeout',
+        turn_id: 'turn-490',
+      },
+    ],
+    env,
+    60,
+  );
+  assert.equal(changed.length, 1);
 });

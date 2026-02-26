@@ -36,6 +36,13 @@ Set these in `wrangler.toml` / Cloudflare dashboard:
 - `HTTP_TIMEOUT_MS` (optional, default `10000`)
 - `EMIT_HEALTH_LOG` (optional, default `false`)
 - `LOG_SOURCE` (optional, default `ic-automaton-monitor`)
+- `ERROR_DEDUPE_TTL_SECS` (optional, default `86400`)
+  - Dedupe retention window for already-forwarded error events.
+
+Optional but recommended:
+- `MONITOR_STATE_KV` (Workers KV binding)
+  - Enables cross-run dedupe by event identity (`turn_id`, `job_id`, `transition_id`, message hash).
+  - Without KV, the worker falls back to in-memory dedupe per isolate.
 
 ## Deploy
 
@@ -44,6 +51,10 @@ cd workers/betterstack-monitor
 
 # Set secret once (token only)
 wrangler secret put BETTERSTACK_SOURCE_TOKEN
+
+# Recommended: create + bind KV for cross-run dedupe
+wrangler kv namespace create MONITOR_STATE
+wrangler kv namespace create MONITOR_STATE --preview
 
 # Deploy
 wrangler deploy
