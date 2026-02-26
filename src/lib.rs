@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
 /// IC canister entry point for the automaton, exposing all candid methods.
 ///
 /// This module wires together every subsystem — scheduler, agent, storage,
