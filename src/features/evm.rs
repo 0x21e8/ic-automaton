@@ -2128,7 +2128,7 @@ mod tests {
     use std::path::PathBuf;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::process::{Child, Command, Stdio};
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::sync::{Mutex, OnceLock};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
@@ -2164,36 +2164,8 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn host_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
     fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = host_env_lock()
-            .lock()
-            .expect("host env lock should not be poisoned");
-        let previous = vars
-            .iter()
-            .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
-            .collect::<Vec<_>>();
-
-        for (name, value) in vars {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-
-        f();
-
-        for (name, value) in previous {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
+        crate::test_support::with_locked_host_env(vars, f);
     }
 
     #[test]

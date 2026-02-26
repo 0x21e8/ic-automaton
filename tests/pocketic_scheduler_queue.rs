@@ -245,15 +245,11 @@ fn set_evm_rpc_url(pic: &PocketIc, canister_id: Principal, url: &str) {
     assert!(result.is_ok(), "set_evm_rpc_url failed: {result:?}");
 }
 
-fn set_automaton_evm_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
-    let payload = encode_args((Some(address.to_string()),))
-        .expect("failed to encode set_automaton_evm_address_admin args");
-    let result: Result<Option<String>, String> =
-        call_update(pic, canister_id, "set_automaton_evm_address_admin", payload);
-    assert!(
-        result.is_ok(),
-        "set_automaton_evm_address_admin failed: {result:?}"
-    );
+fn derive_automaton_evm_address(pic: &PocketIc, canister_id: Principal) -> String {
+    let payload = encode_args(()).expect("failed to encode derive_automaton_evm_address args");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "derive_automaton_evm_address", payload);
+    result.unwrap_or_else(|error| panic!("derive_automaton_evm_address failed: {error}"))
 }
 
 fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
@@ -292,6 +288,24 @@ fn get_scheduler_view(pic: &PocketIc, canister_id: Principal) -> SchedulerRuntim
         "get_scheduler_view",
         encode_args(()).expect("failed to encode empty args"),
     )
+}
+
+fn get_scheduler_base_tick_secs(pic: &PocketIc, canister_id: Principal) -> u64 {
+    call_query(
+        pic,
+        canister_id,
+        "get_scheduler_base_tick_secs",
+        encode_args(()).expect("failed to encode empty args"),
+    )
+}
+
+fn set_scheduler_base_tick_secs(pic: &PocketIc, canister_id: Principal, interval_secs: u64) -> u64 {
+    let payload = encode_args((interval_secs,)).unwrap_or_else(|error| {
+        panic!("failed to encode set_scheduler_base_tick_secs args: {error}");
+    });
+    let result: Result<u64, String> =
+        call_update(pic, canister_id, "set_scheduler_base_tick_secs", payload);
+    result.unwrap_or_else(|error| panic!("set_scheduler_base_tick_secs failed: {error}"))
 }
 
 fn configure_only_poll_inbox(pic: &PocketIc, canister_id: Principal, interval_secs: u64) {
@@ -602,11 +616,7 @@ fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
 
     configure_only_poll_inbox(&pic, canister_id, 60);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(
-        &pic,
-        canister_id,
-        "0x1111111111111111111111111111111111111111",
-    );
+    let _ = derive_automaton_evm_address(&pic, canister_id);
     set_inbox_contract_address_admin(
         &pic,
         canister_id,
@@ -632,6 +642,29 @@ fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
         "agent-turn lease ttl regression: expected 240 seconds"
     );
     assert_eq!(lease.lane, TaskLane::Mutating);
+}
+
+#[cfg(feature = "pocketic_tests")]
+#[test]
+fn scheduler_base_tick_runtime_update_rearms_timer_and_persists_upgrade() {
+    let (pic, canister_id) = with_backend_canister();
+    assert_eq!(get_scheduler_base_tick_secs(&pic, canister_id), 30);
+
+    let before = get_scheduler_view(&pic, canister_id).last_tick_finished_ns;
+    assert_eq!(set_scheduler_base_tick_secs(&pic, canister_id, 1), 1);
+
+    pic.advance_time(Duration::from_secs(2));
+    pic.tick();
+    let after = get_scheduler_view(&pic, canister_id).last_tick_finished_ns;
+    assert!(
+        after > before,
+        "re-armed base tick should trigger scheduler tick after 2s advance"
+    );
+
+    let wasm = assert_wasm_artifact_present();
+    let _ = pic.upgrade_canister(canister_id, wasm, vec![], None);
+
+    assert_eq!(get_scheduler_base_tick_secs(&pic, canister_id), 1);
 }
 
 #[cfg(feature = "pocketic_tests")]
@@ -679,6 +712,21 @@ fn non_controller_cannot_mutate_scheduler_control_plane() {
     assert!(
         low_cycles_result.is_err(),
         "set_scheduler_low_cycles_mode should reject non-controller callers"
+    );
+
+    let set_tick_payload =
+        encode_args((1u64,)).unwrap_or_else(|error| panic!("failed to encode payload: {error}"));
+    let set_tick_result: Result<u64, String> = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "set_scheduler_base_tick_secs",
+        set_tick_payload,
+    );
+    assert_eq!(
+        set_tick_result,
+        Err("caller is not a controller".to_string()),
+        "set_scheduler_base_tick_secs should enforce controller authorization"
     );
 }
 

@@ -247,15 +247,11 @@ fn set_evm_rpc_url(pic: &PocketIc, canister_id: Principal, url: &str) {
     assert!(result.is_ok(), "set_evm_rpc_url failed: {result:?}");
 }
 
-fn set_automaton_evm_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
-    let payload = encode_args((Some(address.to_string()),))
-        .expect("failed to encode set_automaton_evm_address_admin");
-    let result: Result<Option<String>, String> =
-        call_update(pic, canister_id, "set_automaton_evm_address_admin", payload);
-    assert!(
-        result.is_ok(),
-        "set_automaton_evm_address_admin failed: {result:?}"
-    );
+fn derive_automaton_evm_address(pic: &PocketIc, canister_id: Principal) -> String {
+    let payload = encode_args(()).expect("failed to encode derive_automaton_evm_address");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "derive_automaton_evm_address", payload);
+    result.unwrap_or_else(|error| panic!("derive_automaton_evm_address failed: {error}"))
 }
 
 fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
@@ -463,9 +459,8 @@ fn drive_poll_inbox_with_http_mocks(
 }
 
 fn configure_route_for_polling(pic: &PocketIc, canister_id: Principal) -> String {
-    let automaton_address = "0x1111111111111111111111111111111111111111".to_string();
     set_evm_rpc_url(pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(pic, canister_id, &automaton_address);
+    let automaton_address = derive_automaton_evm_address(pic, canister_id);
     set_inbox_contract_address_admin(
         pic,
         canister_id,

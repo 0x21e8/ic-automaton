@@ -21,7 +21,6 @@ const WASM_PATHS: &[&str] = &[
 const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
 
-const AUTOMATON_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
 const INBOX_CONTRACT_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
 const USDC_CONTRACT_ADDRESS: &str = "0x3333333333333333333333333333333333333333";
 const ETH_BALANCE_WEI_HEX: &str = "0x64";
@@ -217,14 +216,11 @@ fn set_evm_rpc_url(pic: &PocketIc, canister_id: Principal, url: &str) {
     assert!(result.is_ok(), "set_evm_rpc_url failed: {result:?}");
 }
 
-fn set_automaton_evm_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
-    let payload = encode_args((Some(address.to_string()),)).expect("failed to encode address");
-    let result: Result<Option<String>, String> =
-        call_update(pic, canister_id, "set_automaton_evm_address_admin", payload);
-    assert!(
-        result.is_ok(),
-        "set_automaton_evm_address_admin failed: {result:?}"
-    );
+fn derive_automaton_evm_address(pic: &PocketIc, canister_id: Principal) -> String {
+    let payload = encode_args(()).expect("failed to encode derive_automaton_evm_address");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "derive_automaton_evm_address", payload);
+    result.unwrap_or_else(|error| panic!("derive_automaton_evm_address failed: {error}"))
 }
 
 fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
@@ -551,9 +547,9 @@ fn bootstrap_gate_blocks_first_inference_until_wallet_sync_succeeds() {
     let (pic, canister_id) = with_backend_canister();
     configure_task_set(&pic, canister_id, true, true, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(&pic, canister_id, AUTOMATON_ADDRESS);
+    let automaton_address = derive_automaton_evm_address(&pic, canister_id);
     set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
-    let topic1 = address_to_topic(AUTOMATON_ADDRESS);
+    let topic1 = address_to_topic(&automaton_address);
     let payload = encode_message_queued_payload(
         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bootstrap gate must block agent turn before first wallet sync",
@@ -606,7 +602,7 @@ fn wallet_sync_refreshes_on_due_window_transitions_to_stale_and_degrades_non_fat
     let (pic, canister_id) = with_backend_canister();
     configure_task_set(&pic, canister_id, false, true, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(&pic, canister_id, AUTOMATON_ADDRESS);
+    let _ = derive_automaton_evm_address(&pic, canister_id);
     set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
 
     let config = get_wallet_balance_sync_config(&pic, canister_id);
@@ -686,7 +682,7 @@ fn wallet_sync_oversized_outcall_tunes_response_limit_and_recovers_without_manua
     let (pic, canister_id) = with_backend_canister();
     configure_task_set(&pic, canister_id, false, true, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(&pic, canister_id, AUTOMATON_ADDRESS);
+    let _ = derive_automaton_evm_address(&pic, canister_id);
     set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
 
     let before = get_wallet_balance_sync_config(&pic, canister_id);
@@ -743,7 +739,7 @@ fn wallet_balance_http_views_expose_safe_non_secret_fields() {
     let (pic, canister_id) = with_backend_canister();
     configure_task_set(&pic, canister_id, false, true, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    set_automaton_evm_address_admin(&pic, canister_id, AUTOMATON_ADDRESS);
+    let _ = derive_automaton_evm_address(&pic, canister_id);
     set_inbox_contract_address_admin(&pic, canister_id, INBOX_CONTRACT_ADDRESS);
 
     advance_and_run_due_poll_inbox(&pic, canister_id, WalletRpcMode::Success);

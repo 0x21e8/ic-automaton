@@ -232,11 +232,11 @@ type PromptLayerView = record {
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : StrategyTemplate; Err : text };
 type Result_10 = variant { Ok : PromptLayer; Err : text };
-type Result_2 = variant { Ok : AbiArtifact; Err : text };
-type Result_3 = variant { Ok : TemplateRevocationState; Err : text };
-type Result_4 = variant { Ok : opt text; Err : text };
+type Result_2 = variant { Ok : text; Err : text };
+type Result_3 = variant { Ok : AbiArtifact; Err : text };
+type Result_4 = variant { Ok : TemplateRevocationState; Err : text };
 type Result_5 = variant { Ok : nat64; Err : text };
-type Result_6 = variant { Ok : text; Err : text };
+type Result_6 = variant { Ok : opt text; Err : text };
 type Result_7 = variant { Ok : vec text; Err : text };
 type Result_8 = variant { Ok : RetentionConfig; Err : text };
 type Result_9 = variant { Ok : StrategyKillSwitchState; Err : text };
@@ -563,6 +563,9 @@ service : (InitArgs) -> {
       TemplateVersion,
       opt text,
     ) -> (Result_1);
+  // Derives the canister's threshold-ECDSA EVM address from the configured key
+  // and caches it in stable storage (controller only).
+  derive_automaton_evm_address : () -> (Result_2);
   // Returns the automaton's derived EVM address, or `None` before first derivation.
   get_automaton_evm_address : () -> (opt text) query;
   // Returns the full conversation log for the given sender address, or `None`
@@ -588,6 +591,8 @@ service : (InitArgs) -> {
   // Returns a combined runtime snapshot (cycles, scheduler state, inference
   // config, top-up config, …).
   get_runtime_view : () -> (RuntimeView) query;
+  // Returns the scheduler timer base tick interval in seconds.
+  get_scheduler_base_tick_secs : () -> (nat64) query;
   // Returns the scheduler's current runtime state (enabled flag, last tick, …).
   get_scheduler_view : () -> (SchedulerRuntime) query;
   // Returns the agent's "soul" — the core identity/persona prompt layer.
@@ -617,7 +622,7 @@ service : (InitArgs) -> {
   http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
   // Normalises and stores an ABI artifact, optionally verifying selector hashes
   // (controller only).
-  ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_2);
+  ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_3);
   // Inserts or updates a strategy template (controller only).
   // Stamps `created_at_ns` on first insert and always updates `updated_at_ns`.
   ingest_strategy_template_admin : (StrategyTemplate) -> (Result_1);
@@ -660,28 +665,26 @@ service : (InitArgs) -> {
       StrategyTemplateKey,
       TemplateVersion,
       opt text,
-    ) -> (Result_3);
-  // Manually overrides the stored automaton EVM address (controller only).
-  set_automaton_evm_address_admin : (opt text) -> (Result_4);
+    ) -> (Result_4);
   // Updates the EVM chain ID used for all on-chain operations (controller only).
   set_evm_chain_id_admin : (nat64) -> (Result_5);
   // Sets how many block confirmations must pass before an EVM event is
   // considered finalised (controller only).
   set_evm_confirmation_depth_admin : (nat64) -> (Result_5);
   // Sets an optional fallback EVM RPC URL used when the primary is unavailable (controller only).
-  set_evm_rpc_fallback_url : (opt text) -> (Result_4);
+  set_evm_rpc_fallback_url : (opt text) -> (Result_6);
   // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
   set_evm_rpc_max_response_bytes : (nat64) -> (Result_5);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
-  set_evm_rpc_url : (text) -> (Result_6);
+  set_evm_rpc_url : (text) -> (Result_2);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
   set_http_allowed_domains : (vec text) -> (Result_7);
   // Overrides the EVM inbox contract address (controller only).
-  set_inbox_contract_address_admin : (opt text) -> (Result_4);
+  set_inbox_contract_address_admin : (opt text) -> (Result_6);
   // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
   // (controller only).
-  set_inference_model : (text) -> (Result_6);
+  set_inference_model : (text) -> (Result_2);
   // Sets the active inference backend (`IcLlm` or `OpenRouter`) (controller only).
   set_inference_provider : (InferenceProvider) -> (text);
   // Enables or disables the autonomous agent loop (controller only).
@@ -691,6 +694,8 @@ service : (InitArgs) -> {
   set_openrouter_api_key : (opt text) -> (text);
   // Replaces the conversation-retention policy (controller only).
   set_retention_config : (RetentionConfig) -> (Result_8);
+  // Updates the scheduler timer base tick interval in seconds (controller only).
+  set_scheduler_base_tick_secs : (nat64) -> (Result_5);
   // Enables or disables the scheduler (controller only).
   // Disabling prevents new jobs from being dispatched without stopping the timer.
   set_scheduler_enabled : (bool) -> (text);
@@ -708,9 +713,9 @@ service : (InitArgs) -> {
   set_task_enabled : (TaskKind, bool) -> (text);
   // Overrides the recurrence interval (seconds) for the given task kind
   // (controller only).
-  set_task_interval_secs : (TaskKind, nat64) -> (Result_6);
+  set_task_interval_secs : (TaskKind, nat64) -> (Result_2);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
   update_prompt_layer_admin : (nat8, text) -> (Result_10);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
-  update_soul : (text) -> (Result_6);
+  update_soul : (text) -> (Result_2);
 }

@@ -95,6 +95,8 @@ const TOPUP_STATE_KEY: &str = "cycle_topup.state";
 /// Persisted cadence multiplier for overriding `TICKS_PER_TURN_INTERVAL` at runtime.
 #[allow(dead_code)]
 const CADENCE_MULTIPLIER_KEY: &str = "timing.cadence_multiplier";
+/// Persisted scheduler base tick interval in seconds.
+const SCHEDULER_BASE_TICK_SECS_KEY: &str = "timing.scheduler_base_tick_secs";
 
 // ── Capacity constants ───────────────────────────────────────────────────────
 
@@ -149,6 +151,8 @@ const MAX_TIMING_ERROR_CHARS: usize = 512;
 const MIN_RETENTION_BATCH_SIZE: u32 = 1;
 const MAX_RETENTION_BATCH_SIZE: u32 = 1_000;
 const MIN_RETENTION_INTERVAL_SECS: u64 = 1;
+const MIN_SCHEDULER_BASE_TICK_SECS: u64 = 1;
+const MAX_SCHEDULER_BASE_TICK_SECS: u64 = 3_600;
 /// 24-hour summary window used for session and turn-window summaries.
 const SUMMARY_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 /// Age threshold after which a memory fact is eligible for rollup compression.
@@ -568,6 +572,17 @@ pub fn init_scheduler_defaults(now_ns: u64) {
         .is_none()
     {
         save_scheduler_runtime(&SchedulerRuntime::default());
+    }
+    if SCHEDULER_RUNTIME_MAP
+        .with(|map| map.borrow().get(&SCHEDULER_BASE_TICK_SECS_KEY.to_string()))
+        .is_none()
+    {
+        SCHEDULER_RUNTIME_MAP.with(|map| {
+            map.borrow_mut().insert(
+                SCHEDULER_BASE_TICK_SECS_KEY.to_string(),
+                encode_json(&timing::SCHEDULER_TICK_INTERVAL_SECS),
+            );
+        });
     }
     for kind in TaskKind::all() {
         let key = task_kind_key(kind);
@@ -1515,6 +1530,37 @@ pub fn set_task_interval_secs(kind: &TaskKind, interval_secs: u64) -> Result<(),
     runtime.next_due_ns = now_ns().saturating_add(interval_secs.saturating_mul(1_000_000_000));
     save_task_runtime(kind, &runtime);
     Ok(())
+}
+
+// ── Scheduler base tick ─────────────────────────────────────────────────
+
+/// Returns the persisted scheduler base tick interval in seconds.
+///
+/// Falls back to the compile-time default when unset.
+pub fn get_scheduler_base_tick_secs() -> u64 {
+    SCHEDULER_RUNTIME_MAP
+        .with(|map| map.borrow().get(&SCHEDULER_BASE_TICK_SECS_KEY.to_string()))
+        .and_then(|payload| read_json::<u64>(Some(payload.as_slice())))
+        .unwrap_or(timing::SCHEDULER_TICK_INTERVAL_SECS)
+}
+
+/// Persists the scheduler base tick interval (seconds).
+///
+/// Returns an error when the value is outside the supported range.
+pub fn set_scheduler_base_tick_secs(interval_secs: u64) -> Result<u64, String> {
+    if !(MIN_SCHEDULER_BASE_TICK_SECS..=MAX_SCHEDULER_BASE_TICK_SECS).contains(&interval_secs) {
+        return Err(format!(
+            "scheduler_base_tick_secs must be in range {}..={}",
+            MIN_SCHEDULER_BASE_TICK_SECS, MAX_SCHEDULER_BASE_TICK_SECS
+        ));
+    }
+    SCHEDULER_RUNTIME_MAP.with(|map| {
+        map.borrow_mut().insert(
+            SCHEDULER_BASE_TICK_SECS_KEY.to_string(),
+            encode_json(&interval_secs),
+        );
+    });
+    Ok(interval_secs)
 }
 
 // ── Cadence multiplier ───────────────────────────────────────────────────
@@ -8188,6 +8234,24 @@ mod tests {
             runtime.next_due_ns, seed_now_ns,
             "first PollInbox run should be due immediately after init"
         );
+    }
+
+    #[test]
+    fn scheduler_base_tick_defaults_and_persists() {
+        init_storage();
+        assert_eq!(
+            get_scheduler_base_tick_secs(),
+            timing::SCHEDULER_TICK_INTERVAL_SECS
+        );
+        assert_eq!(set_scheduler_base_tick_secs(15).unwrap_or_default(), 15);
+        assert_eq!(get_scheduler_base_tick_secs(), 15);
+    }
+
+    #[test]
+    fn scheduler_base_tick_validates_range() {
+        init_storage();
+        assert!(set_scheduler_base_tick_secs(0).is_err());
+        assert!(set_scheduler_base_tick_secs(3_601).is_err());
     }
 
     #[test]

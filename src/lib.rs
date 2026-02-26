@@ -23,6 +23,8 @@ mod scheduler;
 mod storage;
 #[allow(dead_code)]
 mod strategy;
+#[cfg(test)]
+mod test_support;
 mod timing;
 mod tools;
 
@@ -36,18 +38,26 @@ use crate::domain::types::{
     TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
     ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
+#[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
 use crate::storage::stable;
 use crate::timing::current_time_ns;
 use crate::tools::ToolManager;
 use candid::{CandidType, Principal};
-use ic_cdk_timers::set_timer_interval_serial;
+#[cfg(target_arch = "wasm32")]
+use ic_cdk_timers::{clear_timer, set_timer_interval_serial, TimerId};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use serde::Deserialize;
-use std::time::Duration;
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 const WALLET_SYNC_RESPONSE_BYTES_FLOOR: u64 = 1_024;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static SCHEDULER_TIMER_ID: RefCell<Option<TimerId>> = const { RefCell::new(None) };
+}
 
 /// Arguments supplied once at canister creation via `dfx deploy --argument`.
 #[derive(CandidType, Deserialize)]
@@ -308,6 +318,15 @@ fn set_evm_confirmation_depth_admin(confirmation_depth: u64) -> Result<u64, Stri
     stable::set_evm_confirmation_depth(confirmation_depth)
 }
 
+/// Derives the canister's threshold-ECDSA EVM address from the configured key
+/// and caches it in stable storage (controller only).
+#[ic_cdk::update]
+async fn derive_automaton_evm_address() -> Result<String, String> {
+    ensure_controller()?;
+    crate::features::threshold_signer::derive_and_cache_evm_address(&stable::get_ecdsa_key_name())
+        .await
+}
+
 /// Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
 /// and permits all domains (controller only).
 #[ic_cdk::update]
@@ -337,13 +356,6 @@ fn get_automaton_evm_address() -> Option<String> {
     stable::get_automaton_evm_address()
 }
 
-/// Manually overrides the stored automaton EVM address (controller only).
-#[ic_cdk::update]
-fn set_automaton_evm_address_admin(address: Option<String>) -> Result<Option<String>, String> {
-    ensure_controller()?;
-    stable::set_evm_address(address)
-}
-
 /// Returns the latest synced wallet balance telemetry (ETH, USDC, sync status).
 #[ic_cdk::query]
 fn get_wallet_balance_telemetry() -> WalletBalanceTelemetryView {
@@ -360,6 +372,12 @@ fn get_wallet_balance_sync_config() -> WalletBalanceSyncConfigView {
 #[ic_cdk::query]
 fn get_scheduler_view() -> SchedulerRuntime {
     stable::scheduler_runtime_view()
+}
+
+/// Returns the scheduler timer base tick interval in seconds.
+#[ic_cdk::query]
+fn get_scheduler_base_tick_secs() -> u64 {
+    stable::get_scheduler_base_tick_secs()
 }
 
 /// Returns the current conversation-retention configuration.
@@ -479,6 +497,15 @@ fn set_scheduler_enabled(enabled: bool) -> String {
 fn set_scheduler_low_cycles_mode(enabled: bool) -> String {
     ensure_controller_or_trap();
     stable::set_scheduler_low_cycles_mode(enabled)
+}
+
+/// Updates the scheduler timer base tick interval in seconds (controller only).
+#[ic_cdk::update]
+fn set_scheduler_base_tick_secs(interval_secs: u64) -> Result<u64, String> {
+    ensure_controller()?;
+    let persisted = stable::set_scheduler_base_tick_secs(interval_secs)?;
+    arm_timer_with_interval(persisted);
+    Ok(persisted)
 }
 
 /// Overrides the recurrence interval (seconds) for the given task kind
@@ -740,10 +767,26 @@ fn http_request_update(request: HttpUpdateRequest) -> HttpUpdateResponse {
 /// Registers the recurring scheduler timer.  Called from both `init` and
 /// `post_upgrade` so the timer is never left unarmed after an upgrade.
 fn arm_timer() {
-    set_timer_interval_serial(
-        Duration::from_secs(timing::SCHEDULER_TICK_INTERVAL_SECS),
-        scheduler_tick,
-    );
+    arm_timer_with_interval(stable::get_scheduler_base_tick_secs());
+}
+
+fn arm_timer_with_interval(interval_secs: u64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let interval = std::time::Duration::from_secs(interval_secs.max(1));
+        SCHEDULER_TIMER_ID.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(existing) = slot.take() {
+                clear_timer(existing);
+            }
+            *slot = Some(set_timer_interval_serial(interval, scheduler_tick));
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = interval_secs;
+    }
 }
 
 #[cfg(test)]

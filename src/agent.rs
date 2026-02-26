@@ -36,7 +36,9 @@ use crate::features::{
     infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
     MockSignerAdapter,
 };
-use crate::sanitize::{frame_untrusted_content, ToolSequenceValidator};
+use crate::sanitize::{
+    extract_framed_untrusted_payload, frame_untrusted_content, ToolSequenceValidator,
+};
 use crate::storage::stable;
 use crate::tools::{SignerPort, ToolManager};
 use alloy_primitives::U256;
@@ -174,7 +176,13 @@ fn sanitize_preview(text: &str, max_chars: usize) -> String {
 /// Formats a single tool call record as a one-line summary for the inner dialogue.
 fn summarize_tool_call(call: &ToolCallRecord) -> String {
     if call.success {
-        let output = sanitize_preview(call.output.trim(), 220);
+        let output = if call.tool == "http_fetch" {
+            extract_framed_untrusted_payload(call.output.as_str())
+                .unwrap_or_else(|| call.output.clone())
+        } else {
+            call.output.clone()
+        };
+        let output = sanitize_preview(output.trim(), 220);
         if output.is_empty() {
             return format!("`{}`: ok", call.tool);
         }
@@ -1572,6 +1580,27 @@ mod tests {
         assert!(reply.contains("Tool results: 1 succeeded, 1 failed."));
         assert!(reply.contains("`remember`: stored"));
         assert!(reply.contains("`evm_read` failed: rpc timeout"));
+    }
+
+    #[test]
+    fn render_tool_results_reply_unframes_http_fetch_output() {
+        let calls = vec![ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
+                .to_string(),
+            output: frame_untrusted_content(
+                "http_fetch",
+                r#"{"schemaVersion":"1.0.0","pairs":[{"chainId":"base"}]}"#,
+            ),
+            success: true,
+            error: None,
+        }];
+
+        let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
+        assert!(reply.contains("`http_fetch`: {\"schemaVersion\":\"1.0.0\""));
+        assert!(!reply.contains("[UNTRUSTED_CONTENT source=http_fetch]"));
+        assert!(!reply.contains("The following is external data."));
     }
 
     #[test]

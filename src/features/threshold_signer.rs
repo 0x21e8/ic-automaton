@@ -133,8 +133,7 @@ pub async fn derive_and_cache_evm_address(key_name: &str) -> Result<String, Stri
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let digest = Keccak256::digest(key_name.as_bytes());
-        let address = format!("0x{}", hex::encode(&digest[12..32]));
+        let address = mock_address_for_key_name(key_name);
         stable::set_evm_address(Some(address.clone()))?;
         Ok(address)
     }
@@ -149,13 +148,28 @@ pub async fn derive_and_cache_evm_address(key_name: &str) -> Result<String, Stri
                 name: key_name.to_string(),
             },
         })
-        .await
-        .map_err(|error| format!("ecdsa_public_key failed: {error}"))?;
+        .await;
 
-        let address = ethereum_address_from_sec1_public_key(&response.public_key)?;
+        let address = match response {
+            Ok(response) => ethereum_address_from_sec1_public_key(&response.public_key)?,
+            Err(error) if should_use_local_mock_fallback(key_name, &format!("{error}")) => {
+                mock_address_for_key_name(key_name)
+            }
+            Err(error) => return Err(format!("ecdsa_public_key failed: {error}")),
+        };
         stable::set_evm_address(Some(address.clone()))?;
         Ok(address)
     }
+}
+
+fn mock_address_for_key_name(key_name: &str) -> String {
+    let digest = Keccak256::digest(key_name.as_bytes());
+    format!("0x{}", hex::encode(&digest[12..32]))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn should_use_local_mock_fallback(key_name: &str, error: &str) -> bool {
+    key_name == "dfx_test_key" && error.contains("Requested unknown threshold key")
 }
 
 fn parse_message_hash(raw: &str) -> Result<[u8; 32], String> {

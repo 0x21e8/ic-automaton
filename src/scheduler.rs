@@ -1286,8 +1286,6 @@ mod tests {
     };
     use crate::storage::stable;
     use std::future::Future;
-    #[cfg(not(target_arch = "wasm32"))]
-    use std::sync::{Mutex, OnceLock};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     fn settle_pending_topup_jobs(now_ns: u64) {
@@ -1334,36 +1332,8 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn host_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
     fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = host_env_lock()
-            .lock()
-            .expect("host env lock should not be poisoned");
-        let previous = vars
-            .iter()
-            .map(|(name, _)| ((*name).to_string(), std::env::var(name).ok()))
-            .collect::<Vec<_>>();
-
-        for (name, value) in vars {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-
-        f();
-
-        for (name, value) in previous {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
+        crate::test_support::with_locked_host_env(vars, f);
     }
 
     fn init_scheduler_scope() {
@@ -2413,51 +2383,56 @@ mod tests {
 
     #[test]
     fn poll_inbox_job_advances_evm_cursor_when_filters_are_configured() {
-        stable::init_storage();
-        stable::init_scheduler_defaults(0);
-        for kind in TaskKind::all() {
-            stable::set_task_enabled(kind, false);
-        }
+        with_host_stub_env(
+            &[("IC_AUTOMATON_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN", Some("10"))],
+            || {
+                stable::init_storage();
+                stable::init_scheduler_defaults(0);
+                for kind in TaskKind::all() {
+                    stable::set_task_enabled(kind, false);
+                }
 
-        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
-            .expect("rpc url should be configurable");
-        stable::set_evm_address(Some(
-            "0x1111111111111111111111111111111111111111".to_string(),
-        ))
-        .expect("evm address should be configurable");
-        stable::set_inbox_contract_address(Some(
-            "0x2222222222222222222222222222222222222222".to_string(),
-        ))
-        .expect("inbox contract should be configurable");
-        stable::set_evm_cursor(&crate::domain::types::EvmPollCursor {
-            chain_id: 8453,
-            next_block: 0,
-            next_log_index: 0,
-            ..crate::domain::types::EvmPollCursor::default()
-        });
+                stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+                    .expect("rpc url should be configurable");
+                stable::set_evm_address(Some(
+                    "0x1111111111111111111111111111111111111111".to_string(),
+                ))
+                .expect("evm address should be configurable");
+                stable::set_inbox_contract_address(Some(
+                    "0x2222222222222222222222222222222222222222".to_string(),
+                ))
+                .expect("inbox contract should be configurable");
+                stable::set_evm_cursor(&crate::domain::types::EvmPollCursor {
+                    chain_id: 8453,
+                    next_block: 0,
+                    next_log_index: 0,
+                    ..crate::domain::types::EvmPollCursor::default()
+                });
 
-        let poll_job = stable::enqueue_job_if_absent(
-            TaskKind::PollInbox,
-            TaskLane::Mutating,
-            "PollInbox:evm-cursor".to_string(),
-            0,
-            0,
+                let poll_job = stable::enqueue_job_if_absent(
+                    TaskKind::PollInbox,
+                    TaskLane::Mutating,
+                    "PollInbox:evm-cursor".to_string(),
+                    0,
+                    0,
+                );
+                assert!(poll_job.is_some(), "poll job should enqueue");
+
+                block_on_with_spin(scheduler_tick());
+
+                let cursor = stable::runtime_snapshot().evm_cursor;
+                assert_eq!(cursor.next_block, 1);
+                assert_eq!(cursor.consecutive_empty_polls, 1);
+                assert!(cursor.last_poll_at_ns > 0);
+
+                let jobs = stable::list_recent_jobs(10);
+                let poll = jobs
+                    .iter()
+                    .find(|job| job.dedupe_key == "PollInbox:evm-cursor")
+                    .expect("poll job should be present");
+                assert_eq!(poll.status, JobStatus::Succeeded);
+            },
         );
-        assert!(poll_job.is_some(), "poll job should enqueue");
-
-        block_on_with_spin(scheduler_tick());
-
-        let cursor = stable::runtime_snapshot().evm_cursor;
-        assert_eq!(cursor.next_block, 1);
-        assert_eq!(cursor.consecutive_empty_polls, 1);
-        assert!(cursor.last_poll_at_ns > 0);
-
-        let jobs = stable::list_recent_jobs(10);
-        let poll = jobs
-            .iter()
-            .find(|job| job.dedupe_key == "PollInbox:evm-cursor")
-            .expect("poll job should be present");
-        assert_eq!(poll.status, JobStatus::Succeeded);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

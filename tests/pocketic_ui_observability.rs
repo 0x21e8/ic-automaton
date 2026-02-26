@@ -138,15 +138,11 @@ fn set_evm_rpc_url(pic: &PocketIc, canister_id: Principal, url: &str) {
     assert!(result.is_ok(), "set_evm_rpc_url failed: {result:?}");
 }
 
-fn set_automaton_evm_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
-    let payload = encode_args((Some(address.to_string()),))
-        .expect("failed to encode set_automaton_evm_address_admin");
-    let result: Result<Option<String>, String> =
-        call_update(pic, canister_id, "set_automaton_evm_address_admin", payload);
-    assert!(
-        result.is_ok(),
-        "set_automaton_evm_address_admin failed: {result:?}"
-    );
+fn derive_automaton_evm_address(pic: &PocketIc, canister_id: Principal) -> String {
+    let payload = encode_args(()).expect("failed to encode derive_automaton_evm_address");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "derive_automaton_evm_address", payload);
+    result.unwrap_or_else(|error| panic!("derive_automaton_evm_address failed: {error}"))
 }
 
 fn set_inbox_contract_address_admin(pic: &PocketIc, canister_id: Principal, address: &str) {
@@ -425,9 +421,8 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
     set_task_interval_secs(&pic, canister_id, TaskKind::AgentTurn, 30);
     set_task_interval_secs(&pic, canister_id, TaskKind::PollInbox, 30);
     set_evm_rpc_url(&pic, canister_id, "https://mainnet.base.org");
-    let automaton_address = "0x1111111111111111111111111111111111111111";
+    let automaton_address = derive_automaton_evm_address(&pic, canister_id);
     let inbox_contract_address = "0x2222222222222222222222222222222222222222";
-    set_automaton_evm_address_admin(&pic, canister_id, automaton_address);
     set_inbox_contract_address_admin(&pic, canister_id, inbox_contract_address);
 
     let root_request = HttpRequest::get("/").build();
@@ -475,7 +470,7 @@ fn serves_certified_root_and_supports_ui_observability_continuation_flow() {
         Some("not found")
     );
 
-    let topic1 = address_to_topic(automaton_address);
+    let topic1 = address_to_topic(&automaton_address);
     let payload = encode_message_queued_payload(
         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "hello from pocketic ui flow",
