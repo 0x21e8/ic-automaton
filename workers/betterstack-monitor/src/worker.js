@@ -1,6 +1,7 @@
 const DEFAULT_SNAPSHOT_PATH = '/api/snapshot';
 const DEFAULT_TIMEOUT_MS = 10_000;
 const TERMINAL_JOB_STATUSES = new Set(['Failed', 'TimedOut', 'Skipped']);
+const TOOL_FAILURE_PREFIX = 'tool execution reported failures:';
 
 export function normalizeBaseUrl(raw) {
   const trimmed = String(raw ?? '').trim().replace(/\/+$/, '');
@@ -115,6 +116,48 @@ function extractSurvivalOperation(message, jobKind) {
   return null;
 }
 
+function parseToolExecutionFailureMessage(message) {
+  if (!nonEmptyString(message) || !message.startsWith(TOOL_FAILURE_PREFIX)) {
+    return null;
+  }
+
+  const payloadRaw = message.slice(TOOL_FAILURE_PREFIX.length).trim();
+  if (!payloadRaw.startsWith('{')) {
+    return null;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(payloadRaw);
+  } catch {
+    return null;
+  }
+
+  const failedTools = Array.isArray(payload?.failures)
+    ? payload.failures
+        .map((entry) => {
+          const tool = nonEmptyString(entry?.tool) ? entry.tool.trim() : null;
+          const reason = nonEmptyString(entry?.reason) ? entry.reason.trim() : null;
+          if (!tool || !reason) {
+            return null;
+          }
+          return { tool, reason };
+        })
+        .filter(Boolean)
+    : [];
+
+  const payloadCount =
+    Number.isFinite(payload?.count) && payload.count >= 0
+      ? Math.trunc(payload.count)
+      : failedTools.length;
+
+  return {
+    failedToolCount: Math.max(payloadCount, failedTools.length),
+    failedTools,
+    failedToolNames: [...new Set(failedTools.map((entry) => entry.tool))],
+  };
+}
+
 function baseEvent(level, category, message, context) {
   return {
     dt: new Date().toISOString(),
@@ -205,6 +248,7 @@ export function extractLogEvents(snapshot, options) {
     if (!nonEmptyString(turn?.error)) {
       continue;
     }
+    const toolFailure = parseToolExecutionFailureMessage(turn.error);
     events.push(
       baseEvent('error', 'recent_turn_error', turn.error, {
         source: 'ic-automaton-monitor',
@@ -213,6 +257,13 @@ export function extractLogEvents(snapshot, options) {
         turn_id: turn?.id ?? null,
         state_from: turn?.state_from ?? null,
         state_to: turn?.state_to ?? null,
+        turn_tool_call_count: turn?.tool_call_count ?? null,
+        turn_inference_round_count: turn?.inference_round_count ?? null,
+        turn_continuation_stop_reason: turn?.continuation_stop_reason ?? null,
+        turn_error_kind: toolFailure ? 'tool_execution_failures' : null,
+        failed_tool_count: toolFailure?.failedToolCount ?? null,
+        failed_tool_names: toolFailure?.failedToolNames ?? null,
+        failed_tools: toolFailure?.failedTools ?? null,
       }),
     );
   }

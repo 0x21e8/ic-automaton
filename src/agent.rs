@@ -189,6 +189,48 @@ fn summarize_tool_call(call: &ToolCallRecord) -> String {
     format!("`{}` failed: {}", call.tool, sanitize_preview(reason, 220))
 }
 
+/// Formats non-recoverable tool failures into a compact, machine-readable
+/// payload appended to the terminal turn error message.
+fn format_terminal_tool_execution_error(tool_failures: &[&ToolCallRecord]) -> String {
+    if tool_failures.is_empty() {
+        return "tool execution reported failures".to_string();
+    }
+
+    const MAX_FAILURE_DETAILS: usize = 3;
+    let failures = tool_failures
+        .iter()
+        .take(MAX_FAILURE_DETAILS)
+        .map(|record| {
+            let reason = record
+                .error
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(record.output.as_str());
+            let tool = record.tool.trim();
+            serde_json::json!({
+                "tool": if tool.is_empty() { "unknown_tool" } else { tool },
+                "reason": sanitize_preview(reason, 180),
+            })
+        })
+        .collect::<Vec<_>>();
+    let shown = failures.len();
+    let payload = serde_json::json!({
+        "count": tool_failures.len(),
+        "shown": shown,
+        "omitted": tool_failures.len().saturating_sub(shown),
+        "failures": failures,
+    });
+
+    let serialized_payload = serde_json::to_string(&payload).unwrap_or_else(|_| {
+        format!(
+            r#"{{"count":{},"shown":0,"omitted":{},"failures":[]}}"#,
+            tool_failures.len(),
+            tool_failures.len()
+        )
+    });
+    format!("tool execution reported failures: {serialized_payload}")
+}
+
 fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
     if tool_calls.is_empty() {
         return None;
@@ -1238,7 +1280,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     );
                     stop_after_degraded_tool_failures = true;
                 } else {
-                    last_error = Some("tool execution reported failures".to_string());
+                    last_error = Some(format_terminal_tool_execution_error(&failed_tool_records));
                 }
             }
 
@@ -1502,6 +1544,111 @@ mod tests {
         assert!(reply.contains("Tool results: 1 succeeded, 1 failed."));
         assert!(reply.contains("`remember`: stored"));
         assert!(reply.contains("`evm_read` failed: rpc timeout"));
+    }
+
+    #[test]
+    fn format_terminal_tool_execution_error_serializes_failed_tools() {
+        let failure_a = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "evm_read".to_string(),
+            args_json: "{}".to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some("rpc timeout".to_string()),
+        };
+        let failure_b = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: "{}".to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some("HTTP 404 from https://example.com/missing".to_string()),
+        };
+
+        let failures = vec![&failure_a, &failure_b];
+        let message = format_terminal_tool_execution_error(&failures);
+        let payload = message
+            .strip_prefix("tool execution reported failures: ")
+            .expect("message should include serialized payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload).expect("payload should be valid json");
+
+        assert_eq!(parsed["count"], serde_json::json!(2));
+        assert_eq!(parsed["shown"], serde_json::json!(2));
+        assert_eq!(parsed["omitted"], serde_json::json!(0));
+        assert_eq!(parsed["failures"][0]["tool"], serde_json::json!("evm_read"));
+        assert_eq!(
+            parsed["failures"][0]["reason"],
+            serde_json::json!("rpc timeout")
+        );
+        assert_eq!(
+            parsed["failures"][1]["tool"],
+            serde_json::json!("http_fetch")
+        );
+    }
+
+    #[test]
+    fn format_terminal_tool_execution_error_limits_failure_details_and_truncates_reason() {
+        let long_reason = format!("rpc timeout {}", "x ".repeat(300));
+        let failures = [
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "evm_read".to_string(),
+                args_json: "{}".to_string(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                error: Some(long_reason),
+            },
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "http_fetch".to_string(),
+                args_json: "{}".to_string(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                error: Some("HTTP 500".to_string()),
+            },
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "remember".to_string(),
+                args_json: "{}".to_string(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                error: Some("storage write rejected".to_string()),
+            },
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "record_signal".to_string(),
+                args_json: "{}".to_string(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                error: Some("quota reached".to_string()),
+            },
+        ];
+        let failure_refs = failures.iter().collect::<Vec<_>>();
+        let message = format_terminal_tool_execution_error(&failure_refs);
+        let payload = message
+            .strip_prefix("tool execution reported failures: ")
+            .expect("message should include serialized payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload).expect("payload should be valid json");
+
+        assert_eq!(parsed["count"], serde_json::json!(4));
+        assert_eq!(parsed["shown"], serde_json::json!(3));
+        assert_eq!(parsed["omitted"], serde_json::json!(1));
+        assert_eq!(
+            parsed["failures"]
+                .as_array()
+                .expect("failures should be an array")
+                .len(),
+            3
+        );
+        let first_reason = parsed["failures"][0]["reason"]
+            .as_str()
+            .expect("reason should be a string");
+        assert!(
+            first_reason.ends_with("..."),
+            "first reason should be truncated for log safety"
+        );
     }
 
     #[test]

@@ -12,6 +12,10 @@ Cloudflare Worker that polls `ic-automaton` HTTP snapshot endpoint and forwards 
   - `recent_turns` with `error`
   - `recent_transitions` with `error`
 - Sends extracted records to Better Stack log ingest.
+- For structured turn tool failures (`tool execution reported failures: {...}`), forwards parsed fields:
+  - `failed_tool_count`
+  - `failed_tool_names`
+  - `failed_tools` (`[{ tool, reason }]`)
 - Supports cron runs and manual run endpoint.
 
 ## Routes

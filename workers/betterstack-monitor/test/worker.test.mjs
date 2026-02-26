@@ -185,3 +185,43 @@ test('extractLogEvents includes survival operation details for survival-policy b
   assert.equal(events[1].survival_policy_blocked, true);
   assert.equal(events[1].survival_operation, 'inference');
 });
+
+test('extractLogEvents parses structured tool-failure details from turn errors', () => {
+  const snapshot = {
+    runtime: { last_error: null },
+    scheduler: { last_tick_error: null },
+    recent_jobs: [],
+    recent_turns: [
+      {
+        id: 'turn-451',
+        state_from: 'Sleeping',
+        state_to: 'Faulted',
+        tool_call_count: 2,
+        inference_round_count: 1,
+        continuation_stop_reason: 'None',
+        error:
+          'tool execution reported failures: {"count":2,"shown":2,"omitted":0,"failures":[{"tool":"evm_read","reason":"rpc timeout"},{"tool":"http_fetch","reason":"HTTP 404 from https://example.com/missing"}]}',
+      },
+    ],
+    recent_transitions: [],
+  };
+
+  const events = extractLogEvents(snapshot, {
+    canisterBaseUrl: 'https://abcde-aaaaa-aaaab-qaxuq-cai.icp0.io',
+    trigger: 'scheduled',
+    emitHealthLog: false,
+  });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].category, 'recent_turn_error');
+  assert.equal(events[0].turn_error_kind, 'tool_execution_failures');
+  assert.equal(events[0].failed_tool_count, 2);
+  assert.equal(events[0].turn_tool_call_count, 2);
+  assert.equal(events[0].turn_inference_round_count, 1);
+  assert.equal(events[0].turn_continuation_stop_reason, 'None');
+  assert.deepEqual(events[0].failed_tool_names, ['evm_read', 'http_fetch']);
+  assert.deepEqual(events[0].failed_tools, [
+    { tool: 'evm_read', reason: 'rpc timeout' },
+    { tool: 'http_fetch', reason: 'HTTP 404 from https://example.com/missing' },
+  ]);
+});
