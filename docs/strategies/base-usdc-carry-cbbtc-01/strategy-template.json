@@ -1,0 +1,179 @@
+{
+  "key": {
+    "protocol": "morpho-v1",
+    "primitive": "lend_supply",
+    "chain_id": 8453,
+    "template_id": "base-usdc-carry-cbbtc-01"
+  },
+  "version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "status": "Draft",
+  "contract_roles": [
+    {
+      "role": "morpho",
+      "address": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
+      "source_ref": "https://docs.morpho.org/get-started/resources/addresses/",
+      "codehash": null
+    }
+  ],
+  "actions": [
+    {
+      "action_id": "enter_supply",
+      "call_sequence": [
+        {
+          "role": "morpho",
+          "name": "supply",
+          "selector_hex": "0xa99aad89",
+          "inputs": [
+            {
+              "kind": "tuple",
+              "components": [
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "uint256",
+                  "components": []
+                }
+              ]
+            },
+            {
+              "kind": "uint256",
+              "components": []
+            },
+            {
+              "kind": "uint256",
+              "components": []
+            },
+            {
+              "kind": "address",
+              "components": []
+            },
+            {
+              "kind": "bytes",
+              "components": []
+            }
+          ],
+          "outputs": [
+            {
+              "kind": "uint256",
+              "components": []
+            },
+            {
+              "kind": "uint256",
+              "components": []
+            }
+          ],
+          "state_mutability": "nonpayable"
+        }
+      ],
+      "preconditions": [
+        "market_supply_apy_gte_0.03",
+        "market_liquidity_usd_gte_10000000",
+        "wallet_usdc_reserve_after_trade_gte_survival_floor"
+      ],
+      "postconditions": [
+        "morpho_supply_position_increased",
+        "survival_floor_preserved"
+      ],
+      "risk_checks": [
+        "lltv_equals_0.86e18",
+        "oracle_address_matches_template",
+        "market_utilization_lte_0.95"
+      ]
+    },
+    {
+      "action_id": "exit_supply",
+      "call_sequence": [
+        {
+          "role": "morpho",
+          "name": "withdraw",
+          "selector_hex": "0x5c2bea49",
+          "inputs": [
+            {
+              "kind": "tuple",
+              "components": [
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "address",
+                  "components": []
+                },
+                {
+                  "kind": "uint256",
+                  "components": []
+                }
+              ]
+            },
+            {
+              "kind": "uint256",
+              "components": []
+            },
+            {
+              "kind": "uint256",
+              "components": []
+            },
+            {
+              "kind": "address",
+              "components": []
+            },
+            {
+              "kind": "address",
+              "components": []
+            }
+          ],
+          "outputs": [
+            {
+              "kind": "uint256",
+              "components": []
+            },
+            {
+              "kind": "uint256",
+              "components": []
+            }
+          ],
+          "state_mutability": "nonpayable"
+        }
+      ],
+      "preconditions": [
+        "market_supply_apy_lte_exit_threshold_or_better_opportunity_exists"
+      ],
+      "postconditions": [
+        "wallet_usdc_delta_positive_expected",
+        "survival_floor_preserved"
+      ],
+      "risk_checks": [
+        "post_exit_wallet_usdc_gte_survival_floor"
+      ]
+    }
+  ],
+  "constraints_json": "{\"max_calls\":1,\"max_total_value_wei\":\"0\",\"max_notional_wei\":\"0\",\"max_value_wei_per_call\":\"0\",\"template_budget_wei\":\"0\",\"required_postconditions\":[\"survival_floor_preserved\"]}",
+  "created_at_ns": 0,
+  "updated_at_ns": 0
+}

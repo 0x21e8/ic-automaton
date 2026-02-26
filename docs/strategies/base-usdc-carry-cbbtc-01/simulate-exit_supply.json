@@ -1,0 +1,34 @@
+{
+  "key": {
+    "protocol": "morpho-v1",
+    "primitive": "lend_supply",
+    "chain_id": 8453,
+    "template_id": "base-usdc-carry-cbbtc-01"
+  },
+  "version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "action_id": "exit_supply",
+  "typed_params": {
+    "calls": [
+      {
+        "value_wei": "0",
+        "args": [
+          [
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+            "0x663BECd10daE6C4A3Dcd89F1d76c1174199639B9",
+            "0x46415998764C29aB2a25CbeA6254146D50D22687",
+            "860000000000000000"
+          ],
+          "500000",
+          "0",
+          "0x1111111111111111111111111111111111111111",
+          "0x1111111111111111111111111111111111111111"
+        ]
+      }
+    ]
+  }
+}

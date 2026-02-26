@@ -1,0 +1,14 @@
+{
+  "key": {
+    "protocol": "morpho-v1",
+    "primitive": "lend_supply",
+    "chain_id": 8453,
+    "template_id": "base-usdc-carry-cbbtc-01"
+  },
+  "version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "reason": "activate after abi ingest and canary readiness"
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strategy Template Creator"
+  short_description: "Design validated Base DeFi strategy templates"
+  default_prompt: "Use $strategy-template-creator to research and draft a safe Base StrategyTemplate with constraints and source-backed addresses."
