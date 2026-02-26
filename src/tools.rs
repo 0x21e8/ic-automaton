@@ -150,6 +150,8 @@ impl ToolManager {
                 allowed_states: vec![AgentState::ExecutingActions],
             },
         );
+        // Internal-only dispatch entry used by the `send_eth` execution pipeline.
+        // This tool must not be exposed in the LLM-facing schema/catalog.
         policies.insert(
             "broadcast_transaction".to_string(),
             ToolPolicy {

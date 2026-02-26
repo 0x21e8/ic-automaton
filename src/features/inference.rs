@@ -711,6 +711,171 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["layer_id".to_string(), "content".to_string()]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "list_strategy_templates".to_string(),
+            description: Some(
+                "List strategy templates. Optional `key` filters by template namespace and `limit` controls result size."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "key".to_string(),
+                        description: Some(
+                            "Optional template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "integer".to_string(),
+                        name: "limit".to_string(),
+                        description: Some(
+                            "Optional max number of templates to return.".to_string(),
+                        ),
+                    },
+                ]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "simulate_strategy_action".to_string(),
+            description: Some(
+                "Compile and validate a strategy action without broadcasting transactions. Requires `key`, `version`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "key".to_string(),
+                        description: Some(
+                            "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "version".to_string(),
+                        description: Some(
+                            "Template version object: {\"major\":1,\"minor\":0,\"patch\":0}."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "action_id".to_string(),
+                        description: Some("Action identifier within the template.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "typed_params".to_string(),
+                        description: Some(
+                            "Inline typed parameter object consumed by the strategy compiler."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "typed_params_json".to_string(),
+                        description: Some(
+                            "Alternative to `typed_params`: serialized JSON string of typed parameters."
+                                .to_string(),
+                        ),
+                    },
+                ]),
+                required: Some(vec![
+                    "key".to_string(),
+                    "version".to_string(),
+                    "action_id".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "execute_strategy_action".to_string(),
+            description: Some(
+                "Compile, validate, and execute a strategy action (broadcasts real transactions). Requires `key`, `version`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "key".to_string(),
+                        description: Some(
+                            "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "version".to_string(),
+                        description: Some(
+                            "Template version object: {\"major\":1,\"minor\":0,\"patch\":0}."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "action_id".to_string(),
+                        description: Some("Action identifier within the template.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "typed_params".to_string(),
+                        description: Some(
+                            "Inline typed parameter object consumed by the strategy compiler."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "typed_params_json".to_string(),
+                        description: Some(
+                            "Alternative to `typed_params`: serialized JSON string of typed parameters."
+                                .to_string(),
+                        ),
+                    },
+                ]),
+                required: Some(vec![
+                    "key".to_string(),
+                    "version".to_string(),
+                    "action_id".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "get_strategy_outcomes".to_string(),
+            description: Some(
+                "Read outcome statistics for a specific strategy template version."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "key".to_string(),
+                        description: Some(
+                            "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "version".to_string(),
+                        description: Some(
+                            "Template version object: {\"major\":1,\"minor\":0,\"patch\":0}."
+                                .to_string(),
+                        ),
+                    },
+                ]),
+                required: Some(vec!["key".to_string(), "version".to_string()]),
+            }),
+        }),
     ]
 }
 
@@ -723,7 +888,12 @@ fn ic_llm_tool_name(tool: &IcLlmTool) -> &str {
 fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
     let mut tools = ic_llm_tools();
     if !evm_tools_enabled {
-        tools.retain(|tool| !matches!(ic_llm_tool_name(tool), "evm_read" | "send_eth"));
+        tools.retain(|tool| {
+            !matches!(
+                ic_llm_tool_name(tool),
+                "evm_read" | "send_eth" | "execute_strategy_action"
+            )
+        });
     }
     tools
 }
@@ -1323,7 +1493,10 @@ fn build_openrouter_request_body_with_transcript_capabilities(
                 .get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str);
-            !matches!(function_name, Some("evm_read" | "send_eth"))
+            !matches!(
+                function_name,
+                Some("evm_read" | "send_eth" | "execute_strategy_action")
+            )
         });
     }
 
@@ -2090,6 +2263,10 @@ mod tests {
         assert!(names.contains(&"forget".to_string()));
         assert!(names.contains(&"http_fetch".to_string()));
         assert!(names.contains(&"update_prompt_layer".to_string()));
+        assert!(names.contains(&"list_strategy_templates".to_string()));
+        assert!(names.contains(&"simulate_strategy_action".to_string()));
+        assert!(names.contains(&"execute_strategy_action".to_string()));
+        assert!(names.contains(&"get_strategy_outcomes".to_string()));
     }
 
     #[test]
@@ -2120,6 +2297,10 @@ mod tests {
         assert!(names.contains(&"forget"));
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
+        assert!(names.contains(&"list_strategy_templates"));
+        assert!(names.contains(&"simulate_strategy_action"));
+        assert!(names.contains(&"execute_strategy_action"));
+        assert!(names.contains(&"get_strategy_outcomes"));
     }
 
     #[test]
@@ -2211,7 +2392,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!names.contains(&"evm_read".to_string()));
         assert!(!names.contains(&"send_eth".to_string()));
+        assert!(!names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"remember".to_string()));
+        assert!(names.contains(&"list_strategy_templates".to_string()));
+        assert!(names.contains(&"simulate_strategy_action".to_string()));
+        assert!(names.contains(&"get_strategy_outcomes".to_string()));
         assert!(!names.contains(&"top_up_status".to_string()));
         assert!(!names.contains(&"trigger_top_up".to_string()));
     }
@@ -2241,7 +2426,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!names.contains(&"evm_read"));
         assert!(!names.contains(&"send_eth"));
+        assert!(!names.contains(&"execute_strategy_action"));
         assert!(names.contains(&"remember"));
+        assert!(names.contains(&"list_strategy_templates"));
+        assert!(names.contains(&"simulate_strategy_action"));
+        assert!(names.contains(&"get_strategy_outcomes"));
         assert!(!names.contains(&"top_up_status"));
         assert!(!names.contains(&"trigger_top_up"));
     }

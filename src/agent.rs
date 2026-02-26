@@ -614,7 +614,9 @@ fn build_available_tools_section(turn_id: &str) -> String {
 
     let mut lines = vec!["### Available Tools".to_string()];
     for (name, policy) in manager.list_tools() {
-        if !policy.enabled {
+        // `broadcast_transaction` is an internal pipeline tool (used by `send_eth`)
+        // and should not be advertised as directly callable by the LLM.
+        if !policy.enabled || name == "broadcast_transaction" {
             continue;
         }
         let used = usage.get(&name).copied().unwrap_or_default();
@@ -1950,6 +1952,15 @@ mod tests {
         assert!(context.contains("### Recent Memory"));
         assert!(context.contains("- raw strategy=buy dips"));
         assert!(context.contains("### Available Tools"));
+    }
+
+    #[test]
+    fn available_tools_section_omits_internal_broadcast_transaction_tool() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+
+        let section = build_available_tools_section("turn-0");
+        assert!(section.contains("- send_eth: calls_this_turn=0"));
+        assert!(!section.contains("broadcast_transaction"));
     }
 
     #[test]
