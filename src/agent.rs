@@ -247,6 +247,15 @@ fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Extracts the `"signal"` value from a `record_signal` tool call's args JSON.
+fn extract_signal_payload(args_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    value
+        .get("signal")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Normalises a tool-call args string to canonical JSON so that fingerprints
 /// are stable regardless of key ordering or whitespace in the original payload.
 fn canonical_tool_args_json(args_json: &str) -> String {
@@ -1257,6 +1266,23 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 assistant_reply = Some(tool_results_reply);
             }
 
+            // Surface record_signal payloads into inner_dialogue so the agent's
+            // reasoning is captured even when the LLM puts its thinking into the
+            // tool call args rather than the explanation text.
+            for record in &round_tool_records {
+                if record.tool == "record_signal" && record.success {
+                    if let Some(signal) = extract_signal_payload(&record.args_json) {
+                        let trimmed = signal.trim();
+                        if !trimmed.is_empty() {
+                            append_inner_dialogue(
+                                &mut inner_dialogue,
+                                &format!("signal: {}", sanitize_preview(trimmed, 500)),
+                            );
+                        }
+                    }
+                }
+            }
+
             let failed_tool_records = round_tool_records
                 .iter()
                 .filter(|record| !record.success && !is_sequence_validator_block(record))
@@ -1649,6 +1675,21 @@ mod tests {
             first_reason.ends_with("..."),
             "first reason should be truncated for log safety"
         );
+    }
+
+    #[test]
+    fn extract_signal_payload_returns_signal_value() {
+        assert_eq!(
+            extract_signal_payload(r#"{"signal":"ETH price rising"}"#),
+            Some("ETH price rising".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_signal_payload_returns_none_for_missing_key() {
+        assert_eq!(extract_signal_payload(r#"{"other":"value"}"#), None);
+        assert_eq!(extract_signal_payload("invalid json"), None);
+        assert_eq!(extract_signal_payload(r#"{"signal": 42}"#), None);
     }
 
     #[test]
