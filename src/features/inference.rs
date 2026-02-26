@@ -552,7 +552,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "evm_read".to_string(),
             description: Some(
-                "Read EVM contract state via eth_call. Use Layer-10 wallet telemetry for ETH/USDC balances."
+                "Read EVM JSON-RPC state. Supported direct methods: eth_call (address+calldata), eth_getBalance (address), eth_blockNumber (no address), eth_getTransactionCount (address). For other read-only eth_* methods, pass params_json as a JSON array."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -561,24 +561,25 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "method".to_string(),
-                        description: Some("Must be eth_call.".to_string()),
+                        description: Some("Method name. Options: eth_call | eth_getBalance | eth_blockNumber | eth_getTransactionCount. Any other read-only eth_* method requires params_json.".to_string()),
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "address".to_string(),
-                        description: Some("0x-prefixed 20-byte contract address target.".to_string()),
+                        description: Some("0x-prefixed 20-byte address. Required for eth_call, eth_getBalance, and eth_getTransactionCount.".to_string()),
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "calldata".to_string(),
-                        description: Some("0x-prefixed ABI-encoded calldata.".to_string()),
+                        description: Some("0x-prefixed ABI-encoded calldata. Required for eth_call.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "params_json".to_string(),
+                        description: Some("JSON array string of positional params for non-listed read-only eth_* methods (e.g., \"[]\", \"[\\\"0xabc...\\\",\\\"latest\\\"]\").".to_string()),
                     },
                 ]),
-                required: Some(vec![
-                    "method".to_string(),
-                    "address".to_string(),
-                    "calldata".to_string(),
-                ]),
+                required: Some(vec!["method".to_string()]),
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
@@ -2267,6 +2268,39 @@ mod tests {
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
+    }
+
+    #[test]
+    fn ic_llm_evm_read_schema_lists_supported_methods() {
+        let evm_read_tool = ic_llm_tools()
+            .into_iter()
+            .find(
+                |tool| matches!(tool, IcLlmTool::Function(function) if function.name == "evm_read"),
+            )
+            .expect("evm_read tool should exist");
+
+        let IcLlmTool::Function(function) = evm_read_tool;
+        let description = function.description.unwrap_or_default();
+        assert!(description.contains("eth_call"));
+        assert!(description.contains("eth_getBalance"));
+        assert!(description.contains("eth_blockNumber"));
+        assert!(description.contains("eth_getTransactionCount"));
+
+        let parameters = function.parameters.expect("evm_read schema should exist");
+        assert_eq!(
+            parameters.required.unwrap_or_default(),
+            vec!["method".to_string()]
+        );
+        let properties = parameters.properties.unwrap_or_default();
+        let method_property = properties
+            .iter()
+            .find(|property| property.name == "method")
+            .expect("method property should be present");
+        let method_description = method_property.description.as_deref().unwrap_or_default();
+        assert!(method_description.contains("eth_call"));
+        assert!(method_description.contains("eth_getBalance"));
+        assert!(method_description.contains("eth_blockNumber"));
+        assert!(method_description.contains("eth_getTransactionCount"));
     }
 
     #[test]

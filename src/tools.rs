@@ -52,6 +52,67 @@ const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
 
+fn survival_operation_max_backoff_secs(operation: &SurvivalOperationClass) -> u64 {
+    match operation {
+        SurvivalOperationClass::Inference => stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE,
+        SurvivalOperationClass::EvmPoll => stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+        SurvivalOperationClass::EvmBroadcast => {
+            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST
+        }
+        SurvivalOperationClass::ThresholdSign => {
+            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN
+        }
+    }
+}
+
+fn record_survival_operation_successes(classes: &[SurvivalOperationClass]) {
+    for class in classes {
+        stable::record_survival_operation_success(class);
+    }
+}
+
+fn record_survival_operation_failure_for_class(class: &SurvivalOperationClass, now_ns: u64) {
+    stable::record_survival_operation_failure(
+        class,
+        now_ns,
+        survival_operation_max_backoff_secs(class),
+    );
+}
+
+fn record_survival_operation_failures(classes: &[SurvivalOperationClass], now_ns: u64) {
+    for class in classes {
+        record_survival_operation_failure_for_class(class, now_ns);
+    }
+}
+
+fn classify_execute_strategy_action_failure(error: &str) -> SurvivalOperationClass {
+    let normalized = error.to_ascii_lowercase();
+    if [
+        "threshold sign",
+        "sign_with_ecdsa",
+        "signing",
+        "signature",
+        "y_parity",
+        "ecdsa",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return SurvivalOperationClass::ThresholdSign;
+    }
+    if [
+        "eth_sendrawtransaction",
+        "send raw transaction",
+        "broadcast",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return SurvivalOperationClass::EvmBroadcast;
+    }
+    SurvivalOperationClass::EvmPoll
+}
+
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum StrategyToolLogPriority {
     #[log_level(capacity = 2_000, name = "STRATEGY_TOOL_INFO")]
@@ -462,16 +523,15 @@ impl ToolManager {
                         )
                     } else {
                         let result = execute_strategy_action_tool(&call.args_json, signer).await;
-                        if result.is_ok() {
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::EvmPoll,
-                            );
+                        if let Err(error) = &result {
+                            let failed_class = classify_execute_strategy_action_failure(error);
+                            record_survival_operation_failure_for_class(&failed_class, now_ns);
                         } else {
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::EvmPoll,
-                                now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
-                            );
+                            record_survival_operation_successes(&[
+                                SurvivalOperationClass::ThresholdSign,
+                                SurvivalOperationClass::EvmBroadcast,
+                                SurvivalOperationClass::EvmPoll,
+                            ]);
                         }
                         result
                     }
@@ -523,22 +583,17 @@ impl ToolManager {
                     } else {
                         let result = send_eth_tool(&call.args_json, signer).await;
                         if result.is_ok() {
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::ThresholdSign,
-                            );
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::EvmBroadcast,
-                            );
+                            record_survival_operation_successes(&[
+                                SurvivalOperationClass::ThresholdSign,
+                                SurvivalOperationClass::EvmBroadcast,
+                            ]);
                         } else {
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::ThresholdSign,
+                            record_survival_operation_failures(
+                                &[
+                                    SurvivalOperationClass::ThresholdSign,
+                                    SurvivalOperationClass::EvmBroadcast,
+                                ],
                                 now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN,
-                            );
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::EvmBroadcast,
-                                now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST,
                             );
                         }
                         result
@@ -1546,6 +1601,179 @@ mod tests {
             stable::strategy_template_budget_spent_wei(&sample_strategy_key(), &sample_version())
                 .as_deref(),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn execute_strategy_action_tool_success_clears_all_survival_backoffs() {
+        let _time_guard = with_fixed_time_ns(10_000_000_000);
+        stable::init_storage();
+        stable::set_evm_chain_id(8453).expect("chain id should be configurable");
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should set");
+        seed_strategy_template_and_artifact();
+
+        stable::record_survival_operation_failure(
+            &SurvivalOperationClass::ThresholdSign,
+            1,
+            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN,
+        );
+        stable::record_survival_operation_failure(
+            &SurvivalOperationClass::EvmBroadcast,
+            1,
+            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST,
+        );
+        stable::record_survival_operation_failure(
+            &SurvivalOperationClass::EvmPoll,
+            1,
+            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+        );
+
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+
+        let state = AgentState::ExecutingActions;
+        let signer = HexSigner;
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "execute_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_strategy_key(),
+                "version": sample_version(),
+                "action_id": "transfer",
+                "typed_params": {
+                    "calls": [
+                        {
+                            "value_wei": "1",
+                            "args": [
+                                "0x3333333333333333333333333333333333333333",
+                                "1"
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-clear"));
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].success,
+            "execution should pass: {:?}",
+            records[0]
+        );
+
+        for class in [
+            SurvivalOperationClass::ThresholdSign,
+            SurvivalOperationClass::EvmBroadcast,
+            SurvivalOperationClass::EvmPoll,
+        ] {
+            assert_eq!(stable::survival_operation_consecutive_failures(&class), 0);
+            assert_eq!(stable::survival_operation_backoff_until(&class), None);
+        }
+    }
+
+    #[test]
+    fn execute_strategy_action_tool_signing_failure_records_threshold_sign_backoff() {
+        let _time_guard = with_fixed_time_ns(1_000_000_000);
+        stable::init_storage();
+        stable::set_evm_chain_id(8453).expect("chain id should be configurable");
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should set");
+        seed_strategy_template_and_artifact();
+
+        struct SigningFailureSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for SigningFailureSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Err("signing unavailable in test".to_string())
+            }
+        }
+
+        let state = AgentState::ExecutingActions;
+        let signer = SigningFailureSigner;
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "execute_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_strategy_key(),
+                "version": sample_version(),
+                "action_id": "transfer",
+                "typed_params": {
+                    "calls": [
+                        {
+                            "value_wei": "1",
+                            "args": [
+                                "0x3333333333333333333333333333333333333333",
+                                "1"
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-sign-fail"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("signing unavailable"));
+
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::ThresholdSign),
+            1
+        );
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::EvmBroadcast),
+            0
+        );
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::EvmPoll),
+            0
+        );
+    }
+
+    #[test]
+    fn execute_strategy_action_failure_classification_uses_operation_markers() {
+        assert_eq!(
+            classify_execute_strategy_action_failure(
+                "sign_with_ecdsa failed: queue overloaded at signer",
+            ),
+            SurvivalOperationClass::ThresholdSign
+        );
+        assert_eq!(
+            classify_execute_strategy_action_failure(
+                "eth_sendRawTransaction failed: rpc timeout while broadcasting tx",
+            ),
+            SurvivalOperationClass::EvmBroadcast
+        );
+        assert_eq!(
+            classify_execute_strategy_action_failure("strategy validation failed: bad call"),
+            SurvivalOperationClass::EvmPoll
         );
     }
 

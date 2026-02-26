@@ -1321,48 +1321,120 @@ fn filter_route_matched_logs(
 #[derive(Deserialize)]
 struct EvmReadArgs {
     method: String,
-    address: String,
+    #[serde(default)]
+    address: Option<String>,
     #[serde(default)]
     calldata: Option<String>,
+    #[serde(default)]
+    params_json: Option<String>,
 }
 
 enum EvmReadMethod {
     Call,
+    GetBalance,
+    BlockNumber,
+    GetTransactionCount,
+    JsonRpc(String),
 }
 
 struct ParsedEvmReadArgs {
     method: EvmReadMethod,
-    address: String,
+    address: Option<String>,
     calldata: Option<String>,
+    params_json: Option<String>,
+}
+
+fn parse_required_evm_read_address(args: &EvmReadArgs, method: &str) -> Result<String, String> {
+    args.address
+        .as_deref()
+        .ok_or_else(|| format!("address is required for {method}"))
+        .and_then(normalize_address)
+}
+
+fn parse_generic_evm_read_params(
+    method: &str,
+    params_json: Option<String>,
+) -> Result<String, String> {
+    let params_json = params_json.ok_or_else(|| format!("params_json is required for {method}"))?;
+    let params: Value = serde_json::from_str(&params_json)
+        .map_err(|error| format!("invalid params_json for {method}: {error}"))?;
+    if !params.is_array() {
+        return Err(format!("params_json for {method} must be a JSON array"));
+    }
+    serde_json::to_string(&params)
+        .map_err(|error| format!("failed to normalize params_json for {method}: {error}"))
+}
+
+fn is_forbidden_generic_evm_read_method(method: &str) -> bool {
+    matches!(
+        method,
+        "eth_sendRawTransaction"
+            | "eth_sendTransaction"
+            | "eth_sign"
+            | "eth_signTransaction"
+            | "eth_signTypedData"
+            | "eth_signTypedData_v4"
+            | "eth_submitWork"
+            | "eth_submitHashrate"
+    )
 }
 
 fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
     let args: EvmReadArgs = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid evm_read args json: {error}"))?;
 
-    let address = normalize_address(&args.address)?;
-    let method = match args.method.trim() {
+    let method_name = args.method.trim();
+    let method = match method_name {
         "eth_call" => EvmReadMethod::Call,
+        "eth_getBalance" => EvmReadMethod::GetBalance,
+        "eth_blockNumber" => EvmReadMethod::BlockNumber,
+        "eth_getTransactionCount" => EvmReadMethod::GetTransactionCount,
         unsupported => {
-            return Err(format!(
-                "evm_read method must be eth_call (wallet balances come from runtime telemetry), got {unsupported}"
-            ));
+            if !unsupported.starts_with("eth_") || is_forbidden_generic_evm_read_method(unsupported)
+            {
+                return Err(format!(
+                    "evm_read method must be one of eth_call | eth_getBalance | eth_blockNumber | eth_getTransactionCount, or another read-only eth_* method with params_json; got {unsupported}"
+                ));
+            }
+            EvmReadMethod::JsonRpc(unsupported.to_string())
         }
     };
 
-    let calldata = match method {
+    let address = match &method {
+        EvmReadMethod::Call | EvmReadMethod::GetBalance | EvmReadMethod::GetTransactionCount => {
+            Some(parse_required_evm_read_address(&args, method_name)?)
+        }
+        EvmReadMethod::BlockNumber | EvmReadMethod::JsonRpc(_) => None,
+    };
+
+    let calldata = match &method {
         EvmReadMethod::Call => {
             let value = args
                 .calldata
                 .ok_or_else(|| "calldata is required for eth_call".to_string())?;
             Some(normalize_hex_blob(&value, "calldata")?)
         }
+        EvmReadMethod::GetBalance
+        | EvmReadMethod::BlockNumber
+        | EvmReadMethod::GetTransactionCount
+        | EvmReadMethod::JsonRpc(_) => None,
+    };
+
+    let params_json = match &method {
+        EvmReadMethod::JsonRpc(method) => {
+            Some(parse_generic_evm_read_params(method, args.params_json)?)
+        }
+        EvmReadMethod::Call
+        | EvmReadMethod::GetBalance
+        | EvmReadMethod::BlockNumber
+        | EvmReadMethod::GetTransactionCount => None,
     };
 
     Ok(ParsedEvmReadArgs {
         method,
         address,
         calldata,
+        params_json,
     })
 }
 
@@ -1475,11 +1547,42 @@ pub async fn evm_read_tool(args_json: &str) -> Result<String, String> {
 
     match args.method {
         EvmReadMethod::Call => {
+            let address = args
+                .address
+                .as_deref()
+                .ok_or_else(|| "address is required for eth_call".to_string())?;
             let calldata = args
                 .calldata
                 .as_deref()
                 .ok_or_else(|| "calldata is required for eth_call".to_string())?;
-            rpc.eth_call(&args.address, calldata).await
+            rpc.eth_call(address, calldata).await
+        }
+        EvmReadMethod::GetBalance => {
+            let address = args
+                .address
+                .as_deref()
+                .ok_or_else(|| "address is required for eth_getBalance".to_string())?;
+            rpc.eth_get_balance(address).await
+        }
+        EvmReadMethod::BlockNumber => rpc
+            .eth_block_number()
+            .await
+            .map(|value| format!("0x{value:x}")),
+        EvmReadMethod::GetTransactionCount => {
+            let address = args
+                .address
+                .as_deref()
+                .ok_or_else(|| "address is required for eth_getTransactionCount".to_string())?;
+            rpc.eth_get_transaction_count(address)
+                .await
+                .map(|value| format!("0x{value:x}"))
+        }
+        EvmReadMethod::JsonRpc(method) => {
+            let params_json = args
+                .params_json
+                .as_deref()
+                .ok_or_else(|| format!("params_json is required for {method}"))?;
+            rpc.json_rpc_call(&method, params_json).await
         }
     }
 }
@@ -2103,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_evm_read_args_enforces_method_and_address() {
+    fn parse_evm_read_args_enforces_method_requirements() {
         assert!(parse_evm_read_args("{}").is_err());
         assert!(parse_evm_read_args(
             r#"{"method":"eth_call","address":"not-an-address","calldata":"0x00"}"#
@@ -2113,10 +2216,13 @@ mod tests {
             r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111"}"#
         )
         .is_err());
-        assert!(parse_evm_read_args(
-            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#
-        )
-        .is_err());
+        assert!(parse_evm_read_args(r#"{"method":"eth_getBalance"}"#).is_err());
+        assert!(parse_evm_read_args(r#"{"method":"eth_getTransactionCount"}"#).is_err());
+        assert!(parse_evm_read_args(r#"{"method":"eth_blockNumber"}"#).is_ok());
+        assert!(parse_evm_read_args(r#"{"method":"debug_traceCall","params_json":"[]"}"#).is_err());
+        assert!(
+            parse_evm_read_args(r#"{"method":"eth_getCode","params_json":"[\"0x1111111111111111111111111111111111111111\",\"latest\"]"}"#).is_ok()
+        );
     }
 
     #[test]
@@ -2349,17 +2455,43 @@ mod tests {
     }
 
     #[test]
-    fn evm_read_tool_returns_eth_call_result_in_host_mode() {
+    fn evm_read_tool_supports_multiple_methods_in_host_mode() {
         stable::init_storage();
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
             .expect("rpc url should be set");
 
-        let out = block_on_with_spin(evm_read_tool(
+        let call_out = block_on_with_spin(evm_read_tool(
             r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111","calldata":"0x1234"}"#,
         ))
         .expect("evm_read should succeed in host-mode stub");
+        assert_eq!(call_out, "0x");
 
-        assert_eq!(out, "0x");
+        let balance_out = block_on_with_spin(evm_read_tool(
+            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111"}"#,
+        ))
+        .expect("eth_getBalance should succeed in host-mode stub");
+        assert_eq!(balance_out, "0x1");
+
+        let block_number_out = block_on_with_spin(evm_read_tool(r#"{"method":"eth_blockNumber"}"#))
+            .expect("eth_blockNumber should succeed in host-mode stub");
+        assert_eq!(block_number_out, "0x0");
+
+        let nonce_out = block_on_with_spin(evm_read_tool(
+            r#"{"method":"eth_getTransactionCount","address":"0x1111111111111111111111111111111111111111"}"#,
+        ))
+        .expect("eth_getTransactionCount should succeed in host-mode stub");
+        assert_eq!(nonce_out, "0x0");
+
+        let generic_out = block_on_with_spin(evm_read_tool(
+            r#"{"method":"eth_gasPrice","params_json":"[]"}"#,
+        ))
+        .expect("generic eth_gasPrice should succeed in host-mode stub");
+        let generic_json: Value =
+            serde_json::from_str(&generic_out).expect("generic output should be valid json");
+        assert_eq!(
+            generic_json.get("result").and_then(Value::as_str),
+            Some("0x3b9aca00")
+        );
     }
 
     #[test]
