@@ -638,15 +638,45 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "recall".to_string(),
             description: Some(
-                "Retrieve memory facts. Optionally filter by key prefix.".to_string(),
+                "Retrieve memory facts. Optional filters: key prefix and sort order. Set count_only=true to return only matching-count telemetry."
+                    .to_string(),
             ),
             parameters: Some(IcLlmParameters {
                 type_: "object".to_string(),
-                properties: Some(vec![IcLlmProperty {
-                    type_: "string".to_string(),
-                    name: "prefix".to_string(),
-                    description: Some("Optional key prefix filter.".to_string()),
-                }]),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "prefix".to_string(),
+                        description: Some("Optional key prefix filter.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "sort_by".to_string(),
+                        description: Some(
+                            "Optional sort order: updated_at (default) or key.".to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "boolean".to_string(),
+                        name: "count_only".to_string(),
+                        description: Some(
+                            "When true, return only count metadata instead of fact payloads."
+                                .to_string(),
+                        ),
+                    },
+                ]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "memory_stats".to_string(),
+            description: Some(
+                "Return memory telemetry: total fact count, storage bytes, and config.* fact count."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: None,
                 required: None,
             }),
         }),
@@ -2055,7 +2085,7 @@ mod tests {
         assert!(content.contains("## Layer 10: Dynamic Context"));
         assert!(content.contains("### Conversation with 0xabc"));
         assert!(content.contains("compact-skill"));
-        assert!(!content.contains("## Layer 2: Survival Economics"));
+        assert!(content.contains("## Layer 2: Survival Economics"));
         assert!(!content.contains("## Layer 3: Identity & On-Chain Personhood"));
         assert!(!content.contains("## Layer 6: Economic Decision Loop"));
     }
@@ -2261,6 +2291,7 @@ mod tests {
         assert!(names.contains(&"send_eth".to_string()));
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"recall".to_string()));
+        assert!(names.contains(&"memory_stats".to_string()));
         assert!(names.contains(&"forget".to_string()));
         assert!(names.contains(&"http_fetch".to_string()));
         assert!(names.contains(&"update_prompt_layer".to_string()));
@@ -2328,6 +2359,7 @@ mod tests {
         assert!(names.contains(&"send_eth"));
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"recall"));
+        assert!(names.contains(&"memory_stats"));
         assert!(names.contains(&"forget"));
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
@@ -2383,6 +2415,38 @@ mod tests {
     }
 
     #[test]
+    fn ic_llm_recall_schema_includes_sort_and_count_only() {
+        let recall_tool = ic_llm_tools()
+            .into_iter()
+            .find(|tool| matches!(tool, IcLlmTool::Function(function) if function.name == "recall"))
+            .expect("recall tool should exist");
+
+        let IcLlmTool::Function(function) = recall_tool;
+        let params = function
+            .parameters
+            .expect("recall tool should define parameters");
+        let properties = params
+            .properties
+            .expect("recall tool should define properties");
+        assert!(properties.iter().any(|property| property.name == "prefix"));
+        let sort_by = properties
+            .iter()
+            .find(|property| property.name == "sort_by")
+            .expect("recall tool should include sort_by");
+        assert_eq!(sort_by.type_, "string");
+        assert!(sort_by
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("key"));
+        let count_only = properties
+            .iter()
+            .find(|property| property.name == "count_only")
+            .expect("recall tool should include count_only");
+        assert_eq!(count_only.type_, "boolean");
+    }
+
+    #[test]
     fn openrouter_http_fetch_schema_includes_extract_modes() {
         let http_fetch_tool = openrouter_tools()
             .into_iter()
@@ -2429,6 +2493,7 @@ mod tests {
         assert!(!names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"list_strategy_templates".to_string()));
+        assert!(names.contains(&"memory_stats".to_string()));
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
         assert!(!names.contains(&"top_up_status".to_string()));
@@ -2463,6 +2528,7 @@ mod tests {
         assert!(!names.contains(&"execute_strategy_action"));
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"list_strategy_templates"));
+        assert!(names.contains(&"memory_stats"));
         assert!(names.contains(&"simulate_strategy_action"));
         assert!(names.contains(&"get_strategy_outcomes"));
         assert!(!names.contains(&"top_up_status"));

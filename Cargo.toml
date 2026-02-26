@@ -13,6 +13,7 @@ async-trait = "0.1"
 candid = "0.10"
 canlog = { version = "0.2", features = ["derive"] }
 canbench-rs = { version = "0.4.0", optional = true }
+futures = "0.3"
 ic-http-certification = "3.1.0"
 ic-cdk = "0.19"
 ic-cdk-timers = "1.0"

@@ -234,6 +234,7 @@ pub fn assemble_system_prompt_compact(dynamic_context: &str) -> String {
     [
         LAYER_0_INTERPRETATION.to_string(),
         LAYER_1_CONSTITUTION.to_string(),
+        LAYER_2_SURVIVAL.to_string(),
         render_layer_5_operations(),
         dynamic_context.to_string(),
     ]
@@ -344,15 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn assemble_system_prompt_compact_uses_layers_0_1_5_and_10_only() {
+    fn assemble_system_prompt_compact_uses_layers_0_1_2_5_and_10_only() {
         seed_mutable_layers_for_test();
         let prompt = assemble_system_prompt_compact("## Layer 10: Dynamic Context\n- compact: yes");
 
         assert!(prompt.contains("## Layer 0: Interpretation & Precedence"));
         assert!(prompt.contains("## Layer 1: Constitution - Safety & Non-Harm"));
+        assert!(prompt.contains("## Layer 2: Survival Economics"));
         assert!(prompt.contains("## Layer 5: Operational Reality"));
         assert!(prompt.contains("## Layer 10: Dynamic Context"));
-        assert!(!prompt.contains("## Layer 2: Survival Economics"));
         assert!(!prompt.contains("## Layer 3: Identity & On-Chain Personhood"));
         assert!(!prompt.contains("## Layer 4: Ethics of Cooperation & Value"));
         assert!(!prompt.contains("## Layer 6: Economic Decision Loop"));

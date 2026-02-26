@@ -113,6 +113,63 @@ fn classify_execute_strategy_action_failure(error: &str) -> SurvivalOperationCla
     SurvivalOperationClass::EvmPoll
 }
 
+/// Read-only tools that are safe to co-schedule inside a contiguous batch.
+///
+/// `evm_read` and `http_fetch` are included for latency reduction, but each batch
+/// allows at most one instance of each to avoid duplicate outcall-affordability/
+/// backoff updates racing on the same shared counters.
+fn is_parallel_read_only_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "record_signal"
+            | "recall"
+            | "memory_stats"
+            | "list_strategy_templates"
+            | "get_strategy_outcomes"
+            | "evm_read"
+            | "http_fetch"
+    )
+}
+
+#[derive(Default)]
+struct ParallelBatchState {
+    has_evm_read: bool,
+    has_http_fetch: bool,
+}
+
+fn can_add_to_parallel_batch(state: &ParallelBatchState, tool: &str) -> bool {
+    if !is_parallel_read_only_tool(tool) {
+        return false;
+    }
+    match tool {
+        "evm_read" => !state.has_evm_read,
+        "http_fetch" => !state.has_http_fetch,
+        _ => true,
+    }
+}
+
+fn mark_tool_in_parallel_batch(state: &mut ParallelBatchState, tool: &str) {
+    match tool {
+        "evm_read" => state.has_evm_read = true,
+        "http_fetch" => state.has_http_fetch = true,
+        _ => {}
+    }
+}
+
+fn find_parallel_batch_end(calls: &[ToolCall], start: usize) -> usize {
+    let mut index = start;
+    let mut state = ParallelBatchState::default();
+    while index < calls.len() {
+        let tool = calls[index].tool.as_str();
+        if !can_add_to_parallel_batch(&state, tool) {
+            break;
+        }
+        mark_tool_in_parallel_batch(&mut state, tool);
+        index = index.saturating_add(1);
+    }
+    index
+}
+
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum StrategyToolLogPriority {
     #[log_level(capacity = 2_000, name = "STRATEGY_TOOL_INFO")]
@@ -256,6 +313,13 @@ impl ToolManager {
             },
         );
         policies.insert(
+            "memory_stats".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        policies.insert(
             "forget".to_string(),
             ToolPolicy {
                 enabled: true,
@@ -374,254 +438,315 @@ impl ToolManager {
         turn_id: &str,
     ) -> Vec<ToolCallRecord> {
         let mut records = Vec::with_capacity(calls.len());
-        for call in calls {
-            let policy = match self.policies.get(&call.tool) {
-                Some(policy) => policy,
-                None => {
-                    records.push(ToolCallRecord {
-                        turn_id: turn_id.to_string(),
-                        tool: call.tool.clone(),
-                        args_json: call.args_json.clone(),
-                        output: "unknown tool".to_string(),
-                        success: false,
-                        error: Some("unknown tool".to_string()),
-                    });
-                    continue;
+        let mut index = 0;
+        while index < calls.len() {
+            let batch_end = find_parallel_batch_end(calls, index);
+            if batch_end >= index.saturating_add(2) {
+                let mut batch_index = index;
+                while batch_index < batch_end {
+                    if batch_index + 1 < batch_end {
+                        let (first, second) = futures::join!(
+                            self.execute_single_call_record(
+                                state,
+                                &calls[batch_index],
+                                signer,
+                                broadcaster,
+                                turn_id
+                            ),
+                            self.execute_single_call_record(
+                                state,
+                                &calls[batch_index + 1],
+                                signer,
+                                broadcaster,
+                                turn_id
+                            ),
+                        );
+                        records.push(first);
+                        records.push(second);
+                        batch_index += 2;
+                    } else {
+                        records.push(
+                            self.execute_single_call_record(
+                                state,
+                                &calls[batch_index],
+                                signer,
+                                broadcaster,
+                                turn_id,
+                            )
+                            .await,
+                        );
+                        batch_index += 1;
+                    }
                 }
-            };
-
-            if !policy.enabled || !policy.allowed_states.contains(state) {
-                records.push(ToolCallRecord {
-                    turn_id: turn_id.to_string(),
-                    tool: call.tool.clone(),
-                    args_json: call.args_json.clone(),
-                    output: "tool blocked by policy".to_string(),
-                    success: false,
-                    error: Some("tool blocked".to_string()),
-                });
+                index = batch_end;
                 continue;
             }
 
-            let result = match call.tool.as_str() {
-                "sign_message" => {
-                    let now_ns = current_time_ns();
-                    if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::ThresholdSign,
-                        now_ns,
-                    ) {
-                        Err("signing skipped due to survival policy".to_string())
-                    } else {
-                        let message_hash = match parse_sign_message_args(&call.args_json) {
-                            Ok(message_hash) => message_hash,
-                            Err(error) => {
-                                records.push(ToolCallRecord {
-                                    turn_id: turn_id.to_string(),
-                                    tool: call.tool.clone(),
-                                    args_json: call.args_json.clone(),
-                                    output: "tool execution failed".to_string(),
-                                    success: false,
-                                    error: Some(error),
-                                });
-                                continue;
-                            }
-                        };
-
-                        let result = signer.sign_message(&message_hash).await;
-                        if result.is_ok() {
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::ThresholdSign,
-                            );
-                        } else {
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::ThresholdSign,
-                                now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN,
-                            );
-                        }
-                        result
-                    }
-                }
-                "broadcast_transaction" => {
-                    let now_ns = current_time_ns();
-                    if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::EvmBroadcast,
-                        now_ns,
-                    ) {
-                        Err("broadcast skipped due to survival policy".to_string())
-                    } else if let Some(adapter) = broadcaster {
-                        let result = adapter.broadcast_transaction(&call.args_json).await;
-                        if result.is_ok() {
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::EvmBroadcast,
-                            );
-                        } else {
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::EvmBroadcast,
-                                now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST,
-                            );
-                        }
-                        result
-                    } else {
-                        Err("broadcast adapter unavailable".to_string())
-                    }
-                }
-                "record_signal" => Ok("recorded".to_string()),
-                "remember" => remember_fact_tool(&call.args_json, turn_id),
-                "recall" => recall_facts_tool(&call.args_json),
-                "forget" => forget_fact_tool(&call.args_json),
-                "http_fetch" => http_fetch_tool(&call.args_json).await,
-                "top_up_status" => Ok(top_up_status_tool()),
-                "trigger_top_up" => trigger_top_up_tool(),
-                "list_strategy_templates" => list_strategy_templates_tool(&call.args_json),
-                "simulate_strategy_action" => {
-                    let now_ns = current_time_ns();
-                    if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns)
-                    {
-                        Err("simulate_strategy_action skipped due to survival policy".to_string())
-                    } else {
-                        let result = simulate_strategy_action_tool(&call.args_json);
-                        if result.is_ok() {
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::EvmPoll,
-                            );
-                        } else {
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::EvmPoll,
-                                now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
-                            );
-                        }
-                        result
-                    }
-                }
-                "execute_strategy_action" => {
-                    let now_ns = current_time_ns();
-                    if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::ThresholdSign,
-                        now_ns,
-                    ) {
-                        Err(
-                            "execute_strategy_action skipped due to threshold sign survival policy"
-                                .to_string(),
-                        )
-                    } else if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::EvmBroadcast,
-                        now_ns,
-                    ) {
-                        Err(
-                            "execute_strategy_action skipped due to evm broadcast survival policy"
-                                .to_string(),
-                        )
-                    } else if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::EvmPoll,
-                        now_ns,
-                    ) {
-                        Err(
-                            "execute_strategy_action skipped due to preflight survival policy"
-                                .to_string(),
-                        )
-                    } else {
-                        let result = execute_strategy_action_tool(&call.args_json, signer).await;
-                        if let Err(error) = &result {
-                            let failed_class = classify_execute_strategy_action_failure(error);
-                            record_survival_operation_failure_for_class(&failed_class, now_ns);
-                        } else {
-                            record_survival_operation_successes(&[
-                                SurvivalOperationClass::ThresholdSign,
-                                SurvivalOperationClass::EvmBroadcast,
-                                SurvivalOperationClass::EvmPoll,
-                            ]);
-                        }
-                        result
-                    }
-                }
-                "get_strategy_outcomes" => get_strategy_outcomes_tool(&call.args_json),
-                "update_prompt_layer" => parse_update_prompt_layer_args(&call.args_json).and_then(
-                    |(layer_id, content)| {
-                        update_prompt_layer_content(layer_id, content, turn_id).map(|layer| {
-                            format!(
-                                "updated prompt layer {} to version {}",
-                                layer.layer_id, layer.version
-                            )
-                        })
-                    },
-                ),
-                "evm_read" => {
-                    let now_ns = current_time_ns();
-                    if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns)
-                    {
-                        Err("evm_read skipped due to survival policy".to_string())
-                    } else {
-                        let result = evm_read_tool(&call.args_json).await;
-                        if result.is_ok() {
-                            stable::record_survival_operation_success(
-                                &SurvivalOperationClass::EvmPoll,
-                            );
-                        } else {
-                            stable::record_survival_operation_failure(
-                                &SurvivalOperationClass::EvmPoll,
-                                now_ns,
-                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
-                            );
-                        }
-                        result
-                    }
-                }
-                "send_eth" => {
-                    let now_ns = current_time_ns();
-                    if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::ThresholdSign,
-                        now_ns,
-                    ) {
-                        Err("send_eth skipped due to threshold sign survival policy".to_string())
-                    } else if !stable::can_run_survival_operation(
-                        &SurvivalOperationClass::EvmBroadcast,
-                        now_ns,
-                    ) {
-                        Err("send_eth skipped due to evm broadcast survival policy".to_string())
-                    } else {
-                        let result = send_eth_tool(&call.args_json, signer).await;
-                        if result.is_ok() {
-                            record_survival_operation_successes(&[
-                                SurvivalOperationClass::ThresholdSign,
-                                SurvivalOperationClass::EvmBroadcast,
-                            ]);
-                        } else {
-                            record_survival_operation_failures(
-                                &[
-                                    SurvivalOperationClass::ThresholdSign,
-                                    SurvivalOperationClass::EvmBroadcast,
-                                ],
-                                now_ns,
-                            );
-                        }
-                        result
-                    }
-                }
-                _ => Err("unknown tool".to_string()),
-            };
-
-            records.push(match result {
-                Ok(output) => ToolCallRecord {
-                    turn_id: turn_id.to_string(),
-                    tool: call.tool.clone(),
-                    args_json: call.args_json.clone(),
-                    output,
-                    success: true,
-                    error: None,
-                },
-                Err(error) => ToolCallRecord {
-                    turn_id: turn_id.to_string(),
-                    tool: call.tool.clone(),
-                    args_json: call.args_json.clone(),
-                    output: "tool execution failed".to_string(),
-                    success: false,
-                    error: Some(error),
-                },
-            });
+            records.push(
+                self.execute_single_call_record(state, &calls[index], signer, broadcaster, turn_id)
+                    .await,
+            );
+            index += 1;
         }
         records
+    }
+
+    async fn execute_single_call_record(
+        &self,
+        state: &AgentState,
+        call: &ToolCall,
+        signer: &dyn SignerPort,
+        broadcaster: Option<&dyn EvmBroadcastPort>,
+        turn_id: &str,
+    ) -> ToolCallRecord {
+        let policy = match self.policies.get(&call.tool) {
+            Some(policy) => policy,
+            None => return Self::unknown_tool_record(call, turn_id),
+        };
+        if !policy.enabled || !policy.allowed_states.contains(state) {
+            return Self::blocked_tool_record(call, turn_id);
+        }
+
+        let result = self
+            .dispatch_tool_call(call, signer, broadcaster, turn_id)
+            .await;
+        Self::record_for_result(call, turn_id, result)
+    }
+
+    fn unknown_tool_record(call: &ToolCall, turn_id: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            turn_id: turn_id.to_string(),
+            tool: call.tool.clone(),
+            args_json: call.args_json.clone(),
+            output: "unknown tool".to_string(),
+            success: false,
+            error: Some("unknown tool".to_string()),
+        }
+    }
+
+    fn blocked_tool_record(call: &ToolCall, turn_id: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            turn_id: turn_id.to_string(),
+            tool: call.tool.clone(),
+            args_json: call.args_json.clone(),
+            output: "tool blocked by policy".to_string(),
+            success: false,
+            error: Some("tool blocked".to_string()),
+        }
+    }
+
+    fn record_for_result(
+        call: &ToolCall,
+        turn_id: &str,
+        result: Result<String, String>,
+    ) -> ToolCallRecord {
+        match result {
+            Ok(output) => ToolCallRecord {
+                turn_id: turn_id.to_string(),
+                tool: call.tool.clone(),
+                args_json: call.args_json.clone(),
+                output,
+                success: true,
+                error: None,
+            },
+            Err(error) => ToolCallRecord {
+                turn_id: turn_id.to_string(),
+                tool: call.tool.clone(),
+                args_json: call.args_json.clone(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                error: Some(error),
+            },
+        }
+    }
+
+    async fn dispatch_tool_call(
+        &self,
+        call: &ToolCall,
+        signer: &dyn SignerPort,
+        broadcaster: Option<&dyn EvmBroadcastPort>,
+        turn_id: &str,
+    ) -> Result<String, String> {
+        match call.tool.as_str() {
+            "sign_message" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::ThresholdSign,
+                    now_ns,
+                ) {
+                    Err("signing skipped due to survival policy".to_string())
+                } else {
+                    let message_hash = parse_sign_message_args(&call.args_json)?;
+                    let result = signer.sign_message(&message_hash).await;
+                    if result.is_ok() {
+                        stable::record_survival_operation_success(
+                            &SurvivalOperationClass::ThresholdSign,
+                        );
+                    } else {
+                        stable::record_survival_operation_failure(
+                            &SurvivalOperationClass::ThresholdSign,
+                            now_ns,
+                            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN,
+                        );
+                    }
+                    result
+                }
+            }
+            "broadcast_transaction" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmBroadcast,
+                    now_ns,
+                ) {
+                    Err("broadcast skipped due to survival policy".to_string())
+                } else if let Some(adapter) = broadcaster {
+                    let result = adapter.broadcast_transaction(&call.args_json).await;
+                    if result.is_ok() {
+                        stable::record_survival_operation_success(
+                            &SurvivalOperationClass::EvmBroadcast,
+                        );
+                    } else {
+                        stable::record_survival_operation_failure(
+                            &SurvivalOperationClass::EvmBroadcast,
+                            now_ns,
+                            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST,
+                        );
+                    }
+                    result
+                } else {
+                    Err("broadcast adapter unavailable".to_string())
+                }
+            }
+            "record_signal" => Ok("recorded".to_string()),
+            "remember" => remember_fact_tool(&call.args_json, turn_id),
+            "recall" => recall_facts_tool(&call.args_json),
+            "memory_stats" => memory_stats_tool(),
+            "forget" => forget_fact_tool(&call.args_json),
+            "http_fetch" => http_fetch_tool(&call.args_json).await,
+            "top_up_status" => Ok(top_up_status_tool()),
+            "trigger_top_up" => trigger_top_up_tool(),
+            "list_strategy_templates" => list_strategy_templates_tool(&call.args_json),
+            "simulate_strategy_action" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
+                    Err("simulate_strategy_action skipped due to survival policy".to_string())
+                } else {
+                    let result = simulate_strategy_action_tool(&call.args_json);
+                    if result.is_ok() {
+                        stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
+                    } else {
+                        stable::record_survival_operation_failure(
+                            &SurvivalOperationClass::EvmPoll,
+                            now_ns,
+                            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+                        );
+                    }
+                    result
+                }
+            }
+            "execute_strategy_action" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::ThresholdSign,
+                    now_ns,
+                ) {
+                    Err(
+                        "execute_strategy_action skipped due to threshold sign survival policy"
+                            .to_string(),
+                    )
+                } else if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmBroadcast,
+                    now_ns,
+                ) {
+                    Err(
+                        "execute_strategy_action skipped due to evm broadcast survival policy"
+                            .to_string(),
+                    )
+                } else if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmPoll,
+                    now_ns,
+                ) {
+                    Err(
+                        "execute_strategy_action skipped due to preflight survival policy"
+                            .to_string(),
+                    )
+                } else {
+                    let result = execute_strategy_action_tool(&call.args_json, signer).await;
+                    if let Err(error) = &result {
+                        let failed_class = classify_execute_strategy_action_failure(error);
+                        record_survival_operation_failure_for_class(&failed_class, now_ns);
+                    } else {
+                        record_survival_operation_successes(&[
+                            SurvivalOperationClass::ThresholdSign,
+                            SurvivalOperationClass::EvmBroadcast,
+                            SurvivalOperationClass::EvmPoll,
+                        ]);
+                    }
+                    result
+                }
+            }
+            "get_strategy_outcomes" => get_strategy_outcomes_tool(&call.args_json),
+            "update_prompt_layer" => {
+                parse_update_prompt_layer_args(&call.args_json).and_then(|(layer_id, content)| {
+                    update_prompt_layer_content(layer_id, content, turn_id).map(|layer| {
+                        format!(
+                            "updated prompt layer {} to version {}",
+                            layer.layer_id, layer.version
+                        )
+                    })
+                })
+            }
+            "evm_read" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
+                    Err("evm_read skipped due to survival policy".to_string())
+                } else {
+                    let result = evm_read_tool(&call.args_json).await;
+                    if result.is_ok() {
+                        stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
+                    } else {
+                        stable::record_survival_operation_failure(
+                            &SurvivalOperationClass::EvmPoll,
+                            now_ns,
+                            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL,
+                        );
+                    }
+                    result
+                }
+            }
+            "send_eth" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::ThresholdSign,
+                    now_ns,
+                ) {
+                    Err("send_eth skipped due to threshold sign survival policy".to_string())
+                } else if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmBroadcast,
+                    now_ns,
+                ) {
+                    Err("send_eth skipped due to evm broadcast survival policy".to_string())
+                } else {
+                    let result = send_eth_tool(&call.args_json, signer).await;
+                    if result.is_ok() {
+                        record_survival_operation_successes(&[
+                            SurvivalOperationClass::ThresholdSign,
+                            SurvivalOperationClass::EvmBroadcast,
+                        ]);
+                    } else {
+                        record_survival_operation_failures(
+                            &[
+                                SurvivalOperationClass::ThresholdSign,
+                                SurvivalOperationClass::EvmBroadcast,
+                            ],
+                            now_ns,
+                        );
+                    }
+                    result
+                }
+            }
+            _ => Err("unknown tool".to_string()),
+        }
     }
 }
 
@@ -737,20 +862,40 @@ fn parse_remember_args(args_json: &str) -> Result<(String, String), String> {
     Ok((normalize_memory_key(key_raw)?, value_raw.to_string()))
 }
 
-/// Parse the optional `prefix` field for the `recall` tool.
-/// Returns an empty string when no prefix is provided (match all facts).
-fn parse_recall_args(args_json: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(args_json)
-        .map_err(|error| format!("invalid recall args json: {error}"))?;
-    match value.get("prefix") {
-        Some(prefix) => {
-            let prefix = prefix
-                .as_str()
-                .ok_or_else(|| "prefix must be a string".to_string())?;
-            normalize_memory_prefix(prefix)
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum RecallSortBy {
+    #[default]
+    UpdatedAt,
+    Key,
+}
+
+impl RecallSortBy {
+    fn to_memory_fact_sort(self) -> stable::MemoryFactSort {
+        match self {
+            Self::UpdatedAt => stable::MemoryFactSort::UpdatedAtDesc,
+            Self::Key => stable::MemoryFactSort::KeyAsc,
         }
-        None => Ok(String::new()),
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RecallArgs {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    sort_by: RecallSortBy,
+    #[serde(default)]
+    count_only: bool,
+}
+
+/// Parse args for the `recall` tool.
+fn parse_recall_args(args_json: &str) -> Result<RecallArgs, String> {
+    let mut args: RecallArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid recall args json: {error}"))?;
+    let normalized_prefix = normalize_memory_prefix(args.prefix.as_deref().unwrap_or_default())?;
+    args.prefix = Some(normalized_prefix);
+    Ok(args)
 }
 
 /// Extract and validate the `key` field for the `forget` tool.
@@ -1062,11 +1207,22 @@ fn remember_fact_tool(args_json: &str, turn_id: &str) -> Result<String, String> 
 /// Return up to `MAX_MEMORY_RECALL_RESULTS` facts matching the given prefix,
 /// formatted as `key=value` lines.
 fn recall_facts_tool(args_json: &str) -> Result<String, String> {
-    let prefix = parse_recall_args(args_json)?;
+    let args = parse_recall_args(args_json)?;
+    let prefix = args.prefix.unwrap_or_default();
+    if args.count_only {
+        return serde_json::to_string(&serde_json::json!({
+            "prefix": prefix,
+            "count": stable::count_memory_facts_by_prefix(&prefix),
+            "count_only": true
+        }))
+        .map_err(|error| format!("failed to serialize recall count response: {error}"));
+    }
+
+    let sort = args.sort_by.to_memory_fact_sort();
     let facts = if prefix.is_empty() {
-        stable::list_all_memory_facts(MAX_MEMORY_RECALL_RESULTS)
+        stable::list_all_memory_facts_sorted(MAX_MEMORY_RECALL_RESULTS, sort)
     } else {
-        stable::list_memory_facts_by_prefix(&prefix, MAX_MEMORY_RECALL_RESULTS)
+        stable::list_memory_facts_by_prefix_sorted(&prefix, MAX_MEMORY_RECALL_RESULTS, sort)
     };
 
     if facts.is_empty() {
@@ -1078,6 +1234,17 @@ fn recall_facts_tool(args_json: &str) -> Result<String, String> {
         .map(|fact| format!("{}={}", fact.key, fact.value))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// Return high-level memory-store telemetry for autonomous memory management.
+fn memory_stats_tool() -> Result<String, String> {
+    let stats = stable::memory_fact_stats();
+    serde_json::to_string(&serde_json::json!({
+        "total_facts": stats.total_facts,
+        "config_facts": stats.config_facts,
+        "storage_bytes": stats.storage_bytes
+    }))
+    .map_err(|error| format!("failed to serialize memory stats: {error}"))
 }
 
 /// Remove a named fact from stable memory; succeeds even if the key is absent.
@@ -1271,6 +1438,42 @@ mod tests {
             reason: Some("seed".to_string()),
         })
         .expect("activation should persist");
+    }
+
+    fn call(tool: &str, args_json: &str) -> ToolCall {
+        ToolCall {
+            tool_call_id: None,
+            tool: tool.to_string(),
+            args_json: args_json.to_string(),
+        }
+    }
+
+    #[test]
+    fn parallel_batch_end_collects_contiguous_read_only_tools() {
+        let calls = vec![
+            call("recall", r#"{"prefix":"config."}"#),
+            call("memory_stats", "{}"),
+            call("evm_read", r#"{"method":"eth_blockNumber"}"#),
+            call("http_fetch", r#"{"url":"https://example.com"}"#),
+            call("remember", r#"{"key":"k","value":"v"}"#),
+        ];
+        assert_eq!(find_parallel_batch_end(&calls, 0), 4);
+        assert_eq!(find_parallel_batch_end(&calls, 4), 4);
+    }
+
+    #[test]
+    fn parallel_batch_end_rejects_duplicate_outcall_tools_in_same_batch() {
+        let calls = vec![
+            call("evm_read", r#"{"method":"eth_blockNumber"}"#),
+            call("recall", r#"{"prefix":"config."}"#),
+            call("evm_read", r#"{"method":"eth_blockNumber"}"#),
+            call("http_fetch", r#"{"url":"https://example.com"}"#),
+            call("http_fetch", r#"{"url":"https://example.com/2"}"#),
+        ];
+
+        assert_eq!(find_parallel_batch_end(&calls, 0), 2);
+        assert_eq!(find_parallel_batch_end(&calls, 2), 4);
+        assert_eq!(find_parallel_batch_end(&calls, 4), 5);
     }
 
     #[test]
@@ -1865,6 +2068,168 @@ mod tests {
         assert!(records[0].success);
         assert!(records[1].success);
         assert!(records[1].output.contains("strategy=buy-dips"));
+    }
+
+    #[test]
+    fn recall_tool_supports_sort_by_key() {
+        stable::init_storage();
+        stable::set_memory_fact(&MemoryFact {
+            key: "zeta.note".to_string(),
+            value: "1".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 100,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed zeta fact should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "alpha.note".to_string(),
+            value: "2".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 200,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed alpha fact should store");
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "recall".to_string(),
+            args_json: r#"{"prefix":"","sort_by":"key"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-recall"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        let lines = records[0].output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.first().copied().unwrap_or_default(), "alpha.note=2");
+        assert_eq!(lines.get(1).copied().unwrap_or_default(), "zeta.note=1");
+    }
+
+    #[test]
+    fn recall_tool_supports_count_only_mode() {
+        stable::init_storage();
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.rpc_url".to_string(),
+            value: "https://rpc".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 10,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed config.rpc_url should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.pool".to_string(),
+            value: "0xpool".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 20,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed config.pool should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "signal.price".to_string(),
+            value: "100".to_string(),
+            created_at_ns: 3,
+            updated_at_ns: 30,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed signal.price should store");
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "recall".to_string(),
+            args_json: r#"{"prefix":"config.","count_only":true}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-recall"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&records[0].output).expect("count_only output should be json");
+        assert_eq!(
+            payload.get("prefix").and_then(|value| value.as_str()),
+            Some("config.")
+        );
+        assert_eq!(
+            payload.get("count").and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            payload.get("count_only").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parse_recall_args_rejects_unknown_sort_by() {
+        let error = parse_recall_args(r#"{"sort_by":"unsupported"}"#)
+            .expect_err("unsupported sort_by must fail");
+        assert!(error.contains("unsupported"));
+    }
+
+    #[test]
+    fn memory_stats_tool_reports_fact_and_config_counts() {
+        stable::init_storage();
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.rpc_url".to_string(),
+            value: "https://rpc".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed config fact should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "market.signal".to_string(),
+            value: "bullish".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 2,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("seed market fact should store");
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "memory_stats".to_string(),
+            args_json: "{}".to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-stats"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&records[0].output).expect("memory_stats output should be json");
+        assert_eq!(
+            payload
+                .get("total_facts")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default(),
+            2
+        );
+        assert_eq!(
+            payload
+                .get("config_facts")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default(),
+            1
+        );
+        assert!(
+            payload
+                .get("storage_bytes")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default()
+                > 0
+        );
     }
 
     #[test]

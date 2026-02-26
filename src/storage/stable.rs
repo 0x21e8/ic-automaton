@@ -1981,8 +1981,42 @@ pub fn memory_fact_count() -> usize {
     MEMORY_FACTS_MAP.with(|map| map.borrow().len() as usize)
 }
 
+/// Returns aggregate memory-store telemetry used by the `memory_stats` tool.
+pub fn memory_fact_stats() -> MemoryFactStats {
+    MEMORY_FACTS_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .fold(MemoryFactStats::default(), |mut stats, entry| {
+                stats.total_facts = stats.total_facts.saturating_add(1);
+                stats.storage_bytes = stats
+                    .storage_bytes
+                    .saturating_add(entry.key().len().saturating_add(entry.value().len()));
+                if entry.key().to_ascii_lowercase().starts_with("config.") {
+                    stats.config_facts = stats.config_facts.saturating_add(1);
+                }
+                stats
+            })
+    })
+}
+
+/// Returns how many memory facts match `prefix` (case-insensitive).
+pub fn count_memory_facts_by_prefix(prefix: &str) -> usize {
+    let normalized_prefix = prefix.trim().to_ascii_lowercase();
+    MEMORY_FACTS_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter(|entry| entry.key().starts_with(&normalized_prefix))
+            .count()
+    })
+}
+
 /// Returns up to `limit` memory facts, sorted by `updated_at_ns` descending.
 pub fn list_all_memory_facts(limit: usize) -> Vec<MemoryFact> {
+    list_all_memory_facts_sorted(limit, MemoryFactSort::UpdatedAtDesc)
+}
+
+/// Returns up to `limit` memory facts sorted by the requested ordering.
+pub fn list_all_memory_facts_sorted(limit: usize, sort: MemoryFactSort) -> Vec<MemoryFact> {
     if limit == 0 {
         return Vec::new();
     }
@@ -1993,12 +2027,22 @@ pub fn list_all_memory_facts(limit: usize) -> Vec<MemoryFact> {
             .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
             .collect::<Vec<_>>()
     });
-    sort_memory_facts_desc_by_updated(facts, limit)
+    sort_memory_facts(facts, limit, sort)
 }
 
 /// Returns up to `limit` facts whose keys begin with `prefix` (case-insensitive),
 /// sorted by `updated_at_ns` descending.
+#[allow(dead_code)]
 pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact> {
+    list_memory_facts_by_prefix_sorted(prefix, limit, MemoryFactSort::UpdatedAtDesc)
+}
+
+/// Returns up to `limit` facts matching `prefix`, sorted by the requested ordering.
+pub fn list_memory_facts_by_prefix_sorted(
+    prefix: &str,
+    limit: usize,
+    sort: MemoryFactSort,
+) -> Vec<MemoryFact> {
     if limit == 0 {
         return Vec::new();
     }
@@ -2011,7 +2055,7 @@ pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Vec<MemoryFact
             .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
             .collect::<Vec<_>>()
     });
-    sort_memory_facts_desc_by_updated(facts, limit)
+    sort_memory_facts(facts, limit, sort)
 }
 
 // ── Strategy ─────────────────────────────────────────────────────────────────
@@ -2347,13 +2391,42 @@ fn autonomy_tool_success_key(fingerprint: &str) -> String {
     format!("{AUTONOMY_TOOL_SUCCESS_KEY_PREFIX}{fingerprint}")
 }
 
-fn sort_memory_facts_desc_by_updated(mut facts: Vec<MemoryFact>, limit: usize) -> Vec<MemoryFact> {
-    facts.sort_by(|left, right| {
-        right
-            .updated_at_ns
-            .cmp(&left.updated_at_ns)
-            .then_with(|| left.key.cmp(&right.key))
-    });
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryFactSort {
+    UpdatedAtDesc,
+    KeyAsc,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryFactStats {
+    pub total_facts: usize,
+    pub storage_bytes: usize,
+    pub config_facts: usize,
+}
+
+fn sort_memory_facts(
+    mut facts: Vec<MemoryFact>,
+    limit: usize,
+    sort: MemoryFactSort,
+) -> Vec<MemoryFact> {
+    match sort {
+        MemoryFactSort::UpdatedAtDesc => {
+            facts.sort_by(|left, right| {
+                right
+                    .updated_at_ns
+                    .cmp(&left.updated_at_ns)
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+        }
+        MemoryFactSort::KeyAsc => {
+            facts.sort_by(|left, right| {
+                left.key
+                    .cmp(&right.key)
+                    .then_with(|| right.updated_at_ns.cmp(&left.updated_at_ns))
+            });
+        }
+    }
+
     if facts.len() > limit {
         facts.truncate(limit);
     }
@@ -8237,6 +8310,52 @@ mod tests {
         assert!(remove_memory_fact("strategy.primary"));
         assert!(!remove_memory_fact("strategy.primary"));
         assert_eq!(memory_fact_count(), 1);
+    }
+
+    #[test]
+    fn memory_fact_query_variants_support_key_sort_and_counts() {
+        init_storage();
+        set_memory_fact(&MemoryFact {
+            key: "zeta.note".to_string(),
+            value: "1".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 10,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("zeta fact should store");
+        set_memory_fact(&MemoryFact {
+            key: "alpha.note".to_string(),
+            value: "2".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 20,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("alpha fact should store");
+        set_memory_fact(&MemoryFact {
+            key: "config.rpc_url".to_string(),
+            value: "https://rpc".to_string(),
+            created_at_ns: 3,
+            updated_at_ns: 30,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("config fact should store");
+
+        let sorted_by_key = list_all_memory_facts_sorted(10, MemoryFactSort::KeyAsc);
+        assert_eq!(sorted_by_key[0].key, "alpha.note");
+        assert_eq!(sorted_by_key[1].key, "config.rpc_url");
+        assert_eq!(sorted_by_key[2].key, "zeta.note");
+
+        let prefix_sorted = list_memory_facts_by_prefix_sorted("a", 10, MemoryFactSort::KeyAsc);
+        assert_eq!(prefix_sorted.len(), 1);
+        assert_eq!(prefix_sorted[0].key, "alpha.note");
+
+        assert_eq!(count_memory_facts_by_prefix(""), 3);
+        assert_eq!(count_memory_facts_by_prefix("config."), 1);
+
+        let stats = memory_fact_stats();
+        assert_eq!(stats.total_facts, 3);
+        assert_eq!(stats.config_facts, 1);
+        assert!(stats.storage_bytes > 0);
     }
 
     #[test]
