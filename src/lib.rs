@@ -172,7 +172,7 @@ fn upsert_template_status(
 #[ic_cdk::init]
 fn init(args: InitArgs) {
     apply_init_args(args);
-    crate::features::MockSkillLoader::install_defaults();
+    crate::features::DefaultSkillLoader::install_defaults();
     crate::http::init_certification();
     arm_timer();
 }
@@ -230,6 +230,7 @@ fn apply_init_args(args: InitArgs) {
 fn post_upgrade() {
     stable::init_storage();
     enforce_wallet_sync_response_bytes_floor();
+    crate::features::DefaultSkillLoader::seed_missing_defaults();
     crate::http::init_certification();
     arm_timer();
 }
@@ -579,6 +580,17 @@ fn list_turns(limit: u32) -> Vec<String> {
 #[ic_cdk::query]
 fn list_skills() -> Vec<SkillRecord> {
     stable::list_skills()
+}
+
+/// Inserts or updates a skill record.
+///
+/// Only callable by a canister controller.  This is the runtime management
+/// endpoint for adding new inter-canister call skills or modifying existing ones.
+#[ic_cdk::update]
+fn upsert_skill(skill: SkillRecord) -> Result<(), String> {
+    ensure_controller()?;
+    stable::upsert_skill(&skill);
+    Ok(())
 }
 
 /// Returns the policy (autonomy mode, allowed callers, …) for every registered

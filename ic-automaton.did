@@ -343,12 +343,19 @@ type SessionSummary = record {
   window_start_ns : nat64;
   inbox_preview : text;
 };
+type CanisterCallType = variant { Query; Update };
+type CanisterCallPermission = record {
+  canister_id : text;
+  method : text;
+  call_type : CanisterCallType;
+};
 type SkillRecord = record {
   name : text;
   description : text;
   instructions : text;
   enabled : bool;
   mutable : bool;
+  allowed_canister_calls : vec CanisterCallPermission;
 };
 type StorageGrowthMetrics = record {
   inbox_staged_queue_entries : nat64;
@@ -642,6 +649,8 @@ service : (InitArgs) -> {
   list_session_summaries : (nat32) -> (vec SessionSummary) query;
   // Returns all registered skill records.
   list_skills : () -> (vec SkillRecord) query;
+  // Inserts or updates a skill record.  Callable by controllers only.
+  upsert_skill : (SkillRecord) -> (variant { Ok; Err : text });
   // Lists strategy templates.  When `key` is supplied only templates matching
   // that key are returned; otherwise all templates are returned (up to `limit`).
   list_strategy_templates : (opt StrategyTemplateKey, nat32) -> (

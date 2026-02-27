@@ -562,6 +562,24 @@ pub struct TurnRecord {
     pub error: Option<String>,
 }
 
+/// Whether an inter-canister call is a query (read-only) or update (state-mutating).
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum CanisterCallType {
+    Query,
+    Update,
+}
+
+/// A single canister method that a skill permits the agent to call.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct CanisterCallPermission {
+    /// Target canister principal as text (e.g. `"um5iw-rqaaa-aaaaq-qaaba-cai"`).
+    pub canister_id: String,
+    /// Method name (e.g. `"icrc1_balance_of"`).
+    pub method: String,
+    /// Whether this is a read-only query or a state-mutating update.
+    pub call_type: CanisterCallType,
+}
+
 /// A named, optionally-mutable capability that can be enabled or disabled at runtime.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct SkillRecord {
@@ -570,6 +588,12 @@ pub struct SkillRecord {
     pub instructions: String,
     pub enabled: bool,
     pub mutable: bool,
+    /// Inter-canister calls this skill grants the agent permission to make.
+    ///
+    /// The `canister_call` tool checks this list across all active skills before
+    /// executing any call.  An empty vec means the skill grants no IC call permissions.
+    #[serde(default)]
+    pub allowed_canister_calls: Vec<CanisterCallPermission>,
 }
 
 // ── Prompt layer types ───────────────────────────────────────────────────────
@@ -1507,6 +1531,7 @@ pub enum SurvivalOperationClass {
     EvmPoll,
     EvmBroadcast,
     ThresholdSign,
+    InterCanisterCall,
 }
 
 /// The class of operation that experienced a recoverable failure.

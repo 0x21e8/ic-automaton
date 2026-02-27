@@ -24,6 +24,7 @@ use crate::domain::types::{
     AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
     SurvivalOperationClass, TemplateVersion, ToolCall, ToolCallRecord,
 };
+use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
@@ -61,6 +62,9 @@ fn survival_operation_max_backoff_secs(operation: &SurvivalOperationClass) -> u6
         }
         SurvivalOperationClass::ThresholdSign => {
             stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN
+        }
+        SurvivalOperationClass::InterCanisterCall => {
+            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL
         }
     }
 }
@@ -380,6 +384,15 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        // Generic inter-canister call tool — restricted to ExecutingActions even for query
+        // calls because responses are untrusted external data that could influence tool sequences.
+        policies.insert(
+            "canister_call".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
             },
         );
 
@@ -740,6 +753,29 @@ impl ToolManager {
                                 SurvivalOperationClass::EvmBroadcast,
                             ],
                             now_ns,
+                        );
+                    }
+                    result
+                }
+            }
+            "canister_call" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::InterCanisterCall,
+                    now_ns,
+                ) {
+                    Err("canister_call skipped due to survival policy".to_string())
+                } else {
+                    let result = canister_call_tool(&call.args_json).await;
+                    if result.is_ok() {
+                        stable::record_survival_operation_success(
+                            &SurvivalOperationClass::InterCanisterCall,
+                        );
+                    } else {
+                        stable::record_survival_operation_failure(
+                            &SurvivalOperationClass::InterCanisterCall,
+                            now_ns,
+                            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL,
                         );
                     }
                     result

@@ -907,6 +907,47 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["key".to_string(), "version".to_string()]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "canister_call".to_string(),
+            description: Some(
+                "Call a method on another Internet Computer canister. The target canister+method pair must be permitted by an active skill (check active skill instructions for permitted calls and correct Candid argument format). Arguments must be in Candid text format, e.g. \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Response is returned as Candid text."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "canister_id".to_string(),
+                        description: Some(
+                            "Target canister principal in text format (e.g. \"um5iw-rqaaa-aaaaq-qaaba-cai\")."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "method".to_string(),
+                        description: Some(
+                            "Method name to call (e.g. \"icrc1_balance_of\")."
+                                .to_string(),
+                        ),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "args_candid".to_string(),
+                        description: Some(
+                            "Arguments in Candid text format. Use \"()\" for no arguments. Refer to the active skill instructions for the correct type definitions."
+                                .to_string(),
+                        ),
+                    },
+                ]),
+                required: Some(vec![
+                    "canister_id".to_string(),
+                    "method".to_string(),
+                    "args_candid".to_string(),
+                ]),
+            }),
+        }),
     ]
 }
 
@@ -2066,6 +2107,7 @@ mod tests {
             instructions: "Keep it short.".to_string(),
             enabled: true,
             mutable: true,
+            allowed_canister_calls: vec![],
         });
         let input = InferenceInput {
             input: "hello".to_string(),

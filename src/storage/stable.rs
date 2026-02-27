@@ -191,6 +191,8 @@ pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
 /// Maximum exponential backoff (seconds) for the `ThresholdSign` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
+/// Maximum exponential backoff (seconds) for the `InterCanisterCall` operation class.
+pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL: u64 = 120;
 /// Hard upper limit on the EVM RPC response buffer (2 MiB).
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 #[allow(dead_code)]
@@ -246,6 +248,9 @@ fn survival_operation_runtime_key(operation: &SurvivalOperationClass) -> String 
         SurvivalOperationClass::EvmPoll => "survival.operation:evm_poll".to_string(),
         SurvivalOperationClass::EvmBroadcast => "survival.operation:evm_broadcast".to_string(),
         SurvivalOperationClass::ThresholdSign => "survival.operation:threshold_sign".to_string(),
+        SurvivalOperationClass::InterCanisterCall => {
+            "survival.operation:inter_canister_call".to_string()
+        }
     }
 }
 
