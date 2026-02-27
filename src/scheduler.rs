@@ -167,7 +167,7 @@ pub async fn scheduler_tick() {
     if let Some(pruned) = stable::run_retention_maintenance_if_due(current_time_ns()) {
         log!(
             SchedulerLogPriority::Info,
-            "scheduler_retention_maintenance deleted_jobs={} deleted_dedupe={} deleted_inbox={} deleted_outbox={} deleted_turns={} deleted_transitions={} deleted_tools={} generated_session_summaries={} generated_turn_window_summaries={} generated_memory_rollups={}",
+            "scheduler_retention_maintenance deleted_jobs={} deleted_dedupe={} deleted_inbox={} deleted_outbox={} deleted_turns={} deleted_transitions={} deleted_tools={} generated_session_summaries={} generated_turn_window_summaries={} generated_memory_rollups={} deleted_memory_facts={}",
             pruned.deleted_jobs,
             pruned.deleted_dedupe,
             pruned.deleted_inbox,
@@ -177,7 +177,8 @@ pub async fn scheduler_tick() {
             pruned.deleted_tools,
             pruned.generated_session_summaries,
             pruned.generated_turn_window_summaries,
-            pruned.generated_memory_rollups
+            pruned.generated_memory_rollups,
+            pruned.deleted_memory_facts
         );
     }
 
@@ -2248,6 +2249,8 @@ mod tests {
             tools_max_age_secs: 7 * 24 * 60 * 60,
             inbox_max_age_secs: 14 * 24 * 60 * 60,
             outbox_max_age_secs: 14 * 24 * 60 * 60,
+            memory_facts_max_age_secs: 3 * 24 * 60 * 60,
+            memory_facts_prune_batch_size: 25,
             maintenance_batch_size: 50,
             maintenance_interval_secs: 30,
         })

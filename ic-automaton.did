@@ -166,6 +166,14 @@ type JobStatus = variant {
   TimedOut;
   Pending;
 };
+type MemoryFact = record {
+  key : text;
+  value : text;
+  updated_at_ns : nat64;
+  created_at_ns : nat64;
+  source_turn_id : text;
+};
+type MemoryFactListSort = variant { KeyAsc; UpdatedAtDesc };
 type MemoryRollup = record {
   source_count : nat32;
   canonical_value : text;
@@ -234,15 +242,17 @@ type Result_1 = variant { Ok : StrategyTemplate; Err : text };
 type Result_10 = variant { Ok : PromptLayer; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
-type Result_4 = variant { Ok : TemplateRevocationState; Err : text };
-type Result_5 = variant { Ok : nat64; Err : text };
-type Result_6 = variant { Ok : opt text; Err : text };
-type Result_7 = variant { Ok : vec text; Err : text };
+type Result_4 = variant { Ok : vec text; Err : text };
+type Result_5 = variant { Ok : TemplateRevocationState; Err : text };
+type Result_6 = variant { Ok : nat64; Err : text };
+type Result_7 = variant { Ok : opt text; Err : text };
 type Result_8 = variant { Ok : RetentionConfig; Err : text };
 type Result_9 = variant { Ok : StrategyKillSwitchState; Err : text };
 type RetentionConfig = record {
   transitions_max_age_secs : nat64;
+  memory_facts_max_age_secs : nat64;
   turns_max_age_secs : nat64;
+  memory_facts_prune_batch_size : nat32;
   dedupe_max_age_secs : nat64;
   jobs_max_records : nat64;
   maintenance_batch_size : nat32;
@@ -267,6 +277,7 @@ type RetentionMaintenanceRuntime = record {
   transition_scan_cursor : opt text;
   job_scan_cursor : opt text;
   last_generated_turn_window_summaries : nat32;
+  last_deleted_memory_facts : nat32;
   last_deleted_transitions : nat32;
   last_deleted_outbox : nat32;
   turn_scan_cursor : opt text;
@@ -343,19 +354,12 @@ type SessionSummary = record {
   window_start_ns : nat64;
   inbox_preview : text;
 };
-type CanisterCallType = variant { Query; Update };
-type CanisterCallPermission = record {
-  canister_id : text;
-  method : text;
-  call_type : CanisterCallType;
-};
 type SkillRecord = record {
   name : text;
   description : text;
   instructions : text;
   enabled : bool;
   mutable : bool;
-  allowed_canister_calls : vec CanisterCallPermission;
 };
 type StorageGrowthMetrics = record {
   inbox_staged_queue_entries : nat64;
@@ -375,6 +379,7 @@ type StorageGrowthMetrics = record {
   memory_fact_entries : nat64;
   memory_fact_utilization_percent : nat8;
   near_limit : bool;
+  memory_fact_retention_max_age_secs : nat64;
   trend_sample_count : nat32;
   session_summary_entries : nat64;
   dedupe_map_entries : nat64;
@@ -382,6 +387,8 @@ type StorageGrowthMetrics = record {
   turn_window_summary_entries : nat64;
   pressure_warnings : vec text;
   heap_memory_mb : float64;
+  last_deleted_memory_facts : nat32;
+  memory_fact_prune_batch_size : nat32;
   tool_map_entries : nat64;
   runtime_map_entries : nat64;
   stable_memory_mb : float64;
@@ -637,6 +644,12 @@ service : (InitArgs) -> {
   list_conversations : () -> (vec ConversationSummary) query;
   // Returns up to `limit` inbox messages ordered by arrival time (newest last).
   list_inbox_messages : (nat32) -> (vec InboxMessage) query;
+  // Returns memory facts filtered by key prefix, sorted by `sort`, and bounded by `limit`.
+  // 
+  // Pass an empty prefix (`""`) to list across all memory facts.
+  list_memory_facts : (text, MemoryFactListSort, nat32) -> (
+      vec MemoryFact,
+    ) query;
   // Returns up to `limit` most-recent memory rollups (compressed long-term context).
   list_memory_rollups : (nat32) -> (vec MemoryRollup) query;
   // Returns up to `limit` most-recent outbox messages (agent replies queued for delivery).
@@ -649,8 +662,6 @@ service : (InitArgs) -> {
   list_session_summaries : (nat32) -> (vec SessionSummary) query;
   // Returns all registered skill records.
   list_skills : () -> (vec SkillRecord) query;
-  // Inserts or updates a skill record.  Callable by controllers only.
-  upsert_skill : (SkillRecord) -> (variant { Ok; Err : text });
   // Lists strategy templates.  When `key` is supplied only templates matching
   // that key are returned; otherwise all templates are returned (up to `limit`).
   list_strategy_templates : (opt StrategyTemplateKey, nat32) -> (
@@ -667,6 +678,12 @@ service : (InitArgs) -> {
   list_turn_window_summaries : (nat32) -> (vec TurnWindowSummary) query;
   // Returns up to `limit` recent agent turn records as debug strings.
   list_turns : (nat32) -> (vec text) query;
+  // Controller-only remediation endpoint to prune memory facts by prefix and/or age.
+  // 
+  // - `prefix`: optional key namespace filter (e.g. `"signal."`).
+  // - `updated_before_ns`: optional inclusive timestamp cutoff.
+  // - `limit`: max number of facts to remove in this call.
+  prune_memory_facts_admin : (opt text, opt nat64, nat32) -> (Result_4);
   // Hard-revokes a template: sets status to `Revoked`, deactivates it, and
   // records an immutable revocation entry.  Use for security incidents
   // (controller only).
@@ -674,23 +691,23 @@ service : (InitArgs) -> {
       StrategyTemplateKey,
       TemplateVersion,
       opt text,
-    ) -> (Result_4);
+    ) -> (Result_5);
   // Updates the EVM chain ID used for all on-chain operations (controller only).
-  set_evm_chain_id_admin : (nat64) -> (Result_5);
+  set_evm_chain_id_admin : (nat64) -> (Result_6);
   // Sets how many block confirmations must pass before an EVM event is
   // considered finalised (controller only).
-  set_evm_confirmation_depth_admin : (nat64) -> (Result_5);
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_6);
   // Sets an optional fallback EVM RPC URL used when the primary is unavailable (controller only).
-  set_evm_rpc_fallback_url : (opt text) -> (Result_6);
+  set_evm_rpc_fallback_url : (opt text) -> (Result_7);
   // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
-  set_evm_rpc_max_response_bytes : (nat64) -> (Result_5);
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_6);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
   set_evm_rpc_url : (text) -> (Result_2);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
-  set_http_allowed_domains : (vec text) -> (Result_7);
+  set_http_allowed_domains : (vec text) -> (Result_4);
   // Overrides the EVM inbox contract address (controller only).
-  set_inbox_contract_address_admin : (opt text) -> (Result_6);
+  set_inbox_contract_address_admin : (opt text) -> (Result_7);
   // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
   // (controller only).
   set_inference_model : (text) -> (Result_2);
@@ -704,7 +721,7 @@ service : (InitArgs) -> {
   // Replaces the conversation-retention policy (controller only).
   set_retention_config : (RetentionConfig) -> (Result_8);
   // Updates the scheduler timer base tick interval in seconds (controller only).
-  set_scheduler_base_tick_secs : (nat64) -> (Result_5);
+  set_scheduler_base_tick_secs : (nat64) -> (Result_6);
   // Enables or disables the scheduler (controller only).
   // Disabling prevents new jobs from being dispatched without stopping the timer.
   set_scheduler_enabled : (bool) -> (text);

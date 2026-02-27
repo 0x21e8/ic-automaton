@@ -112,6 +112,8 @@ struct RetentionConfig {
     tools_max_age_secs: u64,
     inbox_max_age_secs: u64,
     outbox_max_age_secs: u64,
+    memory_facts_max_age_secs: u64,
+    memory_facts_prune_batch_size: u32,
     maintenance_batch_size: u32,
     maintenance_interval_secs: u64,
 }
@@ -747,6 +749,8 @@ fn high_volume_poll_inbox_history_stays_bounded_with_active_retention() {
             tools_max_age_secs: 7 * 24 * 60 * 60,
             inbox_max_age_secs: 14 * 24 * 60 * 60,
             outbox_max_age_secs: 14 * 24 * 60 * 60,
+            memory_facts_max_age_secs: 3 * 24 * 60 * 60,
+            memory_facts_prune_batch_size: 25,
             maintenance_batch_size: 96,
             maintenance_interval_secs: 1,
         },

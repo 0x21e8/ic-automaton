@@ -188,6 +188,17 @@ fn run_deterministic_inference(
         || input.context_snippet.contains("request_sign_message:true");
     let update_prompt_layer_request = input.input.contains("request_update_prompt_layer:true");
     let layer_6_probe_request = input.input.contains("request_layer_6_probe:true");
+    let remember_capacity_probe_request =
+        input.input.contains("request_remember_capacity_probe:true")
+            || input
+                .context_snippet
+                .contains("request_remember_capacity_probe:true");
+    let remember_failure_loop_probe_request = input
+        .input
+        .contains("request_remember_failure_loop_probe:true")
+        || input
+            .context_snippet
+            .contains("request_remember_failure_loop_probe:true");
     let continuation_loop_request = input.input.contains("request_continuation_loop:true")
         || input
             .context_snippet
@@ -212,7 +223,27 @@ fn run_deterministic_inference(
         });
     }
 
-    let tool_calls = if explicit_sign_request {
+    let tool_calls = if remember_failure_loop_probe_request {
+        vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "remember".to_string(),
+                args_json: r#"{"key":"signal.failure_probe.1730000000","value":"probe"}"#
+                    .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "recall".to_string(),
+                args_json: r#"{"prefix":"config.endpoint.keepalive"}"#.to_string(),
+            },
+        ]
+    } else if remember_capacity_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "remember".to_string(),
+            args_json: r#"{"key":"signal.capacity_probe.1730000000","value":"probe"}"#.to_string(),
+        }]
+    } else if explicit_sign_request {
         vec![ToolCall {
             tool_call_id: None,
             tool: "sign_message".to_string(),
@@ -905,47 +936,6 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     },
                 ]),
                 required: Some(vec!["key".to_string(), "version".to_string()]),
-            }),
-        }),
-        IcLlmTool::Function(IcLlmFunction {
-            name: "canister_call".to_string(),
-            description: Some(
-                "Call a method on another Internet Computer canister. The target canister+method pair must be permitted by an active skill (check active skill instructions for permitted calls and correct Candid argument format). Arguments must be in Candid text format, e.g. \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Response is returned as Candid text."
-                    .to_string(),
-            ),
-            parameters: Some(IcLlmParameters {
-                type_: "object".to_string(),
-                properties: Some(vec![
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "canister_id".to_string(),
-                        description: Some(
-                            "Target canister principal in text format (e.g. \"um5iw-rqaaa-aaaaq-qaaba-cai\")."
-                                .to_string(),
-                        ),
-                    },
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "method".to_string(),
-                        description: Some(
-                            "Method name to call (e.g. \"icrc1_balance_of\")."
-                                .to_string(),
-                        ),
-                    },
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "args_candid".to_string(),
-                        description: Some(
-                            "Arguments in Candid text format. Use \"()\" for no arguments. Refer to the active skill instructions for the correct type definitions."
-                                .to_string(),
-                        ),
-                    },
-                ]),
-                required: Some(vec![
-                    "canister_id".to_string(),
-                    "method".to_string(),
-                    "args_candid".to_string(),
-                ]),
             }),
         }),
     ]
@@ -2107,7 +2097,6 @@ mod tests {
             instructions: "Keep it short.".to_string(),
             enabled: true,
             mutable: true,
-            allowed_canister_calls: vec![],
         });
         let input = InferenceInput {
             input: "hello".to_string(),

@@ -33,10 +33,10 @@ mod tools;
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, ConversationLog, ConversationSummary,
     EvmRouteStateView, InboxMessage, InboxStats, InferenceConfigView, InferenceProvider,
-    MemoryRollup, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
-    RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime,
-    SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate,
-    StrategyTemplateKey, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    MemoryFact, MemoryRollup, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer,
+    PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob,
+    SchedulerRuntime, SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats,
+    StrategyTemplate, StrategyTemplateKey, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
     TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
     ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
@@ -95,6 +95,20 @@ struct StrategyAbiIngestArgs {
     codehash: Option<String>,
     #[serde(default)]
     selector_assertions: Vec<AbiSelectorAssertion>,
+}
+
+/// Sort ordering for `list_memory_facts`.
+#[derive(CandidType, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryFactListSort {
+    UpdatedAtDesc,
+    KeyAsc,
+}
+
+fn memory_fact_sort_to_storage(sort: MemoryFactListSort) -> stable::MemoryFactSort {
+    match sort {
+        MemoryFactListSort::UpdatedAtDesc => stable::MemoryFactSort::UpdatedAtDesc,
+        MemoryFactListSort::KeyAsc => stable::MemoryFactSort::KeyAsc,
+    }
 }
 
 /// Returns `Err` when the caller is not a canister controller (wasm32 only;
@@ -172,7 +186,7 @@ fn upsert_template_status(
 #[ic_cdk::init]
 fn init(args: InitArgs) {
     apply_init_args(args);
-    crate::features::DefaultSkillLoader::install_defaults();
+    crate::features::MockSkillLoader::install_defaults();
     crate::http::init_certification();
     arm_timer();
 }
@@ -230,7 +244,6 @@ fn apply_init_args(args: InitArgs) {
 fn post_upgrade() {
     stable::init_storage();
     enforce_wallet_sync_response_bytes_floor();
-    crate::features::DefaultSkillLoader::seed_missing_defaults();
     crate::http::init_certification();
     arm_timer();
 }
@@ -461,6 +474,50 @@ fn list_memory_rollups(limit: u32) -> Vec<MemoryRollup> {
     stable::list_memory_rollups(limit as usize)
 }
 
+/// Returns memory facts filtered by key prefix, sorted by `sort`, and bounded by `limit`.
+///
+/// Pass an empty prefix (`""`) to list across all memory facts.
+#[ic_cdk::query]
+fn list_memory_facts(prefix: String, sort: MemoryFactListSort, limit: u32) -> Vec<MemoryFact> {
+    let sort = memory_fact_sort_to_storage(sort);
+    let trimmed_prefix = prefix.trim();
+    if trimmed_prefix.is_empty() {
+        stable::list_all_memory_facts_sorted(limit as usize, sort)
+    } else {
+        stable::list_memory_facts_by_prefix_sorted(trimmed_prefix, limit as usize, sort)
+    }
+}
+
+/// Controller-only remediation endpoint to prune memory facts by prefix and/or age.
+///
+/// - `prefix`: optional key namespace filter (e.g. `"signal."`).
+/// - `updated_before_ns`: optional inclusive timestamp cutoff.
+/// - `limit`: max number of facts to remove in this call.
+#[ic_cdk::update]
+fn prune_memory_facts_admin(
+    prefix: Option<String>,
+    updated_before_ns: Option<u64>,
+    limit: u32,
+) -> Result<Vec<String>, String> {
+    ensure_controller()?;
+
+    let normalized_prefix = prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if normalized_prefix.is_none() && updated_before_ns.is_none() {
+        return Err(
+            "provide at least one prune filter: prefix and/or updated_before_ns".to_string(),
+        );
+    }
+
+    Ok(stable::prune_memory_facts(
+        normalized_prefix,
+        updated_before_ns,
+        limit as usize,
+    ))
+}
+
 /// Returns the full conversation log for the given sender address, or `None`
 /// if no conversation exists.
 #[ic_cdk::query]
@@ -580,17 +637,6 @@ fn list_turns(limit: u32) -> Vec<String> {
 #[ic_cdk::query]
 fn list_skills() -> Vec<SkillRecord> {
     stable::list_skills()
-}
-
-/// Inserts or updates a skill record.
-///
-/// Only callable by a canister controller.  This is the runtime management
-/// endpoint for adding new inter-canister call skills or modifying existing ones.
-#[ic_cdk::update]
-fn upsert_skill(skill: SkillRecord) -> Result<(), String> {
-    ensure_controller()?;
-    stable::upsert_skill(&skill);
-    Ok(())
 }
 
 /// Returns the policy (autonomy mode, allowed callers, …) for every registered
@@ -807,8 +853,8 @@ fn arm_timer_with_interval(interval_secs: u64) {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, StrategyTemplate,
-        StrategyTemplateKey, TemplateStatus, TemplateVersion,
+        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, MemoryFact,
+        StrategyTemplate, StrategyTemplateKey, TemplateStatus, TemplateVersion,
     };
 
     #[test]
@@ -1054,6 +1100,76 @@ mod tests {
         let fetched = get_strategy_template(sample_strategy_key(), sample_version())
             .expect("template exists");
         assert_eq!(fetched.actions[0].action_id, "transfer");
+    }
+
+    #[test]
+    fn list_memory_facts_query_supports_prefix_sort_and_limit() {
+        stable::init_storage();
+        for (key, updated_at_ns) in [
+            ("zeta.note", 30u64),
+            ("alpha.note", 20u64),
+            ("config.rpc_url", 10u64),
+        ] {
+            stable::set_memory_fact(&MemoryFact {
+                key: key.to_string(),
+                value: key.to_string(),
+                created_at_ns: updated_at_ns,
+                updated_at_ns,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("memory fact fixture should store");
+        }
+
+        let prefixed =
+            list_memory_facts("config.".to_string(), MemoryFactListSort::UpdatedAtDesc, 10);
+        assert_eq!(prefixed.len(), 1);
+        assert_eq!(prefixed[0].key, "config.rpc_url");
+
+        let sorted = list_memory_facts("".to_string(), MemoryFactListSort::KeyAsc, 2);
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].key, "alpha.note");
+        assert_eq!(sorted[1].key, "config.rpc_url");
+    }
+
+    #[test]
+    fn prune_memory_facts_admin_requires_filter_and_prunes_targeted_entries() {
+        stable::init_storage();
+        stable::set_memory_fact(&MemoryFact {
+            key: "noise.old".to_string(),
+            value: "old".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 100,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("old fact should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "noise.fresh".to_string(),
+            value: "fresh".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 200,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("fresh fact should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.keep".to_string(),
+            value: "keep".to_string(),
+            created_at_ns: 3,
+            updated_at_ns: 300,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("config fact should store");
+
+        assert!(
+            prune_memory_facts_admin(None, None, 10).is_err(),
+            "admin prune should reject requests without prefix or age filter"
+        );
+
+        let removed = prune_memory_facts_admin(Some("noise.".to_string()), Some(150), 10)
+            .expect("filtered prune should succeed");
+        assert_eq!(removed, vec!["noise.old".to_string()]);
+        assert!(stable::get_memory_fact("noise.old").is_none());
+        assert!(stable::get_memory_fact("noise.fresh").is_some());
+        assert!(stable::get_memory_fact("config.keep").is_some());
     }
 }
 

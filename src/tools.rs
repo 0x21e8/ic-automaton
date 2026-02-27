@@ -24,7 +24,6 @@ use crate::domain::types::{
     AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
     SurvivalOperationClass, TemplateVersion, ToolCall, ToolCallRecord,
 };
-use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
@@ -62,9 +61,6 @@ fn survival_operation_max_backoff_secs(operation: &SurvivalOperationClass) -> u6
         }
         SurvivalOperationClass::ThresholdSign => {
             stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN
-        }
-        SurvivalOperationClass::InterCanisterCall => {
-            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL
         }
     }
 }
@@ -384,15 +380,6 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
-            },
-        );
-        // Generic inter-canister call tool — restricted to ExecutingActions even for query
-        // calls because responses are untrusted external data that could influence tool sequences.
-        policies.insert(
-            "canister_call".to_string(),
-            ToolPolicy {
-                enabled: true,
-                allowed_states: vec![AgentState::ExecutingActions],
             },
         );
 
@@ -758,29 +745,6 @@ impl ToolManager {
                     result
                 }
             }
-            "canister_call" => {
-                let now_ns = current_time_ns();
-                if !stable::can_run_survival_operation(
-                    &SurvivalOperationClass::InterCanisterCall,
-                    now_ns,
-                ) {
-                    Err("canister_call skipped due to survival policy".to_string())
-                } else {
-                    let result = canister_call_tool(&call.args_json).await;
-                    if result.is_ok() {
-                        stable::record_survival_operation_success(
-                            &SurvivalOperationClass::InterCanisterCall,
-                        );
-                    } else {
-                        stable::record_survival_operation_failure(
-                            &SurvivalOperationClass::InterCanisterCall,
-                            now_ns,
-                            stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL,
-                        );
-                    }
-                    result
-                }
-            }
             _ => Err("unknown tool".to_string()),
         }
     }
@@ -861,7 +825,106 @@ fn normalize_memory_key(raw: &str) -> Result<String, String> {
     if normalized.chars().any(|char| char.is_control()) {
         return Err("key must not contain control characters".to_string());
     }
-    Ok(normalized)
+    let canonical = canonicalize_memory_key(&normalized);
+    if canonical.is_empty() || canonical.len() > MAX_MEMORY_KEY_BYTES {
+        return Err(format!("key must be 1-{MAX_MEMORY_KEY_BYTES} bytes"));
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_memory_key(normalized: &str) -> String {
+    let mut segments = normalized
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return normalized.to_string();
+    }
+    if segments.last().copied() == Some("latest") {
+        return segments.join(".");
+    }
+
+    let mut stripped_timestamp = false;
+    if segments
+        .last()
+        .copied()
+        .is_some_and(is_timestamp_like_key_segment)
+    {
+        let _ = segments.pop();
+        stripped_timestamp = true;
+    }
+    if stripped_timestamp
+        && segments
+            .last()
+            .copied()
+            .is_some_and(is_timestamp_marker_segment)
+    {
+        let _ = segments.pop();
+    }
+    if stripped_timestamp {
+        segments.push("latest");
+    }
+    segments.join(".")
+}
+
+fn is_timestamp_marker_segment(segment: &str) -> bool {
+    matches!(
+        segment,
+        "ts" | "time" | "timestamp" | "at" | "updated_at" | "observed_at"
+    )
+}
+
+fn is_timestamp_like_key_segment(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+
+    if looks_like_epoch_timestamp(segment) {
+        return true;
+    }
+
+    for prefix in ["ts_", "ts-", "timestamp_", "timestamp-", "time_", "time-"] {
+        if let Some(candidate) = segment.strip_prefix(prefix) {
+            if looks_like_epoch_timestamp(candidate) {
+                return true;
+            }
+        }
+    }
+
+    if let Some(candidate) = segment
+        .strip_suffix("ns")
+        .or_else(|| segment.strip_suffix("ms"))
+        .or_else(|| segment.strip_suffix('s'))
+    {
+        if looks_like_epoch_timestamp(candidate) {
+            return true;
+        }
+    }
+
+    // RFC3339-style suffixes are high-churn observation keys and should map to `.latest`.
+    segment.contains('t')
+        && segment.contains('-')
+        && segment.contains(':')
+        && segment.chars().any(|char| char.is_ascii_digit())
+}
+
+fn looks_like_epoch_timestamp(segment: &str) -> bool {
+    if !segment.chars().all(|char| char.is_ascii_digit()) {
+        return false;
+    }
+    let len = segment.len();
+    let Ok(value) = segment.parse::<u64>() else {
+        return false;
+    };
+    match len {
+        // Seconds range: roughly years 2017..2103.
+        10 => (1_500_000_000..=4_200_000_000).contains(&value),
+        // Milliseconds range: roughly years 2017..2103.
+        13 => (1_500_000_000_000..=4_200_000_000_000).contains(&value),
+        // Micro/nano and other large monotonic timestamp encodings.
+        _ => len >= 16,
+    }
 }
 
 /// Trim, lowercase, and validate a memory prefix (may be empty for "list all").
@@ -2269,17 +2332,142 @@ mod tests {
     }
 
     #[test]
-    fn remember_tool_respects_global_memory_fact_capacity() {
+    fn remember_tool_canonicalizes_timestamp_suffixed_keys_to_latest() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "remember".to_string(),
+                args_json: r#"{"key":"signal.eth.1730000000","value":"100"}"#.to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "remember".to_string(),
+                args_json: r#"{"key":"signal.eth.1730000001","value":"101"}"#.to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "recall".to_string(),
+                args_json: r#"{"prefix":"signal.eth."}"#.to_string(),
+            },
+        ];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 3);
+        assert!(records[0].success);
+        assert!(records[1].success);
+        assert_eq!(records[0].output, "stored: signal.eth.latest");
+        assert_eq!(records[1].output, "stored: signal.eth.latest");
+        assert_eq!(records[2].output, "signal.eth.latest=101");
+        assert_eq!(stable::memory_fact_count(), 1);
+    }
+
+    #[test]
+    fn remember_tool_canonicalizes_config_timestamp_suffixes_to_latest() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "remember".to_string(),
+                args_json:
+                    r#"{"key":"config.endpoint.dexscreener.2026-02-27t12:00:00z","value":"a"}"#
+                        .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "remember".to_string(),
+                args_json:
+                    r#"{"key":"config.endpoint.dexscreener.2026-02-27t12:01:00z","value":"b"}"#
+                        .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "recall".to_string(),
+                args_json: r#"{"prefix":"config.endpoint.dexscreener."}"#.to_string(),
+            },
+        ];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 3);
+        assert!(records[0].success);
+        assert!(records[1].success);
+        assert_eq!(
+            records[0].output,
+            "stored: config.endpoint.dexscreener.latest"
+        );
+        assert_eq!(
+            records[1].output,
+            "stored: config.endpoint.dexscreener.latest"
+        );
+        assert_eq!(
+            records[2].output, "config.endpoint.dexscreener.latest=b",
+            "timestamp-like config keys should normalize and overwrite a stable canonical key"
+        );
+        assert_eq!(stable::memory_fact_count(), 1);
+    }
+
+    #[test]
+    fn remember_tool_evicts_oldest_non_critical_fact_when_memory_full() {
+        stable::init_storage();
+        stable::set_memory_fact(&MemoryFact {
+            key: "signal.oldest".to_string(),
+            value: "seed".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("oldest non-critical fact should store");
+        for idx in 0..stable::MAX_MEMORY_FACTS.saturating_sub(1) {
+            stable::set_memory_fact(&MemoryFact {
+                key: format!("config.keep.{idx}"),
+                value: "seed".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 2,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("seed fact should store");
+        }
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "remember".to_string(),
+            args_json: r#"{"key":"overflow","value":"new"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-overflow"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        assert!(
+            stable::get_memory_fact("signal.oldest").is_none(),
+            "oldest non-critical key should be evicted"
+        );
+        assert!(stable::get_memory_fact("overflow").is_some());
+        assert_eq!(stable::memory_fact_count(), stable::MAX_MEMORY_FACTS);
+    }
+
+    #[test]
+    fn remember_tool_returns_non_evictable_capacity_error_when_only_critical_facts() {
         stable::init_storage();
         for idx in 0..stable::MAX_MEMORY_FACTS {
             stable::set_memory_fact(&MemoryFact {
-                key: format!("fact.{idx}"),
+                key: format!("config.only.{idx}"),
                 value: "seed".to_string(),
                 created_at_ns: 1,
                 updated_at_ns: 1,
                 source_turn_id: "turn-seed".to_string(),
             })
-            .expect("seed fact should store");
+            .expect("critical seed fact should store");
         }
         let state = AgentState::Inferring;
         let signer = CountingSigner::new();
@@ -2299,8 +2487,8 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("memory full"),
-            "remember tool should fail when memory facts are at capacity"
+                .contains("non-evictable capacity reached"),
+            "remember tool should fail deterministically when only critical keys exist"
         );
     }
 

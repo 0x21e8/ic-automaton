@@ -64,6 +64,7 @@ const MAX_STAGED_INBOX_MESSAGES_PER_TURN: usize = 1;
 /// Human-readable reason stored in synthetic tool records when a call is
 /// suppressed by the autonomy deduplication window.
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
+const AUTONOMY_FAILURE_COOLDOWN_SKIP_REASON: &str = "suppressed due to repeated failure cooldown";
 const TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX: &str = "tool sequence validator blocked";
 
 // ── Log types ────────────────────────────────────────────────────────────────
@@ -358,10 +359,28 @@ struct SuppressedAutonomyToolCall {
 }
 
 #[derive(Clone, Debug)]
+struct SuppressedFailureCooldownToolCall {
+    index: usize,
+    call: ToolCall,
+    remaining_secs: u64,
+    normalized_error: String,
+    repeat_count: u32,
+}
+
+#[derive(Clone, Debug)]
 enum PlannedToolCallExecution {
     Execute,
-    Suppressed { age_secs: u64 },
-    SequenceBlocked { reason: String },
+    Suppressed {
+        age_secs: u64,
+    },
+    FailureSuppressed {
+        remaining_secs: u64,
+        normalized_error: String,
+        repeat_count: u32,
+    },
+    SequenceBlocked {
+        reason: String,
+    },
 }
 
 /// Produces a synthetic `ToolCallRecord` marked as successful for a suppressed
@@ -410,6 +429,28 @@ fn is_sequence_validator_block(record: &ToolCallRecord) -> bool {
         .unwrap_or(false)
 }
 
+fn synthetic_failure_suppressed_tool_record(
+    turn_id: &str,
+    call: &ToolCall,
+    remaining_secs: u64,
+    normalized_error: &str,
+    repeat_count: u32,
+) -> ToolCallRecord {
+    ToolCallRecord {
+        turn_id: turn_id.to_string(),
+        tool: call.tool.clone(),
+        args_json: call.args_json.clone(),
+        output: format!(
+            "{AUTONOMY_FAILURE_COOLDOWN_SKIP_REASON}: repeat_count={} remaining_secs={} last_error={}",
+            repeat_count,
+            remaining_secs,
+            sanitize_preview(normalized_error, 180)
+        ),
+        success: true,
+        error: None,
+    }
+}
+
 fn is_http_fetch_recoverable_failure(record: &ToolCallRecord) -> bool {
     if record.tool != "http_fetch" {
         return false;
@@ -423,6 +464,17 @@ fn is_http_fetch_recoverable_failure(record: &ToolCallRecord) -> bool {
         || normalized.starts_with("http 4")
 }
 
+fn is_remember_capacity_failure(record: &ToolCallRecord) -> bool {
+    if record.tool != "remember" {
+        return false;
+    }
+    let Some(error) = record.error.as_deref() else {
+        return false;
+    };
+    let normalized = error.trim().to_ascii_lowercase();
+    normalized.starts_with("memory full:")
+}
+
 fn should_degrade_tool_failures_for_autonomy(
     tool_failures: &[&ToolCallRecord],
     has_external_input: bool,
@@ -430,17 +482,75 @@ fn should_degrade_tool_failures_for_autonomy(
     if has_external_input || tool_failures.is_empty() {
         return false;
     }
-    tool_failures
-        .iter()
-        .all(|record| is_http_fetch_recoverable_failure(record))
+    tool_failures.iter().all(|record| {
+        is_http_fetch_recoverable_failure(record) || is_remember_capacity_failure(record)
+    })
 }
 
-/// Persists the fingerprint and timestamp of every successful autonomy tool call
-/// so future ticks can suppress identical calls within the dedup window.
-fn record_successful_autonomy_tool_calls(tool_calls: &[ToolCallRecord], succeeded_at_ns: u64) {
-    for call in tool_calls.iter().filter(|call| call.success) {
+fn normalize_tool_failure_reason(error: &str) -> String {
+    error
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn suppress_repeated_failure_autonomy_tool_calls(
+    calls: &[ToolCall],
+    now_ns: u64,
+) -> Vec<SuppressedFailureCooldownToolCall> {
+    let mut suppressed = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
-        stable::record_autonomy_tool_success(&fingerprint, succeeded_at_ns);
+        let Some(cooldown) = stable::autonomy_tool_failure_cooldown(&fingerprint, now_ns) else {
+            continue;
+        };
+        suppressed.push(SuppressedFailureCooldownToolCall {
+            index,
+            call: call.clone(),
+            remaining_secs: cooldown.cooldown_until_ns.saturating_sub(now_ns) / 1_000_000_000,
+            normalized_error: cooldown.normalized_error,
+            repeat_count: cooldown.repeat_count,
+        });
+    }
+    suppressed
+}
+
+/// Records autonomy tool outcomes for both success dedupe and repeated-failure cooldowns.
+fn record_autonomy_tool_outcomes(
+    planned_tool_calls: &[ToolCall],
+    planned_execution: &[PlannedToolCallExecution],
+    round_tool_records: &[ToolCallRecord],
+    recorded_at_ns: u64,
+) {
+    for ((call, execution), record) in planned_tool_calls
+        .iter()
+        .zip(planned_execution.iter())
+        .zip(round_tool_records.iter())
+    {
+        if !matches!(execution, PlannedToolCallExecution::Execute) {
+            continue;
+        }
+        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        if record.success {
+            stable::record_autonomy_tool_success(&fingerprint, recorded_at_ns);
+            stable::clear_autonomy_tool_failure(&fingerprint);
+            continue;
+        }
+        if is_sequence_validator_block(record) {
+            continue;
+        }
+        let raw_error = record
+            .error
+            .as_deref()
+            .filter(|error| !error.trim().is_empty())
+            .unwrap_or(record.output.as_str());
+        let normalized = normalize_tool_failure_reason(raw_error);
+        if normalized.is_empty() {
+            continue;
+        }
+        let _ = stable::record_autonomy_tool_failure(&fingerprint, &normalized, recorded_at_ns);
     }
 }
 
@@ -1148,6 +1258,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 }
             }
             let mut suppressed_autonomy_calls = Vec::new();
+            let mut suppressed_failure_calls = Vec::new();
             if inference_round_count == 1 && !has_external_input {
                 let (_, suppressed_calls) =
                     suppress_duplicate_autonomy_tool_calls(&planned_tool_calls, started_at_ns);
@@ -1175,6 +1286,50 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     );
                 }
                 suppressed_autonomy_calls = suppressed_calls;
+
+                let dedupe_indices = suppressed_autonomy_calls
+                    .iter()
+                    .map(|entry| entry.index)
+                    .collect::<BTreeSet<_>>();
+                let failure_suppressed = suppress_repeated_failure_autonomy_tool_calls(
+                    &planned_tool_calls,
+                    started_at_ns,
+                )
+                .into_iter()
+                .filter(|entry| !dedupe_indices.contains(&entry.index))
+                .collect::<Vec<_>>();
+                if !failure_suppressed.is_empty() {
+                    let details = failure_suppressed
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{} args={} repeat_count={} remaining_secs={} last_error={}",
+                                entry.call.tool,
+                                sanitize_preview(&entry.call.args_json, 100),
+                                entry.repeat_count,
+                                entry.remaining_secs,
+                                sanitize_preview(&entry.normalized_error, 120)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n- ");
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        &format!(
+                            "autonomy repeated-failure cooldown suppressed {} tool call(s):\n- {}",
+                            failure_suppressed.len(),
+                            details
+                        ),
+                    );
+                    log!(
+                        AgentLogPriority::Info,
+                        "turn={} autonomy_failure_cooldown_suppressed count={} details={}",
+                        turn_id,
+                        failure_suppressed.len(),
+                        sanitize_preview(&details, 500),
+                    );
+                }
+                suppressed_failure_calls = failure_suppressed;
             }
 
             if planned_tool_calls.is_empty() {
@@ -1184,18 +1339,34 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             let mut planned_execution =
                 Vec::<PlannedToolCallExecution>::with_capacity(planned_tool_calls.len());
             let mut executable_tool_calls = Vec::<ToolCall>::new();
-            let mut suppressed_iter = suppressed_autonomy_calls.into_iter().peekable();
+            let mut dedupe_suppressed_iter = suppressed_autonomy_calls.into_iter().peekable();
+            let mut failure_suppressed_iter = suppressed_failure_calls.into_iter().peekable();
             for (index, call) in planned_tool_calls.iter().enumerate() {
-                let is_suppressed = suppressed_iter
+                let dedupe_suppressed = dedupe_suppressed_iter
                     .peek()
                     .map(|entry| entry.index == index)
                     .unwrap_or(false);
-                if is_suppressed {
-                    let suppressed = suppressed_iter
+                if dedupe_suppressed {
+                    let suppressed = dedupe_suppressed_iter
                         .next()
                         .expect("suppressed iterator must provide matching index");
                     planned_execution.push(PlannedToolCallExecution::Suppressed {
                         age_secs: suppressed.age_secs,
+                    });
+                    continue;
+                }
+                let failure_suppressed = failure_suppressed_iter
+                    .peek()
+                    .map(|entry| entry.index == index)
+                    .unwrap_or(false);
+                if failure_suppressed {
+                    let suppressed = failure_suppressed_iter
+                        .next()
+                        .expect("failure-suppressed iterator must provide matching index");
+                    planned_execution.push(PlannedToolCallExecution::FailureSuppressed {
+                        remaining_secs: suppressed.remaining_secs,
+                        normalized_error: suppressed.normalized_error,
+                        repeat_count: suppressed.repeat_count,
                     });
                     continue;
                 }
@@ -1211,9 +1382,15 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     }
                 }
             }
-            if last_error.is_none() && suppressed_iter.next().is_some() {
+            if last_error.is_none() && dedupe_suppressed_iter.next().is_some() {
                 last_error = Some(
                     "tool execution record mismatch: unexpected extra suppressed tool".to_string(),
+                );
+            }
+            if last_error.is_none() && failure_suppressed_iter.next().is_some() {
+                last_error = Some(
+                    "tool execution record mismatch: unexpected extra failure-suppressed tool"
+                        .to_string(),
                 );
             }
             if last_error.is_some() {
@@ -1259,9 +1436,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             executed_any_tool = executed_any_tool || !executed.is_empty();
 
             let execution_completed_ns = current_time_ns();
-            if !has_external_input {
-                record_successful_autonomy_tool_calls(&executed, execution_completed_ns);
-            }
             let mut executed_iter = executed.into_iter();
             let mut round_tool_records = Vec::with_capacity(planned_tool_calls.len());
             for (call, execution) in planned_tool_calls.iter().zip(planned_execution.iter()) {
@@ -1281,6 +1455,24 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                             &turn_id, call, *age_secs,
                         ));
                     }
+                    PlannedToolCallExecution::FailureSuppressed {
+                        remaining_secs,
+                        normalized_error,
+                        repeat_count,
+                    } => {
+                        let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+                        stable::note_autonomy_tool_failure_suppressed(
+                            &fingerprint,
+                            execution_completed_ns,
+                        );
+                        round_tool_records.push(synthetic_failure_suppressed_tool_record(
+                            &turn_id,
+                            call,
+                            *remaining_secs,
+                            normalized_error,
+                            *repeat_count,
+                        ));
+                    }
                     PlannedToolCallExecution::SequenceBlocked { reason } => {
                         round_tool_records.push(synthetic_sequence_blocked_tool_record(
                             &turn_id, call, reason,
@@ -1295,6 +1487,15 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             }
             if last_error.is_some() {
                 break;
+            }
+
+            if !has_external_input {
+                record_autonomy_tool_outcomes(
+                    &planned_tool_calls,
+                    &planned_execution,
+                    &round_tool_records,
+                    execution_completed_ns,
+                );
             }
 
             if let Some(tool_results_reply) = render_tool_results_reply(&round_tool_records) {
@@ -1337,7 +1538,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     append_inner_dialogue(
                         &mut inner_dialogue,
                         &format!(
-                            "autonomy degraded after recoverable http_fetch failure(s):\n- {details}"
+                            "autonomy degraded after recoverable tool failure(s):\n- {details}"
                         ),
                     );
                     stop_after_degraded_tool_failures = true;
@@ -1794,6 +1995,40 @@ mod tests {
         };
         let failures = vec![&failed];
         assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn autonomy_degrades_remember_capacity_failures_without_external_input() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "remember".to_string(),
+            args_json: r#"{"key":"signal.tick.1730000000","value":"v"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some(
+                "memory full: non-evictable capacity reached (all stored facts are critical)"
+                    .to_string(),
+            ),
+        };
+        let failures = vec![&failed];
+        assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn external_input_keeps_remember_capacity_failures_terminal() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "remember".to_string(),
+            args_json: r#"{"key":"signal.tick.1730000000","value":"v"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            error: Some(
+                "memory full: non-evictable capacity reached (all stored facts are critical)"
+                    .to_string(),
+            ),
+        };
+        let failures = vec![&failed];
+        assert!(!should_degrade_tool_failures_for_autonomy(&failures, true));
     }
 
     #[test]
@@ -2621,6 +2856,171 @@ mod tests {
         assert!(
             outbox[0].body.contains("Tool results:"),
             "fallback response should use deterministic tool summary"
+        );
+    }
+
+    #[test]
+    fn autonomy_turn_with_remember_capacity_failure_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        for idx in 0..stable::MAX_MEMORY_FACTS.saturating_sub(1) {
+            stable::set_memory_fact(&MemoryFact {
+                key: format!("config.only.{idx}"),
+                value: "critical".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 1,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("critical memory fixture should store");
+        }
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.remember_capacity_probe".to_string(),
+            value: "request_remember_capacity_probe:true".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 2,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "autonomy remember-capacity failures should degrade and continue"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].error.is_none(),
+            "degraded autonomy turn should not persist terminal error"
+        );
+        assert_eq!(
+            stable::runtime_snapshot().state,
+            AgentState::Sleeping,
+            "degraded autonomy turn should complete in sleeping state"
+        );
+        assert!(
+            turns[0]
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("autonomy degraded after recoverable tool failure"),
+            "inner dialogue should capture degraded remember-capacity path"
+        );
+    }
+
+    #[test]
+    fn inbox_turn_remember_capacity_failure_is_terminal() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        for idx in 0..stable::MAX_MEMORY_FACTS {
+            stable::set_memory_fact(&MemoryFact {
+                key: format!("config.only.{idx}"),
+                value: "critical".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 1,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("critical memory fixture should store");
+        }
+        stable::post_inbox_message(
+            "request_remember_capacity_probe:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox probe should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_err(),
+            "inbox-driven remember-capacity failures should remain terminal"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tool execution reported failures"),
+            "inbox turn should surface hard tool failure"
+        );
+        assert_eq!(
+            stable::runtime_snapshot().state,
+            AgentState::Faulted,
+            "terminal inbox failure should fault runtime state"
+        );
+    }
+
+    #[test]
+    fn repeated_autonomy_remember_failures_trigger_cooldown_suppression() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        for idx in 0..stable::MAX_MEMORY_FACTS.saturating_sub(2) {
+            stable::set_memory_fact(&MemoryFact {
+                key: format!("config.only.{idx}"),
+                value: "critical".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 1,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("critical memory fixture should store");
+        }
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.failure_loop_probe".to_string(),
+            value: "request_remember_failure_loop_probe:true".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 2,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("failure-loop probe trigger should store");
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.endpoint.keepalive".to_string(),
+            value: "https://example.com/keepalive".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 2,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("alternate recall target should store");
+
+        for _ in 0..4 {
+            let result = block_on_with_spin(run_scheduled_turn_job());
+            assert!(
+                result.is_ok(),
+                "autonomy turn should degrade/suppress instead of faulting during repeated remember failures"
+            );
+        }
+
+        let turns = stable::list_turns(4);
+        assert_eq!(turns.len(), 4);
+        assert!(
+            turns.iter().all(|turn| turn.error.is_none()),
+            "all turns should complete without terminal errors"
+        );
+
+        let latest_turn = &turns[0];
+        let latest_tools = stable::get_tools_for_turn(&latest_turn.id);
+        assert!(
+            latest_tools.iter().any(|record| {
+                record.tool == "remember"
+                    && record.success
+                    && record
+                        .output
+                        .contains("suppressed due to repeated failure cooldown")
+            }),
+            "latest turn should suppress repeated failing remember call during cooldown"
+        );
+        assert!(
+            latest_tools
+                .iter()
+                .any(|record| record.tool == "recall" && record.success),
+            "agent should continue alternate useful work after suppression"
+        );
+        assert!(
+            latest_turn
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("repeated-failure cooldown suppressed"),
+            "inner dialogue should include suppression diagnostics"
         );
     }
 

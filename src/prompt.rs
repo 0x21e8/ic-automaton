@@ -95,7 +95,12 @@ pub const LAYER_5_OPERATIONS: &str = r#"## Layer 5: Operational Reality
 - Store stable reference data (API endpoint URLs, contract addresses, pool addresses, working json_path expressions) under `config.*` keys so they are never rolled up or evicted.
 - Before constructing an `http_fetch` URL, `recall("config.")` to retrieve verified endpoints. Never reconstruct addresses or URLs from partial memory — always use the stored canonical value.
 - After a successful `http_fetch` with json_path extraction, store the working URL + path combination under a `config.*` key if one does not already exist.
-- Use timestamped keys only for ephemeral observations (prices, volumes, signals).
+- Never use timestamp-suffixed memory keys. Per-tick observations must overwrite stable canonical keys.
+- Canonical observation keys:
+- `market.intelligence.<market_id>.latest`
+- `strategy.status.<strategy_id>.latest`
+- `signal.<signal_id>.latest`
+- `config.*` keys must remain stable canonical references and must never carry timestamp suffixes.
 
 ### Active Skills
 - Apply enabled skill instructions as operational guidance only.
@@ -328,7 +333,6 @@ mod tests {
             instructions: "Favor deterministic execution plans.".to_string(),
             enabled: true,
             mutable: true,
-            allowed_canister_calls: vec![],
         });
         stable::upsert_skill(&SkillRecord {
             name: "disabled-skill".to_string(),
@@ -336,7 +340,6 @@ mod tests {
             instructions: "This should not appear.".to_string(),
             enabled: false,
             mutable: true,
-            allowed_canister_calls: vec![],
         });
 
         let prompt = assemble_system_prompt("## Layer 10: Dynamic Context\n- context: yes");

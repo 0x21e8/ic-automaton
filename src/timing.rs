@@ -69,6 +69,20 @@ pub const AUTONOMY_DEDUPE_WINDOW_NS: u64 = AUTONOMY_DEDUPE_WINDOW_SECS * NANOS_P
 /// Balance freshness window — same as the dedup window.
 pub const BALANCE_FRESHNESS_WINDOW_SECS: u64 = AUTONOMY_DEDUPE_WINDOW_SECS;
 
+/// Window used to count repeated autonomy tool failures for cooldown activation.
+pub const AUTONOMY_FAILURE_REPEAT_WINDOW_SECS: u64 = AUTONOMY_DEDUPE_WINDOW_SECS * 3;
+pub const AUTONOMY_FAILURE_REPEAT_WINDOW_NS: u64 =
+    AUTONOMY_FAILURE_REPEAT_WINDOW_SECS * NANOS_PER_SEC;
+/// Number of matching failures within the repeat window required to activate cooldown.
+pub const AUTONOMY_FAILURE_REPEAT_THRESHOLD: u32 = 3;
+/// Cooldown duration during which repeated failing autonomy calls are suppressed.
+pub const AUTONOMY_FAILURE_COOLDOWN_SECS: u64 = AUTONOMY_DEDUPE_WINDOW_SECS * 3;
+pub const AUTONOMY_FAILURE_COOLDOWN_NS: u64 = AUTONOMY_FAILURE_COOLDOWN_SECS * NANOS_PER_SEC;
+/// Maximum age retained for autonomy failure-tracker entries.
+pub const AUTONOMY_FAILURE_TRACK_MAX_AGE_SECS: u64 = AUTONOMY_FAILURE_COOLDOWN_SECS * 4;
+pub const AUTONOMY_FAILURE_TRACK_MAX_AGE_NS: u64 =
+    AUTONOMY_FAILURE_TRACK_MAX_AGE_SECS * NANOS_PER_SEC;
+
 // ── Observation windows ─────────────────────────────────────────────────────
 
 /// Cycles burn-rate moving average window: 3 turn intervals.
@@ -177,6 +191,14 @@ mod tests {
         assert_eq!(AUTONOMY_DEDUPE_WINDOW_SECS, DEFAULT_TASK_INTERVAL_SECS * 2);
         assert_eq!(BALANCE_FRESHNESS_WINDOW_SECS, AUTONOMY_DEDUPE_WINDOW_SECS);
         assert_eq!(
+            AUTONOMY_FAILURE_REPEAT_WINDOW_SECS,
+            AUTONOMY_DEDUPE_WINDOW_SECS * 3
+        );
+        assert_eq!(
+            AUTONOMY_FAILURE_COOLDOWN_SECS,
+            AUTONOMY_DEDUPE_WINDOW_SECS * 3
+        );
+        assert_eq!(
             CYCLES_BURN_MOVING_WINDOW_SECS,
             DEFAULT_TASK_INTERVAL_SECS * 3
         );
@@ -192,6 +214,8 @@ mod tests {
         assert_eq!(TICKS_PER_TURN_INTERVAL, 3);
         assert_eq!(DEFAULT_TASK_INTERVAL_SECS, 6);
         assert_eq!(AUTONOMY_DEDUPE_WINDOW_SECS, 12);
+        assert_eq!(AUTONOMY_FAILURE_REPEAT_WINDOW_SECS, 36);
+        assert_eq!(AUTONOMY_FAILURE_COOLDOWN_SECS, 36);
         assert_eq!(CYCLES_BURN_MOVING_WINDOW_SECS, 18);
     }
 

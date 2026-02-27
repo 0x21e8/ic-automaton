@@ -43,6 +43,7 @@
 /// | 31 | `STRATEGY_KILL_SWITCH_MAP`  | Per-key kill-switch state |
 /// | 32 | `STRATEGY_OUTCOME_STATS_MAP`| Execution outcome statistics |
 /// | 33 | `STRATEGY_BUDGET_MAP`       | Cumulative budget spent per version |
+/// | 34 | `AUTONOMY_TOOL_FAILURE_MAP` | Autonomy repeated-failure cooldown tracker |
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, ConversationEntry, ConversationLog,
     ConversationSummary, CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage,
@@ -151,6 +152,7 @@ const MAX_TIMING_ERROR_CHARS: usize = 512;
 const MIN_RETENTION_BATCH_SIZE: u32 = 1;
 const MAX_RETENTION_BATCH_SIZE: u32 = 1_000;
 const MIN_RETENTION_INTERVAL_SECS: u64 = 1;
+const MIN_MEMORY_FACT_PRUNE_BATCH_SIZE: u32 = 1;
 const MIN_SCHEDULER_BASE_TICK_SECS: u64 = 1;
 const MAX_SCHEDULER_BASE_TICK_SECS: u64 = 3_600;
 /// 24-hour summary window used for session and turn-window summaries.
@@ -172,6 +174,7 @@ const MAX_MEMORY_ROLLUP_FACTS_PER_NAMESPACE: usize = 5;
 #[cfg(test)]
 const MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS: usize = 120;
 const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
+const AUTONOMY_TOOL_FAILURE_KEY_PREFIX: &str = "autonomy.tool_failure.";
 const EVM_INGEST_DEDUPE_KEY_PREFIX: &str = "evm.ingest";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
@@ -191,8 +194,6 @@ pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_BROADCAST: u64 = 300;
 /// Maximum exponential backoff (seconds) for the `ThresholdSign` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_THRESHOLD_SIGN: u64 = 120;
-/// Maximum exponential backoff (seconds) for the `InterCanisterCall` operation class.
-pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL: u64 = 120;
 /// Hard upper limit on the EVM RPC response buffer (2 MiB).
 const MAX_EVM_RPC_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 #[allow(dead_code)]
@@ -248,9 +249,6 @@ fn survival_operation_runtime_key(operation: &SurvivalOperationClass) -> String 
         SurvivalOperationClass::EvmPoll => "survival.operation:evm_poll".to_string(),
         SurvivalOperationClass::EvmBroadcast => "survival.operation:evm_broadcast".to_string(),
         SurvivalOperationClass::ThresholdSign => "survival.operation:threshold_sign".to_string(),
-        SurvivalOperationClass::InterCanisterCall => {
-            "survival.operation:inter_canister_call".to_string()
-        }
     }
 }
 
@@ -523,6 +521,11 @@ thread_local! {
     > = RefCell::new(StableBTreeMap::init(
         MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(33)))
     ));
+    static AUTONOMY_TOOL_FAILURE_MAP: RefCell<
+        StableBTreeMap<String, Vec<u8>, VirtualMemory<DefaultMemoryImpl>>,
+    > = RefCell::new(StableBTreeMap::init(
+        MEMORY_MANAGER.with(|m| m.borrow().get(MemoryId::new(34)))
+    ));
 }
 
 // ── Initialization ───────────────────────────────────────────────────────────
@@ -678,6 +681,12 @@ pub fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, 
             MIN_RETENTION_INTERVAL_SECS
         ));
     }
+    if config.memory_facts_prune_batch_size < MIN_MEMORY_FACT_PRUNE_BATCH_SIZE {
+        return Err(format!(
+            "memory_facts_prune_batch_size must be at least {}",
+            MIN_MEMORY_FACT_PRUNE_BATCH_SIZE
+        ));
+    }
 
     RETENTION_RUNTIME_MAP.with(|map| {
         map.borrow_mut()
@@ -714,6 +723,7 @@ pub struct RetentionPruneStats {
     pub generated_session_summaries: u32,
     pub generated_turn_window_summaries: u32,
     pub generated_memory_rollups: u32,
+    pub deleted_memory_facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -872,6 +882,16 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
     let deleted_tools = delete_tool_candidates(&generated_tools_to_delete);
 
     let generated_memory_rollups = update_memory_rollups(now_ns);
+    let deleted_memory_facts = prune_stale_non_critical_memory_facts(
+        now_ns,
+        config.memory_facts_max_age_secs,
+        usize::try_from(config.memory_facts_prune_batch_size).unwrap_or(usize::MAX),
+    );
+    let _ = prune_stale_autonomy_tool_failures(
+        now_ns,
+        timing::AUTONOMY_FAILURE_TRACK_MAX_AGE_NS,
+        jobs_budget,
+    );
 
     runtime.job_scan_cursor = if jobs_reached_end {
         None
@@ -913,6 +933,7 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
     runtime.last_generated_session_summaries = generated_session_summaries;
     runtime.last_generated_turn_window_summaries = generated_turn_window_summaries;
     runtime.last_generated_memory_rollups = generated_memory_rollups;
+    runtime.last_deleted_memory_facts = deleted_memory_facts;
     runtime.last_finished_ns = Some(now_ns);
     runtime.next_run_after_ns = now_ns.saturating_add(
         config
@@ -934,6 +955,7 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
         generated_session_summaries,
         generated_turn_window_summaries,
         generated_memory_rollups,
+        deleted_memory_facts,
     }
 }
 
@@ -963,6 +985,7 @@ fn summarization_progress_percent(runtime: &RetentionMaintenanceRuntime) -> u8 {
         || runtime.last_generated_session_summaries > 0
         || runtime.last_generated_turn_window_summaries > 0
         || runtime.last_generated_memory_rollups > 0
+        || runtime.last_deleted_memory_facts > 0
     {
         return 50;
     }
@@ -1998,18 +2021,53 @@ pub fn set_evm_bootstrap_lookback_blocks(lookback_blocks: u64) -> Result<u64, St
     Ok(lookback_blocks)
 }
 
-/// Inserts or replaces a memory fact.  Returns an error if the store is full
-/// (`MAX_MEMORY_FACTS`) and the key does not already exist.
+/// Inserts or replaces a memory fact.
+///
+/// When inserting a new key at `MAX_MEMORY_FACTS`, the oldest non-critical
+/// fact is evicted first. If all stored facts are critical, insertion fails
+/// with a deterministic non-evictable-capacity error.
 pub fn set_memory_fact(fact: &MemoryFact) -> Result<(), String> {
-    MEMORY_FACTS_MAP.with(|map| {
+    let evicted_key = MEMORY_FACTS_MAP.with(|map| {
         let mut map_ref = map.borrow_mut();
         let exists = map_ref.get(&fact.key).is_some();
+        let mut evicted_key = None;
+
         if !exists && map_ref.len() as usize >= MAX_MEMORY_FACTS {
-            return Err(format!("memory full: max {MAX_MEMORY_FACTS} facts"));
+            let eviction_candidate = map_ref
+                .iter()
+                .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
+                .filter(|stored| !is_critical_exact_memory_key(&stored.key))
+                .min_by(|left, right| {
+                    left.updated_at_ns
+                        .cmp(&right.updated_at_ns)
+                        .then_with(|| left.key.cmp(&right.key))
+                })
+                .map(|stored| stored.key);
+
+            let Some(candidate_key) = eviction_candidate else {
+                return Err(
+                    "memory full: non-evictable capacity reached (all stored facts are critical)"
+                        .to_string(),
+                );
+            };
+
+            map_ref.remove(&candidate_key);
+            evicted_key = Some(candidate_key);
         }
+
         map_ref.insert(fact.key.clone(), encode_json(fact));
-        Ok(())
-    })
+        Ok(evicted_key)
+    })?;
+
+    if let Some(key) = evicted_key {
+        log!(
+            SchedulerStorageLogPriority::Warn,
+            "memory_fact_evicted_at_capacity evicted_key={} inserted_key={}",
+            key,
+            fact.key
+        );
+    }
+    Ok(())
 }
 
 /// Returns the memory fact stored under `key`, or `None` if absent.
@@ -2107,6 +2165,57 @@ pub fn list_memory_facts_by_prefix_sorted(
             .collect::<Vec<_>>()
     });
     sort_memory_facts(facts, limit, sort)
+}
+
+/// Removes up to `limit` memory facts matching the optional `prefix` and/or
+/// `updated_before_ns` filters.
+///
+/// Facts are pruned oldest-first (`updated_at_ns` ascending) to keep newer
+/// observations when a prune budget is applied.
+pub fn prune_memory_facts(
+    prefix: Option<&str>,
+    updated_before_ns: Option<u64>,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let normalized_prefix = prefix
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let mut candidates = MEMORY_FACTS_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
+            .filter(|fact| {
+                let prefix_matches = normalized_prefix
+                    .as_ref()
+                    .is_none_or(|value| fact.key.starts_with(value));
+                let age_matches =
+                    updated_before_ns.is_none_or(|cutoff_ns| fact.updated_at_ns <= cutoff_ns);
+                prefix_matches && age_matches
+            })
+            .collect::<Vec<_>>()
+    });
+
+    candidates.sort_by(|left, right| {
+        left.updated_at_ns
+            .cmp(&right.updated_at_ns)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    if candidates.len() > limit {
+        candidates.truncate(limit);
+    }
+
+    let mut removed = Vec::with_capacity(candidates.len());
+    for fact in candidates {
+        if remove_memory_fact(&fact.key) {
+            removed.push(fact.key);
+        }
+    }
+    removed
 }
 
 // ── Strategy ─────────────────────────────────────────────────────────────────
@@ -2440,6 +2549,164 @@ pub fn record_autonomy_tool_success(fingerprint: &str, succeeded_at_ns: u64) {
 
 fn autonomy_tool_success_key(fingerprint: &str) -> String {
     format!("{AUTONOMY_TOOL_SUCCESS_KEY_PREFIX}{fingerprint}")
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct AutonomyToolFailureTracker {
+    normalized_error: String,
+    first_failed_at_ns: u64,
+    last_failed_at_ns: u64,
+    repeat_count: u32,
+    cooldown_until_ns: Option<u64>,
+    last_suppressed_at_ns: Option<u64>,
+    suppressed_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutonomyToolFailureCooldown {
+    pub normalized_error: String,
+    pub repeat_count: u32,
+    pub cooldown_until_ns: u64,
+}
+
+/// Returns active cooldown metadata for an autonomy tool call fingerprint.
+pub fn autonomy_tool_failure_cooldown(
+    fingerprint: &str,
+    now_ns: u64,
+) -> Option<AutonomyToolFailureCooldown> {
+    let key = autonomy_tool_failure_key(fingerprint);
+    AUTONOMY_TOOL_FAILURE_MAP
+        .with(|map| map.borrow().get(&key))
+        .and_then(|payload| read_json::<AutonomyToolFailureTracker>(Some(payload.as_slice())))
+        .and_then(|tracker| {
+            let cooldown_until_ns = tracker.cooldown_until_ns?;
+            if cooldown_until_ns <= now_ns {
+                return None;
+            }
+            Some(AutonomyToolFailureCooldown {
+                normalized_error: tracker.normalized_error,
+                repeat_count: tracker.repeat_count,
+                cooldown_until_ns,
+            })
+        })
+}
+
+/// Records an autonomy tool failure and returns a newly-active cooldown when
+/// the repeat threshold is reached within the configured tracking window.
+pub fn record_autonomy_tool_failure(
+    fingerprint: &str,
+    normalized_error: &str,
+    failed_at_ns: u64,
+) -> Option<AutonomyToolFailureCooldown> {
+    let trimmed_error = normalized_error.trim();
+    if trimmed_error.is_empty() {
+        return None;
+    }
+
+    let key = autonomy_tool_failure_key(fingerprint);
+    let existing = AUTONOMY_TOOL_FAILURE_MAP
+        .with(|map| map.borrow().get(&key))
+        .and_then(|payload| read_json::<AutonomyToolFailureTracker>(Some(payload.as_slice())));
+
+    let mut tracker = existing.unwrap_or_default();
+    let within_window = failed_at_ns.saturating_sub(tracker.last_failed_at_ns)
+        <= timing::AUTONOMY_FAILURE_REPEAT_WINDOW_NS;
+    if tracker.normalized_error == trimmed_error && within_window {
+        tracker.repeat_count = tracker.repeat_count.saturating_add(1);
+    } else {
+        tracker.repeat_count = 1;
+        tracker.first_failed_at_ns = failed_at_ns;
+    }
+
+    tracker.normalized_error = trimmed_error.to_string();
+    tracker.last_failed_at_ns = failed_at_ns;
+    if tracker.repeat_count >= timing::AUTONOMY_FAILURE_REPEAT_THRESHOLD {
+        tracker.cooldown_until_ns =
+            Some(failed_at_ns.saturating_add(timing::AUTONOMY_FAILURE_COOLDOWN_NS));
+    } else {
+        tracker.cooldown_until_ns = None;
+    }
+
+    AUTONOMY_TOOL_FAILURE_MAP.with(|map| {
+        map.borrow_mut().insert(key, encode_json(&tracker));
+    });
+    let _ = prune_stale_autonomy_tool_failures(
+        failed_at_ns,
+        timing::AUTONOMY_FAILURE_TRACK_MAX_AGE_NS,
+        16,
+    );
+
+    tracker
+        .cooldown_until_ns
+        .filter(|cooldown_until_ns| *cooldown_until_ns > failed_at_ns)
+        .map(|cooldown_until_ns| AutonomyToolFailureCooldown {
+            normalized_error: tracker.normalized_error,
+            repeat_count: tracker.repeat_count,
+            cooldown_until_ns,
+        })
+}
+
+/// Clears stored autonomy failure streak/cooldown state for a tool fingerprint.
+pub fn clear_autonomy_tool_failure(fingerprint: &str) {
+    AUTONOMY_TOOL_FAILURE_MAP.with(|map| {
+        map.borrow_mut()
+            .remove(&autonomy_tool_failure_key(fingerprint));
+    });
+}
+
+/// Records that a failure-cooldown suppression was applied for a fingerprint.
+pub fn note_autonomy_tool_failure_suppressed(fingerprint: &str, now_ns: u64) {
+    let key = autonomy_tool_failure_key(fingerprint);
+    let Some(mut tracker) = AUTONOMY_TOOL_FAILURE_MAP
+        .with(|map| map.borrow().get(&key))
+        .and_then(|payload| read_json::<AutonomyToolFailureTracker>(Some(payload.as_slice())))
+    else {
+        return;
+    };
+    tracker.last_suppressed_at_ns = Some(now_ns);
+    tracker.suppressed_count = tracker.suppressed_count.saturating_add(1);
+    AUTONOMY_TOOL_FAILURE_MAP.with(|map| {
+        map.borrow_mut().insert(key, encode_json(&tracker));
+    });
+}
+
+fn autonomy_tool_failure_key(fingerprint: &str) -> String {
+    format!("{AUTONOMY_TOOL_FAILURE_KEY_PREFIX}{fingerprint}")
+}
+
+fn prune_stale_autonomy_tool_failures(now_ns: u64, max_age_ns: u64, limit: usize) -> u32 {
+    if limit == 0 {
+        return 0;
+    }
+    let cutoff_ns = now_ns.saturating_sub(max_age_ns);
+    let candidates = AUTONOMY_TOOL_FAILURE_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| {
+                let tracker =
+                    read_json::<AutonomyToolFailureTracker>(Some(entry.value().as_slice()))?;
+                let stale = tracker.last_failed_at_ns <= cutoff_ns
+                    && tracker
+                        .cooldown_until_ns
+                        .is_none_or(|cooldown_until_ns| cooldown_until_ns <= now_ns);
+                if stale {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .take(limit)
+            .collect::<Vec<_>>()
+    });
+    if candidates.is_empty() {
+        return 0;
+    }
+    AUTONOMY_TOOL_FAILURE_MAP.with(|map| {
+        let mut map_ref = map.borrow_mut();
+        candidates.iter().fold(0u32, |count, key| {
+            count + u32::from(map_ref.remove(key).is_some())
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3602,6 +3869,7 @@ fn storage_growth_metrics(captured_at_ns: u64) -> StorageGrowthMetrics {
     let near_limit = max_utilization_percent >= STORAGE_PRESSURE_HIGH_PERCENT;
 
     let retention_runtime = retention_maintenance_runtime();
+    let retention_config = retention_config();
 
     StorageGrowthMetrics {
         runtime_map_entries,
@@ -3627,6 +3895,9 @@ fn storage_growth_metrics(captured_at_ns: u64) -> StorageGrowthMetrics {
         turn_window_summary_utilization_percent,
         memory_rollup_utilization_percent,
         memory_fact_utilization_percent,
+        memory_fact_retention_max_age_secs: retention_config.memory_facts_max_age_secs,
+        memory_fact_prune_batch_size: retention_config.memory_facts_prune_batch_size,
+        last_deleted_memory_facts: retention_runtime.last_deleted_memory_facts,
         near_limit,
         pressure_level,
         pressure_warnings,
@@ -5277,6 +5548,39 @@ fn update_memory_rollups(now_ns: u64) -> u32 {
     generated
 }
 
+fn prune_stale_non_critical_memory_facts(now_ns: u64, max_age_secs: u64, limit: usize) -> u32 {
+    if limit == 0 {
+        return 0;
+    }
+
+    let cutoff_ns = now_ns.saturating_sub(max_age_secs.saturating_mul(1_000_000_000));
+    let mut candidates = MEMORY_FACTS_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<MemoryFact>(Some(entry.value().as_slice())))
+            .filter(|fact| fact.updated_at_ns <= cutoff_ns)
+            .filter(|fact| !is_critical_exact_memory_key(&fact.key))
+            .collect::<Vec<_>>()
+    });
+
+    candidates.sort_by(|left, right| {
+        left.updated_at_ns
+            .cmp(&right.updated_at_ns)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    if candidates.len() > limit {
+        candidates.truncate(limit);
+    }
+
+    let mut deleted = 0u32;
+    for fact in candidates {
+        if remove_memory_fact(&fact.key) {
+            deleted = deleted.saturating_add(1);
+        }
+    }
+    deleted
+}
+
 fn get_inbox_message_by_id(id: &str) -> Option<InboxMessage> {
     INBOX_MAP
         .with(|map| map.borrow().get(&id.to_string()))
@@ -5834,6 +6138,8 @@ mod canbench_pilots {
             tools_max_age_secs: 7 * 24 * 60 * 60,
             inbox_max_age_secs: 14 * 24 * 60 * 60,
             outbox_max_age_secs: 14 * 24 * 60 * 60,
+            memory_facts_max_age_secs: 3 * 24 * 60 * 60,
+            memory_facts_prune_batch_size: 25,
             maintenance_batch_size: 25,
             maintenance_interval_secs: 60,
         });
@@ -5854,6 +6160,8 @@ mod canbench_pilots {
             tools_max_age_secs: 7 * 24 * 60 * 60,
             inbox_max_age_secs: 14 * 24 * 60 * 60,
             outbox_max_age_secs: 14 * 24 * 60 * 60,
+            memory_facts_max_age_secs: 3 * 24 * 60 * 60,
+            memory_facts_prune_batch_size: 25,
             maintenance_batch_size: 100,
             maintenance_interval_secs: 60,
         });
@@ -6490,6 +6798,8 @@ mod tests {
         assert!(defaults.jobs_max_age_secs > 0);
         assert!(defaults.jobs_max_records > 0);
         assert!(defaults.dedupe_max_age_secs > 0);
+        assert!(defaults.memory_facts_max_age_secs > 0);
+        assert!(defaults.memory_facts_prune_batch_size > 0);
         assert!(defaults.maintenance_batch_size > 0);
         assert!(defaults.maintenance_interval_secs > 0);
 
@@ -6502,6 +6812,8 @@ mod tests {
             tools_max_age_secs: 92,
             inbox_max_age_secs: 120,
             outbox_max_age_secs: 121,
+            memory_facts_max_age_secs: 122,
+            memory_facts_prune_batch_size: 4,
             maintenance_batch_size: 3,
             maintenance_interval_secs: 45,
         };
@@ -6514,6 +6826,15 @@ mod tests {
             ..RetentionConfig::default()
         });
         assert!(invalid.is_err(), "batch size zero must be rejected");
+
+        let invalid_memory_prune_budget = set_retention_config(RetentionConfig {
+            memory_facts_prune_batch_size: 0,
+            ..RetentionConfig::default()
+        });
+        assert!(
+            invalid_memory_prune_budget.is_err(),
+            "memory fact prune budget zero must be rejected"
+        );
     }
 
     #[test]
@@ -6901,6 +7222,87 @@ mod tests {
             !rollups.is_empty(),
             "rollups should be included when raw context is saturated"
         );
+    }
+
+    #[test]
+    fn retention_prunes_old_non_critical_memory_facts_with_budget_and_keeps_critical() {
+        init_storage();
+        clear_memory_rollup_map();
+
+        let now_ns = 400_000_000_000u64;
+        let old_ns = now_ns.saturating_sub(MEMORY_ROLLUP_STALE_NS + 5_000_000_000);
+        set_retention_config(RetentionConfig {
+            memory_facts_max_age_secs: 1,
+            memory_facts_prune_batch_size: 2,
+            maintenance_batch_size: 50,
+            maintenance_interval_secs: 1,
+            ..RetentionConfig::default()
+        })
+        .expect("retention config should store");
+
+        for (idx, key) in ["signal.oldest", "signal.middle", "signal.newest"]
+            .into_iter()
+            .enumerate()
+        {
+            let updated_at_ns = old_ns.saturating_add((idx as u64).saturating_mul(10));
+            set_memory_fact(&MemoryFact {
+                key: key.to_string(),
+                value: key.to_string(),
+                created_at_ns: updated_at_ns,
+                updated_at_ns,
+                source_turn_id: "turn-old-non-critical".to_string(),
+            })
+            .expect("non-critical fixture should store");
+        }
+        set_memory_fact(&MemoryFact {
+            key: "config.keep".to_string(),
+            value: "critical-config".to_string(),
+            created_at_ns: old_ns,
+            updated_at_ns: old_ns,
+            source_turn_id: "turn-critical".to_string(),
+        })
+        .expect("critical config fact should store");
+        set_memory_fact(&MemoryFact {
+            key: "wallet.seed".to_string(),
+            value: "critical-wallet".to_string(),
+            created_at_ns: old_ns,
+            updated_at_ns: old_ns,
+            source_turn_id: "turn-critical".to_string(),
+        })
+        .expect("critical wallet fact should store");
+
+        let first = run_retention_maintenance_once(now_ns);
+        assert_eq!(
+            first.deleted_memory_facts, 2,
+            "first run should prune stale non-critical facts up to budget"
+        );
+        assert!(
+            first.generated_memory_rollups >= 1,
+            "stale memory facts should still produce rollups before pruning"
+        );
+        assert!(get_memory_fact("signal.oldest").is_none());
+        assert!(get_memory_fact("signal.middle").is_none());
+        assert!(
+            get_memory_fact("signal.newest").is_some(),
+            "newer stale fact should remain until next pass because of budget"
+        );
+        assert!(
+            get_memory_fact("config.keep").is_some(),
+            "critical config fact must not be pruned by retention"
+        );
+        assert!(
+            get_memory_fact("wallet.seed").is_some(),
+            "critical wallet fact must not be pruned by retention"
+        );
+
+        let second = run_retention_maintenance_once(now_ns);
+        assert_eq!(
+            second.deleted_memory_facts, 1,
+            "second pass should prune remaining stale non-critical fact"
+        );
+        assert!(get_memory_fact("signal.newest").is_none());
+        assert!(get_memory_fact("config.keep").is_some());
+        assert!(get_memory_fact("wallet.seed").is_some());
     }
 
     #[test]
@@ -7305,6 +7707,45 @@ mod tests {
                 >= baseline.storage_growth.tracked_entry_count,
             "tracked entry count should not regress after adding a new inbox message"
         );
+    }
+
+    #[test]
+    fn observability_snapshot_reports_memory_fact_retention_knobs_and_last_prune_count() {
+        init_storage();
+        clear_memory_rollup_map();
+
+        let now_ns = 500_000_000_000u64;
+        let old_ns = now_ns.saturating_sub(20_000_000_000);
+        set_retention_config(RetentionConfig {
+            memory_facts_max_age_secs: 1,
+            memory_facts_prune_batch_size: 3,
+            maintenance_batch_size: 50,
+            maintenance_interval_secs: 1,
+            ..RetentionConfig::default()
+        })
+        .expect("retention config should store");
+
+        for key in ["signal.alpha", "signal.beta", "signal.gamma"] {
+            set_memory_fact(&MemoryFact {
+                key: key.to_string(),
+                value: key.to_string(),
+                created_at_ns: old_ns,
+                updated_at_ns: old_ns,
+                source_turn_id: "turn-observability-prune".to_string(),
+            })
+            .expect("old memory fact should store");
+        }
+
+        let stats = run_retention_maintenance_once(now_ns);
+        assert_eq!(stats.deleted_memory_facts, 3);
+
+        let snapshot = observability_snapshot(1);
+        assert_eq!(
+            snapshot.storage_growth.memory_fact_retention_max_age_secs,
+            1
+        );
+        assert_eq!(snapshot.storage_growth.memory_fact_prune_batch_size, 3);
+        assert_eq!(snapshot.storage_growth.last_deleted_memory_facts, 3);
     }
 
     #[test]
@@ -8429,42 +8870,192 @@ mod tests {
     }
 
     #[test]
-    fn memory_fact_store_enforces_max_cardinality_for_new_keys() {
+    fn memory_fact_store_evicts_oldest_non_critical_fact_at_capacity() {
         init_storage();
-        let now_ns = 77u64;
-        for idx in 0..MAX_MEMORY_FACTS {
+        set_memory_fact(&MemoryFact {
+            key: "signal.oldest".to_string(),
+            value: "stale".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("old non-critical fact should store");
+
+        for idx in 0..MAX_MEMORY_FACTS.saturating_sub(1) {
             set_memory_fact(&MemoryFact {
-                key: format!("fact.{idx}"),
+                key: format!("config.keep.{idx}"),
                 value: format!("value-{idx}"),
-                created_at_ns: now_ns,
-                updated_at_ns: now_ns,
+                created_at_ns: 100,
+                updated_at_ns: 100 + u64::try_from(idx).unwrap_or(u64::MAX),
                 source_turn_id: "turn-fill".to_string(),
             })
-            .expect("fact within cap should store");
+            .expect("critical fact within cap should store");
         }
         assert_eq!(memory_fact_count(), MAX_MEMORY_FACTS);
 
-        let overflow = set_memory_fact(&MemoryFact {
-            key: "fact.overflow".to_string(),
-            value: "overflow".to_string(),
-            created_at_ns: now_ns,
-            updated_at_ns: now_ns,
+        set_memory_fact(&MemoryFact {
+            key: "signal.new".to_string(),
+            value: "fresh".to_string(),
+            created_at_ns: 200,
+            updated_at_ns: 200,
             source_turn_id: "turn-overflow".to_string(),
-        });
-        assert!(overflow.is_err(), "new key beyond cap must be rejected");
+        })
+        .expect("new non-critical fact should evict oldest non-critical fact");
         assert_eq!(memory_fact_count(), MAX_MEMORY_FACTS);
+        assert!(
+            get_memory_fact("signal.oldest").is_none(),
+            "oldest non-critical fact should be evicted first"
+        );
+        assert!(get_memory_fact("signal.new").is_some());
+        assert!(
+            get_memory_fact("config.keep.0").is_some(),
+            "critical facts should remain untouched by eviction"
+        );
 
         let update_existing = set_memory_fact(&MemoryFact {
-            key: "fact.0".to_string(),
+            key: "config.keep.0".to_string(),
             value: "updated".to_string(),
-            created_at_ns: now_ns,
-            updated_at_ns: now_ns.saturating_add(1),
+            created_at_ns: 100,
+            updated_at_ns: 300,
             source_turn_id: "turn-update".to_string(),
         });
         assert!(
             update_existing.is_ok(),
             "existing fact updates should still succeed at capacity"
         );
+    }
+
+    #[test]
+    fn memory_fact_store_never_evicts_critical_facts_when_non_critical_exists() {
+        init_storage();
+        set_memory_fact(&MemoryFact {
+            key: "config.critical.oldest".to_string(),
+            value: "keep".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("critical oldest fact should store");
+        set_memory_fact(&MemoryFact {
+            key: "signal.oldest".to_string(),
+            value: "evict-me".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 2,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("oldest non-critical fact should store");
+        for idx in 0..MAX_MEMORY_FACTS.saturating_sub(2) {
+            set_memory_fact(&MemoryFact {
+                key: format!("config.keep.{idx}"),
+                value: "value".to_string(),
+                created_at_ns: 10,
+                updated_at_ns: 10 + u64::try_from(idx).unwrap_or(u64::MAX),
+                source_turn_id: "turn-fill".to_string(),
+            })
+            .expect("remaining critical facts should store");
+        }
+
+        set_memory_fact(&MemoryFact {
+            key: "signal.new".to_string(),
+            value: "fresh".to_string(),
+            created_at_ns: 1_000,
+            updated_at_ns: 1_000,
+            source_turn_id: "turn-overflow".to_string(),
+        })
+        .expect("new non-critical fact should trigger non-critical eviction");
+
+        assert!(
+            get_memory_fact("config.critical.oldest").is_some(),
+            "critical keys must never be evicted by memory-cap remediation"
+        );
+        assert!(
+            get_memory_fact("signal.oldest").is_none(),
+            "oldest non-critical key should be selected for eviction"
+        );
+    }
+
+    #[test]
+    fn memory_fact_store_returns_deterministic_error_when_all_facts_are_critical() {
+        init_storage();
+        for idx in 0..MAX_MEMORY_FACTS {
+            set_memory_fact(&MemoryFact {
+                key: format!("config.only.{idx}"),
+                value: "critical".to_string(),
+                created_at_ns: 1,
+                updated_at_ns: 1,
+                source_turn_id: "turn-fill".to_string(),
+            })
+            .expect("critical fact should store");
+        }
+        assert_eq!(memory_fact_count(), MAX_MEMORY_FACTS);
+
+        let result = set_memory_fact(&MemoryFact {
+            key: "signal.overflow.latest".to_string(),
+            value: "new".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 2,
+            source_turn_id: "turn-overflow".to_string(),
+        });
+        let error = result.expect_err("all-critical memory set should fail deterministically");
+        assert!(
+            error.contains("non-evictable capacity reached"),
+            "all-critical capacity error should be explicit and deterministic"
+        );
+        assert_eq!(memory_fact_count(), MAX_MEMORY_FACTS);
+    }
+
+    #[test]
+    fn memory_fact_prune_filters_by_prefix_age_and_limit() {
+        init_storage();
+        let fixtures = vec![
+            ("noise.oldest", 10u64),
+            ("noise.middle", 20u64),
+            ("noise.newest", 30u64),
+            ("config.keep", 40u64),
+        ];
+        for (key, updated_at_ns) in fixtures {
+            set_memory_fact(&MemoryFact {
+                key: key.to_string(),
+                value: key.to_string(),
+                created_at_ns: updated_at_ns,
+                updated_at_ns,
+                source_turn_id: "turn-seed".to_string(),
+            })
+            .expect("fixture memory fact should store");
+        }
+
+        let removed = prune_memory_facts(Some("noise."), None, 2);
+        assert_eq!(removed, vec!["noise.oldest", "noise.middle"]);
+        assert!(get_memory_fact("noise.oldest").is_none());
+        assert!(get_memory_fact("noise.middle").is_none());
+        assert!(get_memory_fact("noise.newest").is_some());
+        assert!(get_memory_fact("config.keep").is_some());
+    }
+
+    #[test]
+    fn memory_fact_prune_supports_age_only_filter() {
+        init_storage();
+        set_memory_fact(&MemoryFact {
+            key: "signal.old".to_string(),
+            value: "old".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 100,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("old fact should store");
+        set_memory_fact(&MemoryFact {
+            key: "signal.fresh".to_string(),
+            value: "fresh".to_string(),
+            created_at_ns: 2,
+            updated_at_ns: 200,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("fresh fact should store");
+
+        let removed = prune_memory_facts(None, Some(150), 10);
+        assert_eq!(removed, vec!["signal.old"]);
+        assert!(get_memory_fact("signal.old").is_none());
+        assert!(get_memory_fact("signal.fresh").is_some());
     }
 
     #[test]

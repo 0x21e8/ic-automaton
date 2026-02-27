@@ -113,6 +113,8 @@ struct RetentionConfig {
     tools_max_age_secs: u64,
     inbox_max_age_secs: u64,
     outbox_max_age_secs: u64,
+    memory_facts_max_age_secs: u64,
+    memory_facts_prune_batch_size: u32,
     maintenance_batch_size: u32,
     maintenance_interval_secs: u64,
 }
@@ -1038,6 +1040,8 @@ fn high_volume_agent_turn_flow_keeps_forward_progress_with_retention_enabled() {
             tools_max_age_secs: 2,
             inbox_max_age_secs: 2,
             outbox_max_age_secs: 2,
+            memory_facts_max_age_secs: 3 * 24 * 60 * 60,
+            memory_facts_prune_batch_size: 25,
             maintenance_batch_size: 128,
             maintenance_interval_secs: 1,
         },

@@ -82,11 +82,23 @@ Dumps turns, events, jobs, conversations, memory facts, and scheduler state in o
 ### Memory facts
 
 ```bash
-icp canister call $CANISTER list_memory_facts_by_prefix '("config")' -n ic
+icp canister call $CANISTER list_memory_facts '("config.", variant { KeyAsc }, 50 : nat32)' -n ic
 ```
 
-_(Method name may vary — check `list_memory_facts` or use `recall` via the agent.)_
 Shows what the agent has stored under stable `config.*` keys — endpoint URLs, working json_paths, pool addresses. Empty `config.*` namespace means the agent hasn't yet learned to persist its reference data.
+
+Admin remediation (controller only):
+
+```bash
+# Prefix-only prune (remove up to 50 keys under `noise.`)
+icp canister call $CANISTER prune_memory_facts_admin '(opt "noise.", null, 50 : nat32)' -n ic
+
+# Age-only prune (remove keys updated at/before cutoff ns)
+icp canister call $CANISTER prune_memory_facts_admin '(null, opt (1730000000000000000 : nat64), 100 : nat32)' -n ic
+
+# Prefix + age prune
+icp canister call $CANISTER prune_memory_facts_admin '(opt "signal.", opt (1730000000000000000 : nat64), 100 : nat32)' -n ic
+```
 
 ### Scheduler jobs
 
@@ -189,11 +201,18 @@ Check whether the agent has stored a working URL under `config.*`. If not, the m
 Inspect `config.*` facts (never rolled up, always loaded into context):
 
 ```bash
-icp canister call $CANISTER get_observability_snapshot '(10 : nat32)' -n ic 2>&1 \
-  | grep -i 'config\.'
+icp canister call $CANISTER list_memory_facts '("config.", variant { KeyAsc }, 100 : nat32)' -n ic
 ```
 
 Or look in the `inner_dialogue` of a recent turn for `recall("config.")` calls and their results. If the agent is recalling empty results, the stable reference data hasn't been seeded yet.
+
+Canonical observation key conventions (to avoid memory-cardinality churn):
+
+- `market.intelligence.<market_id>.latest`
+- `strategy.status.<strategy_id>.latest`
+- `signal.<signal_id>.latest`
+
+The runtime now normalizes timestamp-suffixed `remember` keys to stable `.latest` keys so repeated per-tick writes overwrite in place instead of growing key count.
 
 ---
 

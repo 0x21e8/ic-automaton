@@ -562,24 +562,6 @@ pub struct TurnRecord {
     pub error: Option<String>,
 }
 
-/// Whether an inter-canister call is a query (read-only) or update (state-mutating).
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum CanisterCallType {
-    Query,
-    Update,
-}
-
-/// A single canister method that a skill permits the agent to call.
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
-pub struct CanisterCallPermission {
-    /// Target canister principal as text (e.g. `"um5iw-rqaaa-aaaaq-qaaba-cai"`).
-    pub canister_id: String,
-    /// Method name (e.g. `"icrc1_balance_of"`).
-    pub method: String,
-    /// Whether this is a read-only query or a state-mutating update.
-    pub call_type: CanisterCallType,
-}
-
 /// A named, optionally-mutable capability that can be enabled or disabled at runtime.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct SkillRecord {
@@ -588,12 +570,6 @@ pub struct SkillRecord {
     pub instructions: String,
     pub enabled: bool,
     pub mutable: bool,
-    /// Inter-canister calls this skill grants the agent permission to make.
-    ///
-    /// The `canister_call` tool checks this list across all active skills before
-    /// executing any call.  An empty vec means the skill grants no IC call permissions.
-    #[serde(default)]
-    pub allowed_canister_calls: Vec<CanisterCallPermission>,
 }
 
 // ── Prompt layer types ───────────────────────────────────────────────────────
@@ -1191,6 +1167,12 @@ pub struct StorageGrowthMetrics {
     #[serde(default)]
     pub memory_fact_utilization_percent: u8,
     #[serde(default)]
+    pub memory_fact_retention_max_age_secs: u64,
+    #[serde(default)]
+    pub memory_fact_prune_batch_size: u32,
+    #[serde(default)]
+    pub last_deleted_memory_facts: u32,
+    #[serde(default)]
     pub near_limit: bool,
     #[serde(default)]
     pub pressure_level: StoragePressureLevel,
@@ -1234,6 +1216,10 @@ pub struct RetentionConfig {
     pub inbox_max_age_secs: u64,
     #[serde(default = "default_outbox_max_age_secs")]
     pub outbox_max_age_secs: u64,
+    #[serde(default = "default_memory_facts_max_age_secs")]
+    pub memory_facts_max_age_secs: u64,
+    #[serde(default = "default_memory_facts_prune_batch_size")]
+    pub memory_facts_prune_batch_size: u32,
     #[serde(default = "default_maintenance_batch_size")]
     pub maintenance_batch_size: u32,
     #[serde(default = "default_maintenance_interval_secs")]
@@ -1251,6 +1237,8 @@ impl Default for RetentionConfig {
             tools_max_age_secs: default_tools_max_age_secs(),
             inbox_max_age_secs: default_inbox_max_age_secs(),
             outbox_max_age_secs: default_outbox_max_age_secs(),
+            memory_facts_max_age_secs: default_memory_facts_max_age_secs(),
+            memory_facts_prune_batch_size: default_memory_facts_prune_batch_size(),
             maintenance_batch_size: default_maintenance_batch_size(),
             maintenance_interval_secs: default_maintenance_interval_secs(),
         }
@@ -1301,6 +1289,8 @@ pub struct RetentionMaintenanceRuntime {
     pub last_generated_turn_window_summaries: u32,
     #[serde(default)]
     pub last_generated_memory_rollups: u32,
+    #[serde(default)]
+    pub last_deleted_memory_facts: u32,
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
@@ -1531,7 +1521,6 @@ pub enum SurvivalOperationClass {
     EvmPoll,
     EvmBroadcast,
     ThresholdSign,
-    InterCanisterCall,
 }
 
 /// The class of operation that experienced a recoverable failure.
@@ -2004,6 +1993,14 @@ fn default_outbox_max_age_secs() -> u64 {
     14 * 24 * 60 * 60
 }
 
+fn default_memory_facts_max_age_secs() -> u64 {
+    3 * 24 * 60 * 60
+}
+
+fn default_memory_facts_prune_batch_size() -> u32 {
+    25
+}
+
 fn default_maintenance_batch_size() -> u32 {
     120
 }
@@ -2175,6 +2172,8 @@ mod tests {
         let retention = RetentionConfig::default();
         assert_eq!(retention.jobs_max_age_secs, 14 * 24 * 60 * 60);
         assert_eq!(retention.dedupe_max_age_secs, 3 * 24 * 60 * 60);
+        assert_eq!(retention.memory_facts_max_age_secs, 3 * 24 * 60 * 60);
+        assert_eq!(retention.memory_facts_prune_batch_size, 25);
         assert_eq!(retention.jobs_max_records, 60_000);
         assert_eq!(retention.maintenance_batch_size, 120);
         assert_eq!(retention.maintenance_interval_secs, 10 * 60);
